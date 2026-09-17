@@ -1,0 +1,2885 @@
+diff --git a/waydroid_helper/BUILD.gn b/waydroid_helper/BUILD.gn
+new file mode 100644
+index 0000000000..ceac73e85f
+--- /dev/null
++++ b/waydroid_helper/BUILD.gn
+@@ -0,0 +1,57 @@
++# Copyright 2026 NAVER Authors. All rights reserved.
++# Use of this source code is governed by a BSD-style license that can be
++# found in the LICENSE file.
++
++import("//common-mk/generate-dbus-adaptors.gni")
++import("//common-mk/pkg_config.gni")
++
++group("all") {
++  deps = [
++    ":install_dbus_config",
++    ":install_init",
++    ":waydroid_helper",
++    ":waydroid_helper_adaptor",
++  ]
++}
++
++pkg_config("target_defaults") {
++  pkg_deps = [
++    "libarchive",
++    "libbrillo",
++    "libchrome",
++    # For powerd suspend-delay client protobufs (RegisterSuspendDelayRequest,
++    # SuspendImminent, SuspendReadinessInfo, ...) used by SuspendCoordinator.
++    "protobuf-lite",
++    "system_api",
++  ]
++}
++
++generate_dbus_adaptors("waydroid_helper_adaptor") {
++  dbus_service_config = "dbus_bindings/dbus-service-config.json"
++  dbus_adaptors_out_dir = "include/waydroid_helper/dbus_adaptors"
++  sources = [ "dbus_bindings/id.waydro.Helper.xml" ]
++}
++
++executable("waydroid_helper") {
++  sources = [
++    "apk_metadata.cc",
++    "app_cache.cc",
++    "daemon.cc",
++    "main.cc",
++    "suspend_coordinator.cc",
++    "waydroid_cli.cc",
++  ]
++  configs += [ ":target_defaults" ]
++  install_path = "sbin"
++  deps = [ ":waydroid_helper_adaptor" ]
++}
++
++install_config("install_dbus_config") {
++  sources = [ "dbus_bindings/id.waydro.Helper.conf" ]
++  install_path = "dbus_system_d"
++}
++
++install_config("install_init") {
++  sources = [ "init/waydroid-helper.conf" ]
++  install_path = "upstart"
++}
+diff --git a/waydroid_helper/apk_metadata.cc b/waydroid_helper/apk_metadata.cc
+new file mode 100644
+index 0000000000..6cfa5150d1
+--- /dev/null
++++ b/waydroid_helper/apk_metadata.cc
+@@ -0,0 +1,954 @@
++// Copyright 2026 NAVER Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "waydroid_helper/apk_metadata.h"
++
++#include <archive.h>
++#include <archive_entry.h>
++
++#include <algorithm>
++#include <cstdint>
++#include <cstring>
++#include <optional>
++#include <string>
++#include <string_view>
++#include <unordered_map>
++#include <utility>
++#include <vector>
++
++#include <base/logging.h>
++#include <base/strings/string_util.h>
++
++// This file parses just enough of an APK's binary XML (AXML) and resource
++// table (ARSC) to extract three data points: the manifest's package name,
++// the application's launcher icon PNG, and the application's display
++// label.
++//
++// Real-world APKs (particularly ones assembled with resource shrinking /
++// path randomisation) obfuscate everything under res/, so a naive "grep
++// for res/mipmap/ic_launcher.png" scan of the zip won't work.  Instead:
++//
++//   1. Parse AndroidManifest.xml (AXML) -> icon resource id + label
++//      resource id (or literal, when the manifest inlines a string).
++//   2. Parse resources.arsc -> resolve those ids into (a) a file path
++//      inside the APK for the icon, (b) a string literal for the label.
++//   3. If the icon path resolves to an XML (adaptive icon), open that
++//      XML, walk to <foreground android:drawable="@..."/>, and follow
++//      one more indirection through the resource table to land on a PNG.
++//
++// Formats reference:
++//   https://android.googlesource.com/platform/frameworks/base/+/refs/tags/
++//   android-13.0.0_r83/libs/androidfw/include/androidfw/ResourceTypes.h
++
++namespace waydroid_helper {
++namespace {
++
++// ---------- ResChunk framing ----------
++
++constexpr uint16_t kResStringPoolType = 0x0001;
++constexpr uint16_t kResTableType = 0x0002;
++constexpr uint16_t kResXmlType = 0x0003;
++
++constexpr uint16_t kResXmlStartElementType = 0x0102;
++
++constexpr uint16_t kResTablePackageType = 0x0200;
++constexpr uint16_t kResTableTypeType = 0x0201;
++// (RES_TABLE_TYPE_SPEC_TYPE = 0x0202 exists in ARSC but we don't consume
++// spec chunks -- they only carry per-config flags we don't need.)
++
++// Res_value dataType byte.
++constexpr uint8_t kResTypeReference = 0x01;
++constexpr uint8_t kResTypeString = 0x03;
++
++// ResTable_entry.flags
++constexpr uint16_t kEntryFlagComplex = 0x0001;
++
++// ResTable_type.flags
++constexpr uint8_t kTypeFlagSparse = 0x01;
++
++// StringPool_header.flags
++constexpr uint32_t kStringPoolFlagUtf8 = 0x100;
++
++uint16_t ReadU16(const uint8_t* p) {
++  return static_cast<uint16_t>(p[0]) |
++         (static_cast<uint16_t>(p[1]) << 8);
++}
++uint32_t ReadU32(const uint8_t* p) {
++  return static_cast<uint32_t>(p[0]) |
++         (static_cast<uint32_t>(p[1]) << 8) |
++         (static_cast<uint32_t>(p[2]) << 16) |
++         (static_cast<uint32_t>(p[3]) << 24);
++}
++
++// ---------- Res_value ----------
++
++struct ResValue {
++  uint8_t data_type = 0;
++  uint32_t data = 0;
++  // Populated only when the value already carries a raw string (attribute
++  // rawValue or an ARSC entry resolved through the value pool).
++  std::string as_string;
++};
++
++// ---------- String pool ----------
++
++// A generic ResStringPool decoder.  Handles both UTF-8 (post-Honeycomb)
++// and UTF-16 pools.  We only ever read from string pools, never write, so
++// keep the API tiny.
++class StringPool {
++ public:
++  // `pool_chunk` points at the 8-byte ResChunk header of a
++  // RES_STRING_POOL_TYPE chunk; `pool_chunk_size` is the full chunk size
++  // reported in that header.
++  bool Parse(const uint8_t* pool_chunk, size_t pool_chunk_size) {
++    if (pool_chunk_size < 28) {
++      return false;
++    }
++    const uint32_t string_count = ReadU32(pool_chunk + 8);
++    const uint32_t flags = ReadU32(pool_chunk + 16);
++    const uint32_t strings_start = ReadU32(pool_chunk + 20);
++    is_utf8_ = (flags & kStringPoolFlagUtf8) != 0;
++
++    // (pool_chunk_size - 28) / 4 avoids the uint32 wrap in string_count*4.
++    if (strings_start > pool_chunk_size ||
++        string_count > (pool_chunk_size - 28u) / 4u) {
++      return false;
++    }
++    // Hard cap on entries to keep the eager vector<string> from
++    // ballooning even when pool_chunk_size is legitimately large.
++    // Sized against the largest realistic sample we've seen so far
++    // (Whale's resources.arsc declares ~305K strings), with roughly
++    // 1.7x headroom; ParsePackage() keeps type_strings and
++    // key_strings alive simultaneously, so peak memory scales with
++    // this bound multiplied by the number of live pools.  At 512K
++    // entries the eager vector still costs only ~12 MiB of empty
++    // std::strings per pool, well under the daemon's overall budget,
++    // and a hostile pool declaring millions of empty slots to force
++    // multi-hundred-megabyte allocation is rejected here.
++    constexpr uint32_t kMaxStringPoolEntries = 512000;
++    if (string_count > kMaxStringPoolEntries) {
++      LOG(WARNING) << "APK: string pool declares " << string_count
++                   << " entries -- refusing to allocate (cap "
++                   << kMaxStringPoolEntries << ")";
++      return false;
++    }
++    strings_.assign(string_count, std::string());
++    for (uint32_t i = 0; i < string_count; ++i) {
++      const uint32_t offset = ReadU32(pool_chunk + 28 + i * 4);
++      const uint32_t abs_off = strings_start + offset;
++      if (abs_off >= pool_chunk_size) {
++        continue;
++      }
++      strings_[i] = DecodeAt(pool_chunk + abs_off,
++                             pool_chunk_size - abs_off);
++    }
++    return true;
++  }
++
++  size_t size() const { return strings_.size(); }
++  const std::string& At(uint32_t idx) const {
++    static const std::string kEmpty;
++    return idx < strings_.size() ? strings_[idx] : kEmpty;
++  }
++
++ private:
++  std::string DecodeAt(const uint8_t* p, size_t max_len) const {
++    if (is_utf8_) {
++      if (max_len < 2) {
++        return {};
++      }
++      // Skip the "character length" prefix -- 1 or 2 bytes depending on
++      // whether the top bit of the first byte is set.
++      size_t off = (p[0] & 0x80) ? 2 : 1;
++      if (off >= max_len) {
++        return {};
++      }
++      // Byte length prefix uses the same 1-or-2-byte scheme.
++      uint32_t byte_len;
++      if (p[off] & 0x80) {
++        if (off + 2 > max_len) {
++          return {};
++        }
++        byte_len = ((static_cast<uint32_t>(p[off]) & 0x7F) << 8) |
++                   static_cast<uint32_t>(p[off + 1]);
++        off += 2;
++      } else {
++        byte_len = p[off];
++        off += 1;
++      }
++      if (off + byte_len > max_len) {
++        return {};
++      }
++      return std::string(reinterpret_cast<const char*>(p + off), byte_len);
++    }
++    // UTF-16LE.  We transcode to UTF-8 on the way out.
++    if (max_len < 4) {
++      return {};
++    }
++    uint32_t char_len = ReadU16(p);
++    size_t off = 2;
++    if (char_len & 0x8000) {
++      if (off + 2 > max_len) {
++        return {};
++      }
++      char_len = ((char_len & 0x7FFF) << 16) | ReadU16(p + off);
++      off += 2;
++    }
++    if (off + char_len * 2 > max_len) {
++      return {};
++    }
++    std::string out;
++    out.reserve(char_len);
++    for (uint32_t i = 0; i < char_len; ++i) {
++      const uint32_t cp = ReadU16(p + off + i * 2);
++      if (cp < 0x80) {
++        out.push_back(static_cast<char>(cp));
++      } else if (cp < 0x800) {
++        out.push_back(static_cast<char>(0xC0 | (cp >> 6)));
++        out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
++      } else if (cp < 0xD800 || cp >= 0xE000) {
++        out.push_back(static_cast<char>(0xE0 | (cp >> 12)));
++        out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
++        out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
++      } else {
++        out.push_back('?');  // surrogate half; unsupported
++      }
++    }
++    return out;
++  }
++
++  std::vector<std::string> strings_;
++  bool is_utf8_ = false;
++};
++
++// ---------- AXML walker ----------
++
++// Visits every START_ELEMENT in an AXML file and hands the caller the
++// element's (name, attrs) so it can pick out the parts it cares about.
++// `on_element` returns false to stop the walk early.
++struct AxmlAttr {
++  std::string_view name;
++  ResValue value;
++};
++
++using OnElementFn =
++    bool (*)(void* ctx, std::string_view name,
++             const std::vector<AxmlAttr>& attrs);
++
++bool WalkAxml(const std::vector<uint8_t>& axml,
++              void* ctx,
++              OnElementFn on_element) {
++  if (axml.size() < 16) {
++    return false;
++  }
++  const uint8_t* data = axml.data();
++  const size_t size = axml.size();
++
++  if (ReadU16(data) != kResXmlType) {
++    return false;
++  }
++  const uint32_t total = ReadU32(data + 4);
++  const size_t root_end = std::min<size_t>(total, size);
++
++  StringPool sp;
++  size_t cursor = 8;
++
++  while (cursor + 8 <= root_end) {
++    const uint16_t type = ReadU16(data + cursor);
++    const uint32_t chunk_size = ReadU32(data + cursor + 4);
++    if (chunk_size < 8 || cursor + chunk_size > root_end) {
++      return true;
++    }
++
++    if (type == kResStringPoolType) {
++      sp.Parse(data + cursor, chunk_size);
++    } else if (type == kResXmlStartElementType) {
++      const size_t node_hdr = 16;  // 8 chunk hdr + lineno u4 + comment u4
++      if (chunk_size < node_hdr + 20) {
++        cursor += chunk_size;
++        continue;
++      }
++      const uint8_t* ext = data + cursor + node_hdr;
++      const uint32_t name_idx = ReadU32(ext + 4);
++      const uint16_t attr_start = ReadU16(ext + 8);
++      const uint16_t attr_size = ReadU16(ext + 10);
++      const uint16_t attr_count = ReadU16(ext + 12);
++      const std::string& elem_name = sp.At(name_idx);
++
++      std::vector<AxmlAttr> attrs;
++      const size_t attrs_off = node_hdr + attr_start;
++      if (attr_size >= 20 &&
++          chunk_size >= attrs_off + attr_count * attr_size) {
++        const uint8_t* av = data + cursor + attrs_off;
++        attrs.reserve(attr_count);
++        for (uint16_t i = 0; i < attr_count; ++i) {
++          const uint8_t* a = av + i * attr_size;
++          const uint32_t attr_name_idx = ReadU32(a + 4);
++          const uint32_t raw_value_idx = ReadU32(a + 8);
++          const uint8_t data_type = a[15];
++          const uint32_t typed_data = ReadU32(a + 16);
++
++          AxmlAttr out;
++          out.name = sp.At(attr_name_idx);
++          out.value.data_type = data_type;
++          out.value.data = typed_data;
++          if (data_type == kResTypeString) {
++            out.value.as_string =
++                sp.At(raw_value_idx == 0xFFFFFFFFu ? typed_data
++                                                   : raw_value_idx);
++          }
++          attrs.push_back(std::move(out));
++        }
++      }
++      if (!on_element(ctx, elem_name, attrs)) {
++        return true;
++      }
++    }
++    cursor += chunk_size;
++  }
++  return true;
++}
++
++// ---------- ARSC ----------
++
++// Parsed resource table.  We only keep enough state to resolve a specific
++// resource id (0xppttiiii) into a Res_value: package id, type id (1-based
++// index into type_strings), and entry index.
++//
++// A single (typeId, entryIndex) can appear multiple times across
++// different resource configurations (different DPIs, locales, ...); we
++// keep the *first* concrete value we see, which is the "default" config
++// resource in APKs assembled by AAPT2.  That's good enough for launcher
++// icon / app label resolution because those are supplied under the
++// default config in every APK we've seen.
++class ResourceTable {
++ public:
++  // `arsc` points at the start of the resources.arsc payload.  Returns
++  // false on any structural error; the table is unusable in that case.
++  bool Parse(const std::vector<uint8_t>& arsc) {
++    if (arsc.size() < 12 || ReadU16(arsc.data()) != kResTableType) {
++      return false;
++    }
++    const uint32_t total = ReadU32(arsc.data() + 4);
++    const size_t end = std::min<size_t>(total, arsc.size());
++    // ResTable_header adds a uint32 packageCount after the ResChunk_header.
++    // header_size gives us where children start.
++    const uint16_t header_size = ReadU16(arsc.data() + 2);
++    size_t cursor = header_size;
++    while (cursor + 8 <= end) {
++      const uint16_t type = ReadU16(arsc.data() + cursor);
++      const uint32_t chunk_size = ReadU32(arsc.data() + cursor + 4);
++      if (chunk_size < 8 || cursor + chunk_size > end) {
++        break;
++      }
++      if (type == kResStringPoolType) {
++        global_value_pool_.Parse(arsc.data() + cursor, chunk_size);
++      } else if (type == kResTablePackageType) {
++        ParsePackage(arsc.data() + cursor, chunk_size);
++      }
++      cursor += chunk_size;
++    }
++    return true;
++  }
++
++  // Resolve a resource id into its stored Res_value (data + raw string
++  // where applicable).  Returns nullopt if the id doesn't map to
++  // anything, or the value it maps to is a "complex" bag (styles/arrays,
++  // which we can't consume).  Recursively follows TYPE_REFERENCE chains
++  // for up to `kMaxIndirection` hops -- resource shrinking sometimes
++  // produces `alias` entries that just point at another id.
++  std::optional<ResValue> Resolve(uint32_t id) const {
++    constexpr int kMaxIndirection = 4;
++    for (int hop = 0; hop < kMaxIndirection; ++hop) {
++      const auto it = entries_by_id_.find(id);
++      if (it == entries_by_id_.end()) {
++        return std::nullopt;
++      }
++      ResValue v = it->second;
++      if (v.data_type != kResTypeReference || v.data == 0 || v.data == id) {
++        return v;
++      }
++      id = v.data;
++    }
++    return std::nullopt;
++  }
++
++ private:
++  void ParsePackage(const uint8_t* pkg, uint32_t size) {
++    if (size < 288) {
++      return;
++    }
++    const uint32_t package_id = ReadU32(pkg + 8);
++    const uint32_t type_strings_off = ReadU32(pkg + 12 + 128 * 2);
++    const uint32_t key_strings_off = ReadU32(pkg + 12 + 128 * 2 + 8);
++
++    StringPool type_strings;
++    StringPool key_strings;
++    // size >= 288 guarantees size - 8 doesn't underflow; the pool's
++    // self-declared sz must fit within the package chunk.
++    if (type_strings_off != 0 && type_strings_off <= size - 8) {
++      const uint32_t sz = ReadU32(pkg + type_strings_off + 4);
++      if (sz <= size - type_strings_off) {
++        type_strings.Parse(pkg + type_strings_off, sz);
++      }
++    }
++    if (key_strings_off != 0 && key_strings_off <= size - 8) {
++      const uint32_t sz = ReadU32(pkg + key_strings_off + 4);
++      if (sz <= size - key_strings_off) {
++        key_strings.Parse(pkg + key_strings_off, sz);
++      }
++    }
++    (void)key_strings;  // Not needed for our lookups; parsed for debug.
++
++    // Walk chunks after the last string pool.  ResTable_type chunks carry
++    // (typeId, config, entryCount, entries...).
++    const uint16_t header_size = ReadU16(pkg + 2);
++    size_t cursor = header_size;
++    if (type_strings_off != 0 && type_strings_off <= size - 8) {
++      const uint32_t sz = ReadU32(pkg + type_strings_off + 4);
++      if (sz <= size - type_strings_off) {
++        cursor = std::max<size_t>(cursor, type_strings_off + sz);
++      }
++    }
++    if (key_strings_off != 0 && key_strings_off <= size - 8) {
++      const uint32_t sz = ReadU32(pkg + key_strings_off + 4);
++      if (sz <= size - key_strings_off) {
++        cursor = std::max<size_t>(cursor, key_strings_off + sz);
++      }
++    }
++    while (cursor + 8 <= size) {
++      const uint16_t chunk_type = ReadU16(pkg + cursor);
++      const uint32_t chunk_size = ReadU32(pkg + cursor + 4);
++      if (chunk_size < 8 || cursor + chunk_size > size) {
++        break;
++      }
++      if (chunk_type == kResTableTypeType) {
++        ParseType(pkg + cursor, chunk_size, package_id);
++      }
++      cursor += chunk_size;
++    }
++  }
++
++  void ParseType(const uint8_t* chunk, uint32_t chunk_size,
++                 uint32_t package_id) {
++    // ResTable_type layout:
++    //   ResChunk_header (8)
++    //   uint8 id
++    //   uint8 flags
++    //   uint16 reserved
++    //   uint32 entryCount
++    //   uint32 entriesStart
++    //   ResTable_config config (variable)
++    //   uint32 entryOffsets[entryCount]  (dense)
++    //     OR uint16 idx, uint16 offset  (sparse, indexed by header order)
++    //   ResTable_entry blob
++    if (chunk_size < 20) {
++      return;
++    }
++    const uint8_t type_id = chunk[8];
++    const uint8_t flags = chunk[9];
++    const uint32_t entry_count = ReadU32(chunk + 12);
++    const uint32_t entries_start = ReadU32(chunk + 16);
++    if (type_id == 0 || entries_start > chunk_size) {
++      return;
++    }
++
++    const uint16_t header_size = ReadU16(chunk + 2);
++    const size_t offsets_off = header_size;
++    const bool sparse = (flags & kTypeFlagSparse) != 0;
++    const size_t stride = sparse ? 4u : 4u;
++    if (offsets_off + entry_count * stride > chunk_size) {
++      return;
++    }
++
++    // Only cache resources from package 0x7f (the app's own package).
++    // Framework or shared library ids (0x01/0x02/...) are outside our
++    // scope; those already work everywhere anyway.
++    if (package_id != 0x7fu) {
++      return;
++    }
++
++    for (uint32_t i = 0; i < entry_count; ++i) {
++      uint32_t entry_index = i;
++      uint32_t off;
++      if (sparse) {
++        const uint16_t idx = ReadU16(chunk + offsets_off + i * 4);
++        const uint16_t entry_off = ReadU16(chunk + offsets_off + i * 4 + 2);
++        entry_index = idx;
++        off = static_cast<uint32_t>(entry_off) * 4u;
++      } else {
++        off = ReadU32(chunk + offsets_off + i * 4);
++      }
++      if (off == 0xFFFFFFFFu) {
++        continue;
++      }
++      const size_t entry_abs = entries_start + off;
++      if (entry_abs + 8 > chunk_size) {
++        continue;
++      }
++      const uint16_t entry_size = ReadU16(chunk + entry_abs);
++      const uint16_t entry_flags = ReadU16(chunk + entry_abs + 2);
++      // Skip complex (bag) entries -- styles/arrays -- we can't collapse
++      // them to a single value.
++      if (entry_flags & kEntryFlagComplex) {
++        continue;
++      }
++      // ResTable_entry is followed by a Res_value at entry_size:
++      //   uint16 size, uint8 res0, uint8 dataType, uint32 data.
++      const size_t rv_off = entry_abs + entry_size;
++      if (rv_off + 8 > chunk_size) {
++        continue;
++      }
++      ResValue v;
++      v.data_type = chunk[rv_off + 3];
++      v.data = ReadU32(chunk + rv_off + 4);
++      if (v.data_type == kResTypeString) {
++        v.as_string = global_value_pool_.At(v.data);
++      }
++      const uint32_t id =
++          (package_id << 24) | (static_cast<uint32_t>(type_id) << 16) |
++          entry_index;
++      entries_by_id_.emplace(id, std::move(v));
++    }
++  }
++
++  StringPool global_value_pool_;
++  std::unordered_map<uint32_t, ResValue> entries_by_id_;
++};
++
++// ---------- Zip helpers (libarchive) ----------
++
++// Cached, indexed contents of an APK zip file.  libarchive is stream-only
++// so we read every entry we might care about upfront into memory.  Icon
++// PNGs are ~20-200 KB, resources.arsc is ~1-5 MB for large apps; the peak
++// footprint is well under 50 MB per install call and lives just for the
++// duration of ExtractApkMetadata.
++struct ApkContents {
++  std::vector<uint8_t> android_manifest;   // AndroidManifest.xml (AXml)
++  std::vector<uint8_t> resources_arsc;     // resources.arsc
++  std::unordered_map<std::string, std::vector<uint8_t>> res_files;
++};
++
++// Zip-bomb defenses.  APKs come from untrusted downloads via Files/Chrome
++// and this daemon runs as root with oom_score_adj=-100, so an unbounded
++// inflate could take down the entire system before the kernel notices.
++// Per-entry caps stop a single compressed entry from expanding without
++// bound; the total cap stops a swarm of medium-sized entries.
++//
++// kMaxSingleEntryBytes was raised from 32 MiB because real APKs routinely
++// ship a resources.arsc larger than 32 MiB (Play Store frontends, Whale,
++// etc.) and the smaller cap aborted metadata extraction before the
++// manifest was reached, leaving the launcher without an icon.  96 MiB
++// covers the legitimate long tail while keeping a single entry bounded;
++// abort paths log which entry hit the cap so future adjustments have
++// direct evidence.
++//
++// kMaxTotalContentBytes stays at the original 64 MiB.  The earlier
++// bump to 192 MiB was to leave headroom for large res/raw / res/font
++// assets, but IsUninterestingResSubdir() below now skips those
++// subdirs at archive-walk time, so they never contribute to the total.
++// Under this scope, real launcher-relevant entries (manifest +
++// resources.arsc + mipmap/drawable icons) sit well below 64 MiB.
++constexpr size_t kMaxSingleEntryBytes = 96 * 1024 * 1024;   // 96 MiB
++constexpr size_t kMaxTotalContentBytes = 64 * 1024 * 1024;  // 64 MiB
++
++// res/ subdirectories we never need for launcher icon extraction. Skip
++// them at archive-walk time so a fat raw asset (audio, video, large
++// animations) can't blow either the single-entry or total-bytes cap
++// and abort the whole metadata pass.
++bool IsUninterestingResSubdir(std::string_view path) {
++  // Fast prefix checks -- Android resource dirs are all "res/<kind>-..."
++  // (optionally suffixed with density/config qualifiers).
++  constexpr std::string_view kSkip[] = {
++      "res/raw/", "res/raw-",
++      "res/xml/", "res/xml-",
++      "res/anim/", "res/anim-",
++      "res/animator/", "res/animator-",
++      "res/font/", "res/font-",
++      "res/interpolator/", "res/interpolator-",
++      "res/menu/", "res/menu-",
++      "res/transition/", "res/transition-",
++      "res/values/", "res/values-",
++  };
++  for (std::string_view p : kSkip) {
++    if (path.starts_with(p)) {
++      return true;
++    }
++  }
++  return false;
++}
++
++// Structural caps that don't rely on byte totals. An attacker can put
++// millions of *empty* res/ entries with unique names into a zip: the
++// total-bytes cap never trips, but the unordered_map nodes and the
++// path strings themselves eat memory and CPU. Bound the raw entry
++// count we're willing to enumerate, the number of res/ entries we're
++// willing to store, and the pathname length of any one entry we keep.
++// Real APKs have <10K entries and <5K under res/; pathnames rarely
++// pass 256 bytes.
++constexpr size_t kMaxArchiveEntries = 200000;
++constexpr size_t kMaxResEntries = 50000;
++constexpr size_t kMaxEntryPathLen = 4096;
++
++bool ReadCurrentEntry(struct archive* a,
++                      size_t max_bytes,
++                      std::vector<uint8_t>* out) {
++  constexpr size_t kBufSize = 32 * 1024;
++  uint8_t buf[kBufSize];
++  out->clear();
++  for (;;) {
++    la_ssize_t n = archive_read_data(a, buf, sizeof(buf));
++    if (n == 0) {
++      return true;
++    }
++    if (n < 0) {
++      LOG(WARNING) << "APK: archive_read_data: "
++                   << archive_error_string(a);
++      out->clear();
++      return false;
++    }
++    if (out->size() + static_cast<size_t>(n) > max_bytes) {
++      LOG(WARNING) << "APK: entry exceeds size cap (" << max_bytes
++                   << " bytes) -- refusing to inflate further";
++      out->clear();
++      return false;
++    }
++    out->insert(out->end(), buf, buf + n);
++  }
++}
++
++bool ReadApk(const base::FilePath& apk_path, ApkContents* out) {
++  struct archive* a = archive_read_new();
++  if (!a) {
++    return false;
++  }
++  archive_read_support_format_zip(a);
++  const int rc = archive_read_open_filename(a, apk_path.value().c_str(),
++                                            /*block_size=*/64 * 1024);
++  if (rc != ARCHIVE_OK) {
++    LOG(WARNING) << "APK: cannot open " << apk_path.value() << ": "
++                 << archive_error_string(a);
++    archive_read_free(a);
++    return false;
++  }
++  size_t total_bytes = 0;
++  size_t entries_seen = 0;
++  bool aborted = false;
++  const auto remaining = [&]() -> size_t {
++    return total_bytes < kMaxTotalContentBytes
++               ? kMaxTotalContentBytes - total_bytes
++               : 0;
++  };
++  const auto per_entry_cap = [&]() -> size_t {
++    return std::min<size_t>(kMaxSingleEntryBytes, remaining());
++  };
++  struct archive_entry* entry = nullptr;
++  while (!aborted &&
++         archive_read_next_header(a, &entry) == ARCHIVE_OK) {
++    if (++entries_seen > kMaxArchiveEntries) {
++      LOG(WARNING) << "APK: exceeds archive entry cap ("
++                   << kMaxArchiveEntries << ")";
++      aborted = true;
++      break;
++    }
++    const char* c_path = archive_entry_pathname(entry);
++    if (!c_path) {
++      archive_read_data_skip(a);
++      continue;
++    }
++    // Bound the pathname length before we ever construct a std::string
++    // from it: otherwise millions of entries with multi-KiB names still
++    // charge us for the path storage even when we would skip the entry.
++    const size_t path_len = strlen(c_path);
++    if (path_len > kMaxEntryPathLen) {
++      LOG(WARNING) << "APK: entry pathname too long (" << path_len
++                   << " bytes); skipping";
++      archive_read_data_skip(a);
++      continue;
++    }
++    std::string path(c_path, path_len);
++    if (path == "AndroidManifest.xml") {
++      if (!ReadCurrentEntry(a, per_entry_cap(), &out->android_manifest)) {
++        LOG(WARNING) << "APK: AndroidManifest.xml exceeded per-entry cap";
++        aborted = true;
++        break;
++      }
++      total_bytes += out->android_manifest.size();
++    } else if (path == "resources.arsc") {
++      if (!ReadCurrentEntry(a, per_entry_cap(), &out->resources_arsc)) {
++        LOG(WARNING) << "APK: resources.arsc exceeded per-entry cap";
++        aborted = true;
++        break;
++      }
++      total_bytes += out->resources_arsc.size();
++    } else if (base::StartsWith(path, "res/",
++                                base::CompareCase::SENSITIVE)) {
++      // Skip res/ subdirs unrelated to launcher icon lookup (raw, xml,
++      // anim, ...) -- these are the ones that occasionally ship huge
++      // media assets that used to blow the per-entry byte cap and
++      // abort the whole metadata pass.
++      if (IsUninterestingResSubdir(path)) {
++        archive_read_data_skip(a);
++        continue;
++      }
++      // Cap the number of res/ entries we're willing to remember. This
++      // is a separate limit from the byte total because an attacker can
++      // send an arbitrary number of empty res/ entries that never
++      // increment total_bytes; each still costs a map node and a
++      // pathname string.
++      if (out->res_files.size() >= kMaxResEntries) {
++        LOG(WARNING) << "APK: exceeds res/ entry cap (" << kMaxResEntries
++                     << ")";
++        aborted = true;
++        break;
++      }
++      // Keep every res/ entry so we can serve any path resources.arsc
++      // resolves to without a second archive pass.
++      std::vector<uint8_t> content;
++      if (!ReadCurrentEntry(a, per_entry_cap(), &content)) {
++        LOG(WARNING) << "APK: entry " << path
++                     << " exceeded per-entry cap";
++        aborted = true;
++        break;
++      }
++      total_bytes += content.size();
++      // Also charge the total budget for the pathname storage so a
++      // stream of medium-sized names can't stay under the radar of
++      // byte totals that only counted payload.
++      total_bytes += path.size();
++      if (total_bytes > kMaxTotalContentBytes) {
++        LOG(WARNING) << "APK: pathname/payload total exceeds cap ("
++                     << kMaxTotalContentBytes << ")";
++        aborted = true;
++        break;
++      }
++      out->res_files.emplace(std::move(path), std::move(content));
++    } else {
++      archive_read_data_skip(a);
++    }
++  }
++  archive_read_free(a);
++  if (aborted) {
++    LOG(WARNING) << "APK: metadata extraction aborted for "
++                 << apk_path.value()
++                 << " (byte or structural cap exceeded)";
++    return false;
++  }
++  return !out->android_manifest.empty();
++}
++
++// ---------- Manifest walker ----------
++
++struct ManifestFields {
++  std::string package;
++  ResValue label;
++  ResValue icon;
++};
++
++bool OnManifestElement(void* ctx, std::string_view name,
++                       const std::vector<AxmlAttr>& attrs) {
++  auto* fields = static_cast<ManifestFields*>(ctx);
++  if (name == "manifest") {
++    for (const auto& a : attrs) {
++      if (a.name == "package" && a.value.data_type == kResTypeString) {
++        fields->package = a.value.as_string;
++      }
++    }
++  } else if (name == "application") {
++    for (const auto& a : attrs) {
++      if (a.name == "label") {
++        fields->label = a.value;
++      } else if (a.name == "icon") {
++        fields->icon = a.value;
++      }
++    }
++    // Nothing else in the manifest interests us; stop early.
++    return false;
++  }
++  return true;
++}
++
++// ---------- Adaptive icon walker ----------
++
++struct AdaptiveIconRef {
++  bool found = false;
++  uint32_t drawable_id = 0;
++};
++
++bool OnAdaptiveIconElement(void* ctx, std::string_view name,
++                           const std::vector<AxmlAttr>& attrs) {
++  auto* out = static_cast<AdaptiveIconRef*>(ctx);
++  // Prefer monochrome / foreground; ignore background (usually a solid
++  // colour that produces a boring tile once flattened).
++  if (name != "foreground" && name != "monochrome") {
++    return true;
++  }
++  for (const auto& a : attrs) {
++    if (a.name == "drawable" && a.value.data_type == kResTypeReference) {
++      out->found = true;
++      out->drawable_id = a.value.data;
++      // <foreground> wins if we see it, but we still keep walking so a
++      // later element could produce a better match.  In practice
++      // AdaptiveIcon has at most one <foreground>, so this is a no-op.
++      return name != "foreground";
++    }
++  }
++  return true;
++}
++
++// ---------- Density-ranked file path pick ----------
++
++int DensityRank(std::string_view path) {
++  if (path.find("xxxhdpi") != std::string_view::npos) return 6;
++  if (path.find("xxhdpi") != std::string_view::npos) return 5;
++  if (path.find("xhdpi") != std::string_view::npos) return 4;
++  if (path.find("hdpi") != std::string_view::npos) return 3;
++  if (path.find("mdpi") != std::string_view::npos) return 2;
++  if (path.find("ldpi") != std::string_view::npos) return 1;
++  return 0;
++}
++
++// Resolve a resource id representing an icon into raw PNG bytes.  Follows
++// one level of adaptive-icon indirection if the id lands on an XML.
++std::vector<uint8_t> ResolveIconPng(const ResourceTable& rt,
++                                    const ApkContents& apk,
++                                    uint32_t icon_id) {
++  auto val = rt.Resolve(icon_id);
++  if (!val || val->data_type != kResTypeString || val->as_string.empty()) {
++    return {};
++  }
++  const std::string& first_path = val->as_string;
++  if (base::EndsWith(first_path, ".png",
++                     base::CompareCase::INSENSITIVE_ASCII) ||
++      base::EndsWith(first_path, ".webp",
++                     base::CompareCase::INSENSITIVE_ASCII)) {
++    auto it = apk.res_files.find(first_path);
++    if (it != apk.res_files.end()) {
++      return it->second;
++    }
++    return {};
++  }
++  if (base::EndsWith(first_path, ".xml",
++                     base::CompareCase::INSENSITIVE_ASCII)) {
++    auto it = apk.res_files.find(first_path);
++    if (it == apk.res_files.end()) {
++      return {};
++    }
++    AdaptiveIconRef ref;
++    WalkAxml(it->second, &ref, OnAdaptiveIconElement);
++    if (!ref.found) {
++      return {};
++    }
++    // The foreground/monochrome id can itself resolve to a bunch of
++    // density variants -- the resource table only exposes the default one
++    // through Resolve() (that's the "first config wins" behaviour we
++    // documented above).  Follow it.
++    auto inner = rt.Resolve(ref.drawable_id);
++    if (!inner || inner->data_type != kResTypeString ||
++        inner->as_string.empty()) {
++      return {};
++    }
++    auto it2 = apk.res_files.find(inner->as_string);
++    if (it2 == apk.res_files.end()) {
++      return {};
++    }
++    return it2->second;
++  }
++  return {};
++}
++
++// Best-effort path when resources.arsc doesn't tell us anything (e.g.
++// malformed table, older APK).  Enumerates res/mipmap-*/ and
++// res/drawable-*/ for ic_launcher-shaped PNGs and picks the highest
++// density.
++std::vector<uint8_t> FallbackIconFromWellKnownPaths(const ApkContents& apk) {
++  std::vector<uint8_t> best;
++  int best_rank = -1;
++  for (const auto& [path, bytes] : apk.res_files) {
++    const bool is_icon_dir =
++        base::StartsWith(path, "res/mipmap",
++                         base::CompareCase::SENSITIVE) ||
++        base::StartsWith(path, "res/drawable",
++                         base::CompareCase::SENSITIVE);
++    const bool is_png =
++        base::EndsWith(path, ".png", base::CompareCase::INSENSITIVE_ASCII);
++    const bool looks_like_launcher =
++        path.find("ic_launcher") != std::string_view::npos ||
++        path.find("app_icon") != std::string_view::npos ||
++        path.find("launcher_icon") != std::string_view::npos;
++    if (!is_icon_dir || !is_png || !looks_like_launcher) {
++      continue;
++    }
++    const bool is_round =
++        path.find("ic_launcher_round") != std::string_view::npos;
++    const bool is_foreground =
++        path.find("_foreground") != std::string_view::npos ||
++        path.find("_background") != std::string_view::npos;
++    int rank = DensityRank(path);
++    if (is_round) rank -= 20;
++    if (is_foreground) rank -= 40;
++    if (rank <= best_rank) {
++      continue;
++    }
++    best = bytes;
++    best_rank = rank;
++  }
++  return best;
++}
++
++// Resolve a label attribute value.  If the manifest inlined a literal,
++// use that; otherwise chase the reference through the resource table.
++std::string ResolveLabel(const ResourceTable& rt, const ResValue& label) {
++  if (label.data_type == kResTypeString) {
++    return label.as_string;
++  }
++  if (label.data_type != kResTypeReference || label.data == 0) {
++    return {};
++  }
++  auto val = rt.Resolve(label.data);
++  if (!val || val->data_type != kResTypeString) {
++    return {};
++  }
++  return val->as_string;
++}
++
++}  // namespace
++
++std::optional<ApkMetadata> ExtractApkMetadata(const base::FilePath& apk_path) {
++  ApkContents apk;
++  if (!ReadApk(apk_path, &apk)) {
++    return std::nullopt;
++  }
++
++  ManifestFields fields;
++  if (!WalkAxml(apk.android_manifest, &fields, OnManifestElement)) {
++    return std::nullopt;
++  }
++  if (fields.package.empty()) {
++    LOG(WARNING) << "APK: no <manifest package> in " << apk_path.value();
++    return std::nullopt;
++  }
++
++  ResourceTable rt;
++  const bool arsc_ok = !apk.resources_arsc.empty() &&
++                       rt.Parse(apk.resources_arsc);
++
++  ApkMetadata md;
++  md.package_id = std::move(fields.package);
++  if (arsc_ok) {
++    md.label = ResolveLabel(rt, fields.label);
++    if (fields.icon.data_type == kResTypeReference && fields.icon.data) {
++      md.icon_png = ResolveIconPng(rt, apk, fields.icon.data);
++    }
++  }
++  // Path A relies on the resource table.  If it produced nothing, fall
++  // back to the pre-ARSC heuristic so APKs that don't obfuscate their
++  // res/ layout still get an icon.
++  if (md.icon_png.empty()) {
++    md.icon_png = FallbackIconFromWellKnownPaths(apk);
++  }
++  return md;
++}
++
++}  // namespace waydroid_helper
+diff --git a/waydroid_helper/apk_metadata.h b/waydroid_helper/apk_metadata.h
+new file mode 100644
+index 0000000000..b0783b1fcd
+--- /dev/null
++++ b/waydroid_helper/apk_metadata.h
+@@ -0,0 +1,45 @@
++// Copyright 2026 NAVER Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef WAYDROID_HELPER_APK_METADATA_H_
++#define WAYDROID_HELPER_APK_METADATA_H_
++
++#include <cstdint>
++#include <optional>
++#include <string>
++#include <vector>
++
++#include <base/files/file_path.h>
++
++namespace waydroid_helper {
++
++struct ApkMetadata {
++  // From AndroidManifest.xml <manifest package="…">.  Required -- if we
++  // couldn't derive it, ExtractApkMetadata() returns nullopt.
++  std::string package_id;
++
++  // Application label if it appears in AndroidManifest.xml as a literal
++  // (`android:label="Whale"`).  Empty when the manifest references a
++  // resource (@string/app_name) -- resolving that would require parsing
++  // resources.arsc, which we skip until there's a proven need.  Callers
++  // should fall back to something else (e.g. the CLI's ListApps output or
++  // package_id) when this is empty.
++  std::string label;
++
++  // A launcher icon extracted straight from the APK zip -- we scan
++  // res/mipmap-*/ and res/drawable-*/ for `ic_launcher.png` (or
++  // `.webp`) and keep the highest-density match.  Empty when nothing
++  // recognisable is found; PNG data otherwise.
++  std::vector<uint8_t> icon_png;
++};
++
++// Reads the APK at `apk_path` and returns its metadata, or nullopt if the
++// file isn't a valid APK / we can't even read its package name.  Safe to
++// call on untrusted input: everything is size-bounded and no code from the
++// APK is executed.
++std::optional<ApkMetadata> ExtractApkMetadata(const base::FilePath& apk_path);
++
++}  // namespace waydroid_helper
++
++#endif  // WAYDROID_HELPER_APK_METADATA_H_
+diff --git a/waydroid_helper/app_cache.cc b/waydroid_helper/app_cache.cc
+new file mode 100644
+index 0000000000..1ab967fbb3
+--- /dev/null
++++ b/waydroid_helper/app_cache.cc
+@@ -0,0 +1,76 @@
++// Copyright 2026 NAVER Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "waydroid_helper/app_cache.h"
++
++#include <utility>
++
++#include <base/files/file_path.h>
++#include <base/files/file_util.h>
++#include <base/logging.h>
++#include <base/strings/string_split.h>
++
++namespace waydroid_helper {
++
++AppCache::AppCache(const std::string& path) : path_(path) {}
++
++std::vector<WaydroidCli::App> AppCache::Load() const {
++  std::string contents;
++  if (!base::ReadFileToString(base::FilePath(path_), &contents)) {
++    // First run or container has never been brought up successfully --
++    // a missing file isn't an error, just "no cache yet".
++    return {};
++  }
++
++  std::vector<WaydroidCli::App> apps;
++  for (std::string_view line :
++       base::SplitStringPiece(contents, "\n", base::TRIM_WHITESPACE,
++                              base::SPLIT_WANT_NONEMPTY)) {
++    auto fields = base::SplitStringPiece(line, "\t", base::KEEP_WHITESPACE,
++                                         base::SPLIT_WANT_ALL);
++    if (fields.size() != 2) {
++      LOG(WARNING) << "AppCache: skipping malformed line in " << path_
++                   << " (expected 2 tab-separated fields, got "
++                   << fields.size() << ")";
++      continue;
++    }
++    WaydroidCli::App app;
++    app.name = std::string(fields[0]);
++    app.package_id = std::string(fields[1]);
++    // Icons live in a separate on-disk store (see app_cache.h header
++    // comment) and get overlaid at ListApps serving time; the TSV stays
++    // metadata-only so cache corruption can never affect launcher art.
++    apps.push_back(std::move(app));
++  }
++  return apps;
++}
++
++void AppCache::Save(const std::vector<WaydroidCli::App>& apps) const {
++  // Ensure the parent dir exists.  /var/lib/waydroid_helper is created
++  // by the ebuild's tmpfiles.d (or first-run mkdir below if running off
++  // a dev image without it).
++  base::FilePath file_path(path_);
++  base::FilePath parent = file_path.DirName();
++  if (!base::DirectoryExists(parent)) {
++    base::File::Error err = base::File::FILE_OK;
++    if (!base::CreateDirectoryAndGetError(parent, &err)) {
++      LOG(WARNING) << "AppCache: failed to mkdir " << parent.value()
++                   << " err=" << err;
++      return;
++    }
++  }
++
++  std::string out;
++  for (const auto& a : apps) {
++    out += a.name;
++    out += '\t';
++    out += a.package_id;
++    out += '\n';
++  }
++  if (!base::WriteFile(file_path, out)) {
++    LOG(WARNING) << "AppCache: failed to write " << path_;
++  }
++}
++
++}  // namespace waydroid_helper
+diff --git a/waydroid_helper/app_cache.h b/waydroid_helper/app_cache.h
+new file mode 100644
+index 0000000000..4de2d0fd2b
+--- /dev/null
++++ b/waydroid_helper/app_cache.h
+@@ -0,0 +1,62 @@
++// Copyright 2026 NAVER Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef WAYDROID_HELPER_APP_CACHE_H_
++#define WAYDROID_HELPER_APP_CACHE_H_
++
++#include <string>
++#include <vector>
++
++#include "waydroid_helper/waydroid_cli.h"
++
++namespace waydroid_helper {
++
++// Persists the last successful ListApps() result so ListApps() can still
++// answer (with stale data) while the container is stopped under the
++// lazy-start model.  Chrome's WaydroidApps publisher populates the
++// launcher at login from this cache; the container itself only boots
++// when the user actually picks an app.
++//
++// File format is intentionally trivial -- one entry per app, '\t' between
++// fields, '\n' between apps.  Only (name, package_id) live in the TSV;
++// launcher icons are stored as separate PNG files at
++// /var/lib/waydroid_helper/icons/<package_id>.png (see
++// DBusAdaptor::SaveIconForPackage) and overlaid into ListApps replies at
++// serving time -- keeping the TSV parser trivial and letting icons be
++// replaced/deleted independently of the app list.
++//
++//   name<TAB>package_id<NEWLINE>
++//   name<TAB>package_id<NEWLINE>
++//   ...
++class AppCache {
++ public:
++  // Default path under /var/lib so the cache survives reboots but lives
++  // on the same encrypted stateful partition as the rest of waydroid's
++  // user data.
++  static constexpr char kDefaultPath[] =
++      "/var/lib/waydroid_helper/app_cache.tsv";
++
++  explicit AppCache(const std::string& path = kDefaultPath);
++  AppCache(const AppCache&) = delete;
++  AppCache& operator=(const AppCache&) = delete;
++  ~AppCache() = default;
++
++  // Reads cache from disk.  Returns an empty vector on first run / file
++  // missing / parse error -- never throws.  Logs a single warning on
++  // parse failure so we notice cache corruption without spamming.
++  std::vector<WaydroidCli::App> Load() const;
++
++  // Writes |apps| to disk, replacing any prior content.  Best-effort: a
++  // failure here only means the next ListApps call before the container
++  // is up again will return an empty list, so we log but don't fail the
++  // outer ListApps RPC.
++  void Save(const std::vector<WaydroidCli::App>& apps) const;
++
++ private:
++  std::string path_;
++};
++
++}  // namespace waydroid_helper
++
++#endif  // WAYDROID_HELPER_APP_CACHE_H_
+diff --git a/waydroid_helper/daemon.cc b/waydroid_helper/daemon.cc
+new file mode 100644
+index 0000000000..57de4eac64
+--- /dev/null
++++ b/waydroid_helper/daemon.cc
+@@ -0,0 +1,414 @@
++// Copyright 2026 NAVER Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "waydroid_helper/daemon.h"
++
++#include <sysexits.h>
++
++#include <algorithm>
++#include <utility>
++
++#include <base/files/file_path.h>
++#include <base/files/file_util.h>
++#include <base/logging.h>
++#include <base/time/time.h>
++#include <dbus/bus.h>
++#include <dbus/object_path.h>
++
++namespace waydroid_helper {
++
++namespace {
++// Path matches the one declared in id.waydro.Helper.xml.
++constexpr char kObjectPath[] = "/id/waydro/Helper";
++
++// Where we stash per-package launcher icons extracted at InstallApk time.
++// Sits under the same encrypted-stateful mount as the TSV app cache so both
++// survive reboots on the same disk.
++constexpr char kIconDir[] = "/var/lib/waydroid_helper/icons";
++
++// Android package names allow letters, digits, '.' and '_'.  Refuse
++// anything else so nobody can talk us into path-traversal via a crafted
++// package id.
++bool IsSafePackageId(const std::string& package_id) {
++  if (package_id.empty() || package_id.size() > 256) {
++    return false;
++  }
++  for (char c : package_id) {
++    const bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
++                    (c >= '0' && c <= '9') || c == '.' || c == '_';
++    if (!ok) {
++      return false;
++    }
++  }
++  return true;
++}
++
++base::FilePath IconPathForPackage(const std::string& package_id) {
++  return base::FilePath(kIconDir).Append(package_id + ".png");
++}
++}  // namespace
++
++DBusAdaptor::DBusAdaptor(scoped_refptr<dbus::Bus> bus)
++    : id::waydro::HelperAdaptor(this),
++      dbus_object_(/*object_manager=*/nullptr,
++                   bus,
++                   dbus::ObjectPath(kObjectPath)) {}
++
++void DBusAdaptor::RegisterAsync(
++    brillo::dbus_utils::AsyncEventSequencer::CompletionAction cb) {
++  RegisterWithDBusObject(&dbus_object_);
++  dbus_object_.RegisterAsync(std::move(cb));
++
++  // Start the boot watcher: every 5s, check whether Android has booted;
++  // when it has, drop to background CPU shares once and stop polling.
++  // 5s is plenty light (each tick is one `lxc-attach getprop` of a few
++  // hundred ms, gated by a 3s timeout); the watcher stops itself the
++  // moment background is applied so steady-state cost is zero.
++  boot_watcher_.Start(FROM_HERE, base::Seconds(5),
++                      base::BindRepeating(&DBusAdaptor::OnBootWatcherTick,
++                                          weak_factory_.GetWeakPtr()));
++}
++
++void DBusAdaptor::OnBootWatcherTick() {
++  if (background_applied_) {
++    boot_watcher_.Stop();
++    return;
++  }
++  if (!cli_.IsRunning() || !cli_.IsBootCompleted()) {
++    return;
++  }
++  if (cli_.SetCpuShares(WaydroidCli::kCpuSharesBackground)) {
++    LOG(INFO) << "Boot complete; dropped Waydroid cpu.shares to background ("
++              << WaydroidCli::kCpuSharesBackground << ")";
++    background_applied_ = true;
++    boot_watcher_.Stop();
++    // Kick a background refresh: boot_completed=1 doesn't guarantee that
++    // Android's `waydroidplatform` binder service is registered yet, so the
++    // ticker will keep retrying `waydroid app list` until it succeeds and
++    // then emit AppListChanged exactly once with the live data.
++    ScheduleRefreshCache(base::Seconds(0));
++  }
++}
++
++void DBusAdaptor::ScheduleRefreshCache(base::TimeDelta initial_delay) {
++  refresh_attempts_ = 0;
++  refresh_timer_.Start(FROM_HERE, initial_delay,
++                       base::BindOnce(&DBusAdaptor::RefreshCacheTick,
++                                      weak_factory_.GetWeakPtr()));
++}
++
++void DBusAdaptor::RefreshCacheTick() {
++  // Backoff cadence: try every 3s for up to ~90s.  `waydroid app list`
++  // itself has a 5s internal timeout so a single failed attempt costs at
++  // most 5s of daemon-thread time; we're fine to serialize this with D-Bus
++  // handling.
++  constexpr int kMaxAttempts = 30;
++  constexpr base::TimeDelta kInterval = base::Seconds(3);
++
++  refresh_attempts_++;
++
++  std::optional<std::vector<WaydroidCli::App>> fresh = cli_.ListApps();
++  if (fresh.has_value()) {
++    // CLI ran to completion.  Merge with placeholders seeded by
++    // InstallApk that Android's `waydroid app list` hasn't caught up to
++    // yet: right after `pm install` the target usually shows up in a
++    // subsequent `waydroid app list` roundtrip, but there's a several-
++    // second window where the list still enumerates only the pre-baked
++    // LineageOS system apps.  Those all get blocklisted, so `fresh`
++    // comes back as `Some({})` and unconditionally saving it would blow
++    // away the placeholder we just seeded (and the launcher tile would
++    // vanish until the next refresh).
++    //
++    // Ground truth for "the user recently installed this" is the icon
++    // file on disk: SaveIconForPackage runs only after cli_.InstallApk
++    // returned success, so if we still have an icon PNG on disk but
++    // fresh doesn't list its package, that package is real and in
++    // flight.  Preserve those entries verbatim from the previous cache
++    // until fresh starts including them (at which point the natural
++    // dedupe by package_id keeps a single copy).
++    std::vector<WaydroidCli::App> merged = std::move(*fresh);
++    const std::vector<WaydroidCli::App> old_cache = cache_.Load();
++    for (const auto& old_app : old_cache) {
++      const bool in_fresh = std::any_of(
++          merged.begin(), merged.end(),
++          [&](const WaydroidCli::App& m) {
++            return m.package_id == old_app.package_id;
++          });
++      if (in_fresh) {
++        continue;
++      }
++      if (!base::PathExists(IconPathForPackage(old_app.package_id))) {
++        // No icon on disk = never seeded by us; must be either a stale
++        // entry we've since uninstalled or a pre-existing cache row from
++        // an older daemon build.  Drop it so uninstalls converge.
++        continue;
++      }
++      merged.push_back(old_app);
++    }
++    cache_.Save(std::move(merged));
++    SendAppListChangedSignal();
++    return;
++  }
++
++  if (refresh_attempts_ < kMaxAttempts) {
++    refresh_timer_.Start(FROM_HERE, kInterval,
++                         base::BindOnce(&DBusAdaptor::RefreshCacheTick,
++                                        weak_factory_.GetWeakPtr()));
++  } else {
++    LOG(WARNING) << "RefreshCache: gave up after " << kMaxAttempts
++                 << " attempts; launcher may be stale until the next "
++                    "container-state change";
++  }
++}
++
++void DBusAdaptor::MaybeEmitContainerStateChanged(bool observed) {
++  if (observed == last_known_running_) {
++    return;
++  }
++  last_known_running_ = observed;
++  SendContainerStateChangedSignal(observed);
++  if (observed) {
++    // Container just came up: schedule a cache refresh so the launcher
++    // reflects whatever's actually installed once Android finishes boot.
++    // Any AppListChanged Chrome cares about will be emitted from the
++    // background ticker exactly once the CLI succeeds.
++    ScheduleRefreshCache(base::Seconds(1));
++  }
++}
++
++bool DBusAdaptor::IsRunning() {
++  const bool running = cli_.IsRunning();
++  MaybeEmitContainerStateChanged(running);
++  return running;
++}
++
++void DBusAdaptor::EnsureRunning(bool* success, std::string* error_message) {
++  std::string err;
++  bool ok = cli_.EnsureRunning(&err);
++  MaybeEmitContainerStateChanged(ok);
++  if (success) {
++    *success = ok;
++  }
++  if (error_message) {
++    *error_message = ok ? std::string() : std::move(err);
++  }
++}
++
++std::vector<std::tuple<std::string, std::string, std::vector<uint8_t>>>
++DBusAdaptor::ListApps() {
++  // Fast path: serve from the on-disk cache.  Any state change that
++  // could have affected the installed-app set (Install/Remove/boot-
++  // complete/container-up) schedules a background RefreshCacheTick which
++  // eventually populates the cache with a live enumeration and re-emits
++  // AppListChanged.  So D-Bus reads are always O(cache_load) and Chrome
++  // gets a follow-up signal once real data is available.
++  //
++  // If the container is currently running AND the cache is empty, take
++  // the opportunity to try one live query synchronously -- this covers
++  // the very-first-boot case where the cache file doesn't exist yet.
++  std::vector<WaydroidCli::App> apps = cache_.Load();
++  if (apps.empty() && cli_.IsRunning()) {
++    std::optional<std::vector<WaydroidCli::App>> fresh = cli_.ListApps();
++    if (fresh.has_value()) {
++      apps = std::move(*fresh);
++      cache_.Save(apps);
++    } else {
++      // Live failed; kick a background refresh so we get real data soon.
++      ScheduleRefreshCache(base::Seconds(0));
++    }
++  }
++
++  std::vector<std::tuple<std::string, std::string, std::vector<uint8_t>>> out;
++  out.reserve(apps.size());
++  for (auto& app : apps) {
++    // `waydroid app list` never fills icon_png (the CLI just doesn't emit
++    // one), so we always overlay whatever InstallApk stashed on disk.  If
++    // no icon was captured -- either the APK didn't ship a launcher PNG
++    // or it was installed before this daemon started tracking icons --
++    // icon_png stays empty and Chrome uses its default resource icon.
++    std::vector<uint8_t> icon = LoadIconForPackage(app.package_id);
++    out.emplace_back(std::move(app.name),
++                     std::move(app.package_id),
++                     std::move(icon));
++    // Suppress unused-value warning on the discarded original icon_png.
++    (void)app.icon_png;
++  }
++  return out;
++}
++
++void DBusAdaptor::InstallApk(const std::string& apk_path,
++                             bool* success,
++                             std::string* error_message) {
++  // Pull the label + icon straight out of the APK BEFORE running the
++  // container-side install.  Two reasons:
++  //   1. We don't want to depend on Android's waydroidplatform binder
++  //      being up to render the launcher entry -- it can lag `pm install`
++  //      by tens of seconds after a fresh container boot.
++  //   2. Even after Android is up, `waydroid app list` returns an empty
++  //      icon_png; extracting from the APK is currently the only way to
++  //      show a real icon in the ChromeOS launcher.
++  // Failure to parse is non-fatal: we still forward the install to the
++  // container CLI and rely on the CLI's app list for name/id.
++  std::optional<ApkMetadata> md =
++      ExtractApkMetadata(base::FilePath(apk_path));
++
++  // Install needs the container; bring it up if not running.
++  std::string ensure_err;
++  if (!cli_.EnsureRunning(&ensure_err)) {
++    if (success) {
++      *success = false;
++    }
++    if (error_message) {
++      *error_message = "container start failed: " + ensure_err;
++    }
++    return;
++  }
++
++  std::string err;
++  bool ok = cli_.InstallApk(apk_path, &err);
++  if (ok) {
++    if (md && !md->package_id.empty()) {
++      // Persist the icon (if any) and pre-seed the on-disk TSV cache with
++      // a placeholder record so Chrome can already draw the launcher tile
++      // during the ~5-30s it takes waydroidplatform to become queryable.
++      // The background RefreshCacheTick will replace this record with the
++      // authoritative one from `waydroid app list` as soon as it succeeds.
++      if (!md->icon_png.empty()) {
++        SaveIconForPackage(md->package_id, md->icon_png);
++      }
++      std::vector<WaydroidCli::App> seeded = cache_.Load();
++      const bool already_cached = std::any_of(
++          seeded.begin(), seeded.end(),
++          [&](const WaydroidCli::App& a) {
++            return a.package_id == md->package_id;
++          });
++      if (!already_cached) {
++        WaydroidCli::App placeholder;
++        placeholder.name =
++            !md->label.empty() ? md->label : md->package_id;
++        placeholder.package_id = md->package_id;
++        seeded.push_back(std::move(placeholder));
++        cache_.Save(seeded);
++        SendAppListChangedSignal();
++      }
++    }
++    // Reply to Chrome right away so the "installing..." notification
++    // resolves.  The background refresh will still run and eventually
++    // replace the seeded entry with the CLI's real record; if
++    // waydroidplatform never comes up, the seeded entry keeps the app
++    // visible in the launcher anyway.
++    ScheduleRefreshCache(base::Seconds(1));
++  }
++  if (success) {
++    *success = ok;
++  }
++  if (error_message) {
++    *error_message = ok ? std::string() : std::move(err);
++  }
++}
++
++bool DBusAdaptor::RemoveApp(const std::string& package_id) {
++  std::string ensure_err;
++  if (!cli_.EnsureRunning(&ensure_err)) {
++    LOG(ERROR) << "RemoveApp(" << package_id
++               << "): container start failed: " << ensure_err;
++    return false;
++  }
++  bool ok = cli_.RemoveApp(package_id);
++  if (ok) {
++    // The stored icon file is now orphaned: even if Android hangs on to a
++    // vestigial entry for a few seconds, we don't want Chrome to serve
++    // its old icon back to the launcher when RefreshCacheTick eventually
++    // syncs.  Delete eagerly.
++    DeleteIconForPackage(package_id);
++    // Same rationale as InstallApk: background refresh will re-enumerate
++    // and emit AppListChanged once the CLI succeeds.  A trailing empty
++    // result is legitimate ("the app the user just removed was the last
++    // one") and now correctly persisted because ListApps returns
++    // optional<vector>: a real success returns an empty vector, a CLI
++    // failure returns nullopt and simply reschedules another attempt.
++    ScheduleRefreshCache(base::Seconds(1));
++  }
++  return ok;
++}
++
++void DBusAdaptor::SaveIconForPackage(
++    const std::string& package_id,
++    const std::vector<uint8_t>& icon_png) const {
++  if (!IsSafePackageId(package_id) || icon_png.empty()) {
++    return;
++  }
++  base::File::Error create_err;
++  if (!base::CreateDirectoryAndGetError(base::FilePath(kIconDir),
++                                        &create_err)) {
++    LOG(WARNING) << "Cannot create " << kIconDir << ": " << create_err;
++    return;
++  }
++  const base::FilePath dst = IconPathForPackage(package_id);
++  if (!base::WriteFile(dst, icon_png)) {
++    LOG(WARNING) << "Failed to persist icon at " << dst.value();
++  }
++}
++
++std::vector<uint8_t> DBusAdaptor::LoadIconForPackage(
++    const std::string& package_id) const {
++  if (!IsSafePackageId(package_id)) {
++    return {};
++  }
++  const base::FilePath src = IconPathForPackage(package_id);
++  std::string data;
++  if (!base::ReadFileToString(src, &data)) {
++    return {};  // no icon yet is fine -- Chrome falls back to a default
++  }
++  return std::vector<uint8_t>(data.begin(), data.end());
++}
++
++void DBusAdaptor::DeleteIconForPackage(const std::string& package_id) const {
++  if (!IsSafePackageId(package_id)) {
++    return;
++  }
++  base::DeleteFile(IconPathForPackage(package_id));
++}
++
++bool DBusAdaptor::LaunchApp(const std::string& package_id) {
++  std::string ensure_err;
++  if (!cli_.EnsureRunning(&ensure_err)) {
++    LOG(ERROR) << "LaunchApp(" << package_id
++               << "): container start failed: " << ensure_err;
++    return false;
++  }
++  // Implicit foreground bump as a safety net; the caller (Chrome) is
++  // responsible for SetBackground when the window loses focus.  A
++  // missed bump just means the launch itself runs throttled, which is
++  // recoverable -- the user will SetForeground via Chrome's window
++  // focus path moments later.
++  cli_.SetCpuShares(WaydroidCli::kCpuSharesForeground);
++  return cli_.LaunchApp(package_id);
++}
++
++bool DBusAdaptor::SetForeground() {
++  return cli_.SetCpuShares(WaydroidCli::kCpuSharesForeground);
++}
++
++bool DBusAdaptor::SetBackground() {
++  return cli_.SetCpuShares(WaydroidCli::kCpuSharesBackground);
++}
++
++Daemon::Daemon() : DBusServiceDaemon(/*service_name=*/"id.waydro.Helper") {}
++
++void Daemon::RegisterDBusObjectsAsync(
++    brillo::dbus_utils::AsyncEventSequencer* sequencer) {
++  adaptor_ = std::make_unique<DBusAdaptor>(bus_);
++  adaptor_->RegisterAsync(
++      sequencer->GetHandler("DBusAdaptor.RegisterAsync() failed.", true));
++
++  // Cooperative suspend integration: register with powerd as a suspend
++  // delay client so we can put Android into Doze (releasing wake locks)
++  // before the cgroup freezer hits.  Non-fatal if powerd is unavailable
++  // -- the rest of the helper still functions.
++  suspend_coordinator_ = std::make_unique<SuspendCoordinator>(bus_);
++  suspend_coordinator_->Init();
++}
++
++}  // namespace waydroid_helper
+diff --git a/waydroid_helper/daemon.h b/waydroid_helper/daemon.h
+new file mode 100644
+index 0000000000..0b992eec26
+--- /dev/null
++++ b/waydroid_helper/daemon.h
+@@ -0,0 +1,116 @@
++// Copyright 2026 NAVER Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef WAYDROID_HELPER_DAEMON_H_
++#define WAYDROID_HELPER_DAEMON_H_
++
++#include <cstdint>
++#include <memory>
++#include <string>
++#include <tuple>
++#include <vector>
++
++#include <base/memory/weak_ptr.h>
++#include <base/timer/timer.h>
++#include <brillo/daemons/dbus_daemon.h>
++
++#include "waydroid_helper/apk_metadata.h"
++#include "waydroid_helper/app_cache.h"
++#include "waydroid_helper/dbus_adaptors/id.waydro.Helper.h"
++#include "waydroid_helper/suspend_coordinator.h"
++#include "waydroid_helper/waydroid_cli.h"
++
++namespace waydroid_helper {
++
++class DBusAdaptor : public id::waydro::HelperInterface,
++                   public id::waydro::HelperAdaptor {
++ public:
++  explicit DBusAdaptor(scoped_refptr<dbus::Bus> bus);
++  DBusAdaptor(const DBusAdaptor&) = delete;
++  DBusAdaptor& operator=(const DBusAdaptor&) = delete;
++  ~DBusAdaptor() override = default;
++
++  void RegisterAsync(
++      brillo::dbus_utils::AsyncEventSequencer::CompletionAction cb);
++
++  // id::waydro::HelperInterface overrides.  Methods with two or more
++  // out args end up `void`-returning with all outputs as pointers in the
++  // generated adaptor; single-out methods return the value directly.
++  bool IsRunning() override;
++  void EnsureRunning(bool* success, std::string* error_message) override;
++  std::vector<std::tuple<std::string, std::string, std::vector<uint8_t>>>
++  ListApps() override;
++  void InstallApk(const std::string& apk_path,
++                  bool* success,
++                  std::string* error_message) override;
++  bool RemoveApp(const std::string& package_id) override;
++  bool LaunchApp(const std::string& package_id) override;
++  bool SetForeground() override;
++  bool SetBackground() override;
++
++ private:
++  // Probes container state and, if it differs from |last_known_running_|,
++  // emits ContainerStateChanged.  Caller can pass a fresh observation as
++  // |observed| to avoid a duplicate IsRunning roundtrip.
++  void MaybeEmitContainerStateChanged(bool observed);
++
++  // Periodic check that fires once after sign-in: as soon as
++  // sys.boot_completed=1 it drops cpu.shares to background and stops
++  // itself.  The container boots under LXC's default cpu.shares (1024)
++  // so Android start-up isn't throttled; this watcher hands it off to
++  // the background CPU class only after boot is done.  Set{Foreground,
++  // Background} D-Bus methods still let Chrome override afterwards.
++  void OnBootWatcherTick();
++
++  // Kicks the background cache-refresh timer.  Called on any event that
++  // could have changed the container's installed-app set (Install/Remove
++  // success, boot-complete, container-state transition to running).  The
++  // ticker retries `waydroid app list` at a fixed cadence until the CLI
++  // succeeds (which may take up to ~30s while Android's waydroidplatform
++  // binder service starts), then updates the cache and emits AppListChanged
++  // exactly once so the launcher catches up deterministically.
++  void ScheduleRefreshCache(base::TimeDelta initial_delay);
++  void RefreshCacheTick();
++
++  // Persist an icon extracted from an APK to /var/lib/waydroid_helper/
++  // icons/<package_id>.png so ListApps() can serve it back to Chrome even
++  // when the container is stopped.  Package IDs go through a light
++  // filesystem-safety check first -- anything that isn't a valid Android
++  // package name (letters, digits, '.' or '_') is refused so the on-disk
++  // layout can't be walked out of the icons directory.
++  void SaveIconForPackage(const std::string& package_id,
++                          const std::vector<uint8_t>& icon_png) const;
++  std::vector<uint8_t> LoadIconForPackage(const std::string& package_id) const;
++  void DeleteIconForPackage(const std::string& package_id) const;
++
++  WaydroidCli cli_;
++  AppCache cache_;
++  brillo::dbus_utils::DBusObject dbus_object_;
++  bool last_known_running_ = false;
++  bool background_applied_ = false;
++  base::RepeatingTimer boot_watcher_;
++  base::OneShotTimer refresh_timer_;
++  int refresh_attempts_ = 0;
++  base::WeakPtrFactory<DBusAdaptor> weak_factory_{this};
++};
++
++class Daemon : public brillo::DBusServiceDaemon {
++ public:
++  Daemon();
++  Daemon(const Daemon&) = delete;
++  Daemon& operator=(const Daemon&) = delete;
++  ~Daemon() override = default;
++
++ protected:
++  void RegisterDBusObjectsAsync(
++      brillo::dbus_utils::AsyncEventSequencer* sequencer) override;
++
++ private:
++  std::unique_ptr<DBusAdaptor> adaptor_;
++  std::unique_ptr<SuspendCoordinator> suspend_coordinator_;
++};
++
++}  // namespace waydroid_helper
++
++#endif  // WAYDROID_HELPER_DAEMON_H_
+diff --git a/waydroid_helper/dbus_bindings/dbus-service-config.json b/waydroid_helper/dbus_bindings/dbus-service-config.json
+new file mode 100644
+index 0000000000..79fe79bc8a
+--- /dev/null
++++ b/waydroid_helper/dbus_bindings/dbus-service-config.json
+@@ -0,0 +1,3 @@
++{
++  "service_name": "id.waydro.Helper"
++}
+diff --git a/waydroid_helper/dbus_bindings/id.waydro.Helper.conf b/waydroid_helper/dbus_bindings/id.waydro.Helper.conf
+new file mode 100644
+index 0000000000..604054c85c
+--- /dev/null
++++ b/waydroid_helper/dbus_bindings/id.waydro.Helper.conf
+@@ -0,0 +1,22 @@
++<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-BUS Bus Configuration 1.0//EN"
++ "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
++<!--
++  Copyright 2026 NAVER Authors. All rights reserved.
++  Use of this source code is governed by a BSD-style license that can be
++  found in the LICENSE file.
++
++  System-bus policy for id.waydro.Helper.  The daemon runs as root because
++  `waydroid` CLI itself requires root for LXC operations; chronos (Chrome)
++  is allowed to call the four methods.
++-->
++<busconfig>
++  <policy user="root">
++    <allow own="id.waydro.Helper"/>
++    <allow send_destination="id.waydro.Helper"
++           send_interface="id.waydro.Helper"/>
++  </policy>
++  <policy user="chronos">
++    <allow send_destination="id.waydro.Helper"
++           send_interface="id.waydro.Helper"/>
++  </policy>
++</busconfig>
+diff --git a/waydroid_helper/dbus_bindings/id.waydro.Helper.xml b/waydroid_helper/dbus_bindings/id.waydro.Helper.xml
+new file mode 100644
+index 0000000000..f767f43115
+--- /dev/null
++++ b/waydroid_helper/dbus_bindings/id.waydro.Helper.xml
+@@ -0,0 +1,151 @@
++<?xml version="1.0" encoding="UTF-8" ?>
++<!--
++  Copyright 2026 NAVER Authors. All rights reserved.
++  Use of this source code is governed by a BSD-style license that can be
++  found in the LICENSE file.
++
++  D-Bus interface exposed by waydroid-helper, a thin host-side daemon that
++  proxies app management requests from Chrome's WaydroidApps publisher (and
++  the Files app .apk handler) to the Waydroid container's `waydroid app`
++  CLI.  The daemon performs three responsibilities:
++
++    1. Translates D-Bus method calls into `waydroid app {list,install,
++       remove,launch}` subprocess invocations.
++    2. Filters the LineageOS pre-installed apps out of `ListApps` so the
++       ChromeOS launcher only shows user-installed apps.
++    3. Exits after a short idle timeout so the daemon has no background
++       cost; subsequent calls re-spawn it via D-Bus activation.
++
++  Naming convention follows the existing Waydroid project ones we already
++  ship: id.waydro.Container (lifecycle) and id.waydro.Session (per-user
++  bus).  This adds id.waydro.Helper for app management.
++-->
++<node name="/id/waydro/Helper"
++    xmlns:tp="http://telepathy.freedesktop.org/wiki/DbusSpec#extensions-v0">
++  <interface name="id.waydro.Helper">
++    <method name="IsRunning">
++      <tp:docstring>
++        Quick non-blocking check whether the Waydroid LXC container is up.
++        Chrome calls this before LaunchApp to decide whether to show a
++        "Starting Android..." spinner.
++      </tp:docstring>
++      <arg name="running" type="b" direction="out"/>
++      <annotation name="org.chromium.DBus.Method.Kind" value="simple"/>
++    </method>
++
++    <method name="EnsureRunning">
++      <tp:docstring>
++        Block until the container is running AND Android has finished
++        booting (sys.boot_completed=1).  Idempotent: returns success
++        immediately if already running.  Returns (false, error_message)
++        on timeout (~30s) or upstart/container failure.  This is the
++        right call to make from Chrome's WaydroidApps publisher right
++        before any user-visible action that requires the container.
++      </tp:docstring>
++      <arg name="success" type="b" direction="out"/>
++      <arg name="error_message" type="s" direction="out"/>
++      <annotation name="org.chromium.DBus.Method.Kind" value="simple"/>
++    </method>
++
++    <method name="ListApps">
++      <tp:docstring>
++        Return all user-installed Waydroid apps (pre-installed LineageOS apps
++        are filtered server-side).  Each entry is (display_name, package_id,
++        icon_png_bytes).  icon_png_bytes is allowed to be empty if the
++        daemon could not extract the launcher icon.
++
++        IMPORTANT (lazy-start): this method does NOT auto-start the
++        container.  If the container is stopped, the daemon returns the
++        cached list from the last successful query while the container was
++        up.  The launcher therefore stays responsive at login while the
++        container itself only boots when the user actually picks an app.
++      </tp:docstring>
++      <arg name="apps" type="a(ssay)" direction="out"/>
++      <annotation name="org.chromium.DBus.Method.Kind" value="simple"/>
++    </method>
++
++    <method name="InstallApk">
++      <tp:docstring>
++        Install an APK file located at |apk_path| (must be readable by the
++        daemon's user).  Blocks until install completes.  Returns success +
++        error message (empty on success).
++      </tp:docstring>
++      <arg name="apk_path" type="s" direction="in"/>
++      <arg name="success" type="b" direction="out"/>
++      <arg name="error_message" type="s" direction="out"/>
++      <annotation name="org.chromium.DBus.Method.Kind" value="simple"/>
++    </method>
++
++    <method name="RemoveApp">
++      <tp:docstring>
++        Uninstall the app identified by |package_id|.  Returns success.
++      </tp:docstring>
++      <arg name="package_id" type="s" direction="in"/>
++      <arg name="success" type="b" direction="out"/>
++      <annotation name="org.chromium.DBus.Method.Kind" value="simple"/>
++    </method>
++
++    <method name="LaunchApp">
++      <tp:docstring>
++        Launch the main activity of |package_id|.  Returns success.  The
++        actual window appears via the Waydroid Wayland surface managed by
++        the container's hwcomposer.
++
++        Implicitly bumps the container's cgroup CPU shares to foreground
++        as a safety net for callers that haven't wired up window-focus
++        tracking yet; callers that have should also call SetBackground
++        when their last Android window loses focus / closes.
++      </tp:docstring>
++      <arg name="package_id" type="s" direction="in"/>
++      <arg name="success" type="b" direction="out"/>
++      <annotation name="org.chromium.DBus.Method.Kind" value="simple"/>
++    </method>
++
++    <method name="SetForeground">
++      <tp:docstring>
++        Raise the LXC payload cgroup's cpu.shares to the foreground value
++        (matches ChromeOS Chrome processes).  Chrome's WaydroidApps
++        publisher should call this when an Android Wayland surface gains
++        focus -- including focus on an already-running Android app
++        (in which case no LaunchApp is issued, but the user still wants
++        full CPU priority).  Returns false if the container cgroup is not
++        present (container not running).
++      </tp:docstring>
++      <arg name="success" type="b" direction="out"/>
++      <annotation name="org.chromium.DBus.Method.Kind" value="simple"/>
++    </method>
++
++    <method name="SetBackground">
++      <tp:docstring>
++        Drop the LXC payload cgroup's cpu.shares to the background value
++        (~16x lower than foreground -- ARC++ kCpuRestrictionBackground
++        equivalent).  Chrome's publisher should call this when its last
++        Android window loses focus or is closed, so Android's background
++        services stop competing with the ChromeOS UI for CPU.  Returns
++        false if the container cgroup is not present.
++      </tp:docstring>
++      <arg name="success" type="b" direction="out"/>
++      <annotation name="org.chromium.DBus.Method.Kind" value="simple"/>
++    </method>
++
++    <signal name="ContainerStateChanged">
++      <tp:docstring>
++        Fired when the helper observes the container transition between
++        "running with Android booted" and "stopped".  |running| reflects
++        the new state.  Subscribers can use this to invalidate their
++        view of the app list, or to show a "Starting Android..." UI
++        without polling IsRunning.
++      </tp:docstring>
++      <arg name="running" type="b"/>
++    </signal>
++
++    <signal name="AppListChanged">
++      <tp:docstring>
++        Fired after a successful InstallApk or RemoveApp.  Subscribers
++        should call ListApps to refetch the current set.  No argument
++        because the daemon already cached the list internally and
++        ListApps is cheap.
++      </tp:docstring>
++    </signal>
++  </interface>
++</node>
+diff --git a/waydroid_helper/init/waydroid-helper.conf b/waydroid_helper/init/waydroid-helper.conf
+new file mode 100644
+index 0000000000..4f4a24151c
+--- /dev/null
++++ b/waydroid_helper/init/waydroid-helper.conf
+@@ -0,0 +1,34 @@
++# Copyright 2026 NAVER Authors. All rights reserved.
++# Use of this source code is governed by a BSD-style license that can be
++# found in the LICENSE file.
++
++description     "WhaleOS Waydroid app management D-Bus helper"
++author          "whaleos-dev@navercorp.com"
++
++# Starts alongside other system services.  The daemon is cheap (idle most
++# of the time and gated by lazy-start on the container side) so D-Bus
++# activation isn't set up -- the constant overhead of one long-lived
++# process isn't worth the extra complexity of the activation glue.
++start on started system-services
++stop on stopping system-services
++
++# Bail if respawning too fast (e.g. waydroid binary missing).
++respawn
++respawn limit 10 10
++
++oom score -100
++
++# The `waydroid` Python CLI we shell out to from SuspendCoordinator
++# (EnterDoze / ExitDoze) imports gi.repository.GLib via PyGObject for
++# its Binder client.  Without GI_TYPELIB_PATH the import fails with
++# "cannot import name GLib, introspection typelib not found" and our
++# Doze hand-off no-ops at every SuspendImminent.  Same env that
++# waydroid-container.conf sets, kept in sync.  libgbinder /
++# python-gbinder live under /usr/local/lib64 on WhaleOS dev images.
++env LD_LIBRARY_PATH=/usr/local/lib64
++env GI_TYPELIB_PATH=/usr/lib64/girepository-1.0
++
++# Daemon runs as root because the underlying `waydroid` CLI requires root
++# for LXC operations.  No minijail wrapper yet -- to be tightened in a
++# follow-up once the call surface and seccomp policy are stable.
++exec /usr/sbin/waydroid_helper
+diff --git a/waydroid_helper/main.cc b/waydroid_helper/main.cc
+new file mode 100644
+index 0000000000..5e9526feb7
+--- /dev/null
++++ b/waydroid_helper/main.cc
+@@ -0,0 +1,14 @@
++// Copyright 2026 NAVER Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include <brillo/syslog_logging.h>
++
++#include "waydroid_helper/daemon.h"
++
++int main(int /*argc*/, char** /*argv*/) {
++  brillo::OpenLog("waydroid_helper", true);
++  brillo::InitLog(brillo::kLogToSyslog | brillo::kLogToStderrIfTty);
++  waydroid_helper::Daemon daemon;
++  return daemon.Run();
++}
+diff --git a/waydroid_helper/suspend_coordinator.cc b/waydroid_helper/suspend_coordinator.cc
+new file mode 100644
+index 0000000000..1b7472d77d
+--- /dev/null
++++ b/waydroid_helper/suspend_coordinator.cc
+@@ -0,0 +1,165 @@
++// Copyright 2026 NAVER Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "waydroid_helper/suspend_coordinator.h"
++
++#include <memory>
++#include <utility>
++
++#include <base/functional/bind.h>
++#include <base/logging.h>
++#include <base/time/time.h>
++#include <chromeos/dbus/service_constants.h>
++#include <dbus/message.h>
++#include <dbus/object_path.h>
++#include <power_manager/proto_bindings/suspend.pb.h>
++
++namespace waydroid_helper {
++
++namespace {
++
++constexpr char kDelayDescription[] = "waydroid_helper";
++
++// 7 seconds matches the precedent in platform2/trunks/power_manager.cc.
++// Doze enter/exit `waydroid shell` invocations are typically 1-3s, so
++// 7s leaves comfortable headroom for slow Android-side dumpsys calls.
++constexpr base::TimeDelta kSuspendTimeout = base::Seconds(7);
++
++}  // namespace
++
++SuspendCoordinator::SuspendCoordinator(scoped_refptr<dbus::Bus> bus)
++    : bus_(std::move(bus)) {}
++
++void SuspendCoordinator::Init() {
++  powerd_proxy_ = bus_->GetObjectProxy(
++      power_manager::kPowerManagerServiceName,
++      dbus::ObjectPath(power_manager::kPowerManagerServicePath));
++  if (!powerd_proxy_) {
++    LOG(ERROR) << "Failed to acquire powerd object proxy; cooperative "
++                  "suspend disabled";
++    return;
++  }
++  // If powerd restarts, re-register so we don't miss the next suspend.
++  powerd_proxy_->SetNameOwnerChangedCallback(base::BindRepeating(
++      &SuspendCoordinator::OnPowerdNameOwnerChanged,
++      weak_ptr_factory_.GetWeakPtr()));
++  RegisterSuspendDelay();
++}
++
++void SuspendCoordinator::OnPowerdNameOwnerChanged(
++    const std::string& /*old_owner*/, const std::string& new_owner) {
++  if (new_owner.empty()) {
++    // powerd went away; our delay_id is no longer valid.
++    delay_id_ = std::nullopt;
++    return;
++  }
++  RegisterSuspendDelay();
++}
++
++void SuspendCoordinator::RegisterSuspendDelay() {
++  power_manager::RegisterSuspendDelayRequest request;
++  request.set_timeout(kSuspendTimeout.InMicroseconds());
++  request.set_description(kDelayDescription);
++  request.set_applicable_during_key_eviction(false);
++
++  dbus::MethodCall call(power_manager::kPowerManagerInterface,
++                        power_manager::kRegisterSuspendDelayMethod);
++  dbus::MessageWriter writer(&call);
++  writer.AppendProtoAsArrayOfBytes(request);
++
++  base::expected<std::unique_ptr<dbus::Response>, dbus::Error> resp(
++      powerd_proxy_->CallMethodAndBlock(
++          &call, dbus::ObjectProxy::TIMEOUT_USE_DEFAULT));
++  if (!resp.has_value() || !resp.value()) {
++    LOG(ERROR) << "RegisterSuspendDelay call failed";
++    return;
++  }
++
++  power_manager::RegisterSuspendDelayReply reply;
++  dbus::MessageReader reader(resp.value().get());
++  if (!reader.PopArrayOfBytesAsProto(&reply)) {
++    LOG(ERROR) << "RegisterSuspendDelay reply was not a parsable proto";
++    return;
++  }
++  delay_id_ = reply.delay_id();
++  LOG(INFO) << "Registered suspend delay id=" << *delay_id_;
++
++  // Subscribe to both signals.  ConnectToSignal is idempotent across
++  // re-registers (powerd restart) because we don't disconnect first --
++  // duplicate callbacks would only call back twice, both Doze handlers
++  // are idempotent.
++  powerd_proxy_->ConnectToSignal(
++      power_manager::kPowerManagerInterface,
++      power_manager::kSuspendImminentSignal,
++      base::BindRepeating(&SuspendCoordinator::HandleSuspendImminent,
++                          weak_ptr_factory_.GetWeakPtr()),
++      base::BindOnce(&SuspendCoordinator::OnSignalConnected,
++                     weak_ptr_factory_.GetWeakPtr()));
++  powerd_proxy_->ConnectToSignal(
++      power_manager::kPowerManagerInterface,
++      power_manager::kSuspendDoneSignal,
++      base::BindRepeating(&SuspendCoordinator::HandleSuspendDone,
++                          weak_ptr_factory_.GetWeakPtr()),
++      base::BindOnce(&SuspendCoordinator::OnSignalConnected,
++                     weak_ptr_factory_.GetWeakPtr()));
++}
++
++void SuspendCoordinator::OnSignalConnected(const std::string& interface,
++                                           const std::string& signal,
++                                           bool success) {
++  if (!success) {
++    LOG(ERROR) << "Failed to subscribe to " << interface << "." << signal;
++  }
++}
++
++void SuspendCoordinator::HandleSuspendImminent(dbus::Signal* signal) {
++  power_manager::SuspendImminent info;
++  dbus::MessageReader reader(signal);
++  if (!reader.PopArrayOfBytesAsProto(&info)) {
++    LOG(WARNING) << "SuspendImminent: unparsable proto, acking anyway";
++    return;
++  }
++  int suspend_id = info.suspend_id();
++  LOG(INFO) << "SuspendImminent id=" << suspend_id
++            << " -- entering Android Doze";
++
++  // Synchronous; blocks the daemon's D-Bus thread for 1-3s.  Acceptable
++  // because powerd is itself waiting for our ack and nothing else hits
++  // our interface during suspend prep.  If EnterDoze fails the suspend
++  // still proceeds -- powerd will then either succeed (if no wake
++  // sources are stuck) or harmlessly abort and retry.
++  cli_.EnterDoze();
++  SendSuspendReady(suspend_id);
++}
++
++void SuspendCoordinator::HandleSuspendDone(dbus::Signal* signal) {
++  power_manager::SuspendDone info;
++  dbus::MessageReader reader(signal);
++  if (reader.PopArrayOfBytesAsProto(&info)) {
++    LOG(INFO) << "SuspendDone id=" << info.suspend_id() << " duration_us="
++              << info.suspend_duration() << " -- exiting Android Doze";
++  } else {
++    LOG(INFO) << "SuspendDone (unparsable proto) -- exiting Android Doze";
++  }
++  cli_.ExitDoze();
++}
++
++void SuspendCoordinator::SendSuspendReady(int suspend_id) {
++  if (!delay_id_) {
++    LOG(WARNING) << "SendSuspendReady: no delay_id, skipping ack";
++    return;
++  }
++  power_manager::SuspendReadinessInfo info;
++  info.set_delay_id(*delay_id_);
++  info.set_suspend_id(suspend_id);
++
++  dbus::MethodCall call(power_manager::kPowerManagerInterface,
++                        power_manager::kHandleSuspendReadinessMethod);
++  dbus::MessageWriter writer(&call);
++  writer.AppendProtoAsArrayOfBytes(info);
++  (void)powerd_proxy_->CallMethodAndBlock(
++      &call, dbus::ObjectProxy::TIMEOUT_USE_DEFAULT);
++}
++
++}  // namespace waydroid_helper
+diff --git a/waydroid_helper/suspend_coordinator.h b/waydroid_helper/suspend_coordinator.h
+new file mode 100644
+index 0000000000..b118d5944f
+--- /dev/null
++++ b/waydroid_helper/suspend_coordinator.h
+@@ -0,0 +1,81 @@
++// Copyright 2026 NAVER Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef WAYDROID_HELPER_SUSPEND_COORDINATOR_H_
++#define WAYDROID_HELPER_SUSPEND_COORDINATOR_H_
++
++#include <memory>
++#include <optional>
++#include <string>
++
++#include <base/memory/scoped_refptr.h>
++#include <base/memory/weak_ptr.h>
++#include <dbus/bus.h>
++#include <dbus/object_proxy.h>
++
++#include "waydroid_helper/waydroid_cli.h"
++
++namespace waydroid_helper {
++
++// Cooperative suspend handler.  Registers waydroid_helper as a powerd
++// suspend-delay client; on each SuspendImminent we put the Waydroid
++// Android container into deep Doze (which releases its non-critical
++// kernel wake sources) before acknowledging powerd.  Without this,
++// EPOLLWAKEUP wake sources held by Android system_server's epoll fds
++// would stay active across the cgroup freeze and wedge powerd in
++// pm_get_wakeup_count().  See patch 0014 header for the full chain.
++//
++// On SuspendDone (resume), we tell Android to leave Doze so apps can
++// run again.
++//
++// All work happens on the daemon's main D-Bus thread; both Doze enter
++// and exit are synchronous `waydroid shell` invocations that typically
++// take 1-3 seconds.  The 7-second suspend-delay timeout (matches
++// trunks/power_manager.cc precedent) leaves headroom for slow shells.
++class SuspendCoordinator {
++ public:
++  explicit SuspendCoordinator(scoped_refptr<dbus::Bus> bus);
++  SuspendCoordinator(const SuspendCoordinator&) = delete;
++  SuspendCoordinator& operator=(const SuspendCoordinator&) = delete;
++  ~SuspendCoordinator() = default;
++
++  // Connects to powerd, registers the suspend delay, and subscribes to
++  // SuspendImminent / SuspendDone.  Logs on failure but never throws.
++  void Init();
++
++ private:
++  // Re-register on powerd restart.
++  void OnPowerdNameOwnerChanged(const std::string& old_owner,
++                                const std::string& new_owner);
++
++  void RegisterSuspendDelay();
++  void OnSignalConnected(const std::string& interface,
++                         const std::string& signal,
++                         bool success);
++
++  void HandleSuspendImminent(dbus::Signal* signal);
++  void HandleSuspendDone(dbus::Signal* signal);
++
++  // Acks powerd that we're ready for |suspend_id| to proceed.
++  void SendSuspendReady(int suspend_id);
++
++  scoped_refptr<dbus::Bus> bus_;
++  dbus::ObjectProxy* powerd_proxy_ = nullptr;  // not owned
++
++  // Stateless wrapper around `waydroid shell -- ...`; owning a separate
++  // instance avoids tangling our lifetime with the DBusAdaptor's cli_
++  // (no shared state -- each call is its own subprocess).
++  WaydroidCli cli_;
++
++  // delay_id_ is populated after a successful RegisterSuspendDelay
++  // and consumed by SendSuspendReady.  std::nullopt means we're not
++  // currently registered (e.g. powerd hasn't come up yet).
++  std::optional<int> delay_id_;
++
++  base::WeakPtrFactory<SuspendCoordinator> weak_ptr_factory_{this};
++};
++
++}  // namespace waydroid_helper
++
++#endif  // WAYDROID_HELPER_SUSPEND_COORDINATOR_H_
+diff --git a/waydroid_helper/system_apps_blocklist.h b/waydroid_helper/system_apps_blocklist.h
+new file mode 100644
+index 0000000000..09a0374ac1
+--- /dev/null
++++ b/waydroid_helper/system_apps_blocklist.h
+@@ -0,0 +1,56 @@
++// Copyright 2026 NAVER Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef WAYDROID_HELPER_SYSTEM_APPS_BLOCKLIST_H_
++#define WAYDROID_HELPER_SYSTEM_APPS_BLOCKLIST_H_
++
++#include <string_view>
++
++namespace waydroid_helper {
++
++// LineageOS apps pre-installed inside the Waydroid system.img.  ListApps
++// excludes these so the ChromeOS launcher only surfaces user-installed apps
++// (apps the user adds via the Files-app .apk handler).  Update this list if
++// the bundled Waydroid image's app set changes (e.g. on Android version
++// bump or vendor.img refresh).
++inline constexpr std::string_view kSystemAppBlocklist[] = {
++    // LineageOS user-facing apps that ship pre-installed in system.img
++    // and would otherwise show up in the ChromeOS launcher next to
++    // user-installed apps.  These have proper LAUNCHER intent filters
++    // and so would survive the LAUNCHER-only filter; we explicitly
++    // exclude them so the launcher only surfaces apps the user added.
++    "com.android.documentsui",          // Files
++    "com.android.contacts",             // Contacts
++    "org.lineageos.recorder",           // Recorder
++    "com.android.gallery3d",            // Gallery
++    "org.lineageos.jelly",              // Browser
++    "org.lineageos.eleven",             // Music
++    "org.lineageos.etar",               // Calendar
++    "org.lineageos.aperture",           // Camera
++    "com.android.settings",             // Settings
++    "com.android.calculator2",          // Calculator
++    "com.android.deskclock",            // Clock
++
++    // System utilities / providers that don't normally have a LAUNCHER
++    // intent but have shown up in the ChromeOS launcher in past sessions
++    // (likely via stale AppListSyncableService entries from a previous
++    // build).  Belt-and-braces: hard-exclude here so they can never end
++    // up in a published list regardless of how `waydroid app list`
++    // chooses to enumerate them in future LineageOS revisions.
++    "com.android.inputmethod.latin",    // Android Keyboard (AOSP) IME
++    "com.android.webview",              // WebView system component
++    "com.android.provision",            // Provisioning app
++    "com.android.printspooler",         // Print spooler
++    "org.protonaosp.deviceconfig",      // Proton AOSP device config
++    "org.lineageos.lineageparts",       // LineageOS settings extension
++    "org.lineageos.profiles",           // LineageOS profiles
++    "org.lineageos.waydroidupdater",    // Waydroid in-container updater
++    "com.stevesoltys.seedvault",        // System backup helper
++    "org.calyxos.backup.contacts",      // System contacts backup helper
++    "com.google.android.apps.googlecamera.fishfood",  // Bundled GCam
++};
++
++}  // namespace waydroid_helper
++
++#endif  // WAYDROID_HELPER_SYSTEM_APPS_BLOCKLIST_H_
+diff --git a/waydroid_helper/waydroid_cli.cc b/waydroid_helper/waydroid_cli.cc
+new file mode 100644
+index 0000000000..d702e70d6e
+--- /dev/null
++++ b/waydroid_helper/waydroid_cli.cc
+@@ -0,0 +1,397 @@
++// Copyright 2026 NAVER Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "waydroid_helper/waydroid_cli.h"
++
++#include <algorithm>
++#include <string_view>
++
++#include <base/files/file_path.h>
++#include <base/files/file_util.h>
++#include <base/logging.h>
++#include <base/strings/string_number_conversions.h>
++#include <base/strings/string_split.h>
++#include <base/strings/string_util.h>
++#include <base/threading/platform_thread.h>
++#include <base/time/time.h>
++#include <brillo/process/process.h>
++
++#include "waydroid_helper/system_apps_blocklist.h"
++
++namespace waydroid_helper {
++
++namespace {
++
++// `waydroid app list` emits records like:
++//
++//   Name: Files
++//   packageName: com.android.documentsui
++//   categories:
++//       android.intent.category.LAUNCHER
++//   Name: Contacts
++//   packageName: ...
++//
++// Records are not separated by blank lines, so we treat "Name:" as the
++// start of a new record and accumulate fields until the next "Name:".
++constexpr char kFieldName[] = "Name:";
++constexpr char kFieldPackage[] = "packageName:";
++
++// Conservative cap on stderr captured into D-Bus error replies.
++constexpr size_t kMaxStderrBytes = 512;
++
++bool IsBlocklisted(std::string_view package_id) {
++  for (std::string_view blocked : kSystemAppBlocklist) {
++    if (package_id == blocked) {
++      return true;
++    }
++  }
++  return false;
++}
++
++void Trim(std::string* s) {
++  base::TrimWhitespaceASCII(*s, base::TRIM_ALL, s);
++}
++
++}  // namespace
++
++int WaydroidCli::RunWaydroid(const std::vector<std::string>& args,
++                             std::string* stdout_out,
++                             std::string* stderr_out,
++                             int timeout_seconds) {
++  // Wrap every `waydroid ...` invocation in coreutils `timeout(1)`.
++  // `waydroid app list / install / ...` all go via the IPlatform binder
++  // service inside the container; if that service is missing or wedged
++  // (typical right after a sign-in cold start while Android is still
++  // booting), the Python CLI retries forever rather than failing fast.
++  // Without a cap, our D-Bus method handlers would hang for the full
++  // 25s default reply timeout and the caller (Chrome's WaydroidApps
++  // publisher) would surface an empty list to the launcher.
++  //
++  // Callers pick the cap that fits the command (see
++  // kFastWaydroidTimeoutSeconds / kInstallWaydroidTimeoutSeconds): a
++  // few seconds is enough for read-only queries against a healthy
++  // container, while `app install` runs dexopt on the new APK inside
++  // the container and routinely needs minutes.
++  brillo::ProcessImpl process;
++  process.AddArg("/usr/bin/timeout");
++  process.AddArg("--kill-after=1");
++  process.AddArg(base::NumberToString(timeout_seconds));
++  process.AddArg(waydroid_path_);
++  for (const std::string& a : args) {
++    process.AddArg(a);
++  }
++  process.RedirectUsingMemory(STDOUT_FILENO);
++  process.RedirectUsingMemory(STDERR_FILENO);
++
++  int exit_code = process.Run();
++  if (stdout_out) {
++    *stdout_out = process.GetOutputString(STDOUT_FILENO);
++  }
++  if (stderr_out) {
++    *stderr_out = process.GetOutputString(STDERR_FILENO);
++    if (stderr_out->size() > kMaxStderrBytes) {
++      stderr_out->resize(kMaxStderrBytes);
++    }
++  }
++  // timeout(1) exit codes: 124=timeout (SIGTERM), 137=128+9 after kill,
++  // 125=timeout itself failed, 126/127=command not runnable.  Callers
++  // check for non-zero; we just preserve whatever timeout returned.
++  return exit_code;
++}
++
++std::optional<std::vector<WaydroidCli::App>> WaydroidCli::ListApps() {
++  std::string stdout_str;
++  std::string stderr_str;
++  int rc = RunWaydroid({"app", "list"}, &stdout_str, &stderr_str,
++                       kFastWaydroidTimeoutSeconds);
++  if (rc != 0) {
++    LOG(WARNING) << "waydroid app list exit=" << rc << " stderr=" << stderr_str;
++    return std::nullopt;
++  }
++
++  std::vector<App> apps;
++  App current;
++  bool current_has_name = false;
++  bool current_has_pkg = false;
++
++  for (std::string_view line :
++       base::SplitStringPiece(stdout_str, "\n", base::TRIM_WHITESPACE,
++                              base::SPLIT_WANT_NONEMPTY)) {
++    if (base::StartsWith(line, kFieldName)) {
++      // Flush any prior record before starting a new one.
++      if (current_has_name && current_has_pkg &&
++          !IsBlocklisted(current.package_id)) {
++        apps.push_back(std::move(current));
++      }
++      current = App{};
++      current_has_name = false;
++      current_has_pkg = false;
++
++      current.name = std::string(line.substr(sizeof(kFieldName) - 1));
++      Trim(&current.name);
++      current_has_name = true;
++    } else if (base::StartsWith(line, kFieldPackage)) {
++      current.package_id = std::string(line.substr(sizeof(kFieldPackage) - 1));
++      Trim(&current.package_id);
++      current_has_pkg = true;
++    }
++    // "categories:" and indented category lines are ignored -- Chrome's
++    // launcher doesn't consume Android's intent categories, and we'd end
++    // up burning parse cycles on them for nothing.
++  }
++  // Don't forget the last record.
++  if (current_has_name && current_has_pkg &&
++      !IsBlocklisted(current.package_id)) {
++    apps.push_back(std::move(current));
++  }
++
++  return apps;
++}
++
++bool WaydroidCli::InstallApk(const std::string& apk_path,
++                             std::string* error_out) {
++  std::string stderr_str;
++  int rc = RunWaydroid({"app", "install", apk_path}, /*stdout=*/nullptr,
++                       &stderr_str, kInstallWaydroidTimeoutSeconds);
++  if (rc != 0 && error_out) {
++    *error_out = stderr_str.empty() ? "waydroid app install failed"
++                                    : std::move(stderr_str);
++  }
++  return rc == 0;
++}
++
++bool WaydroidCli::RemoveApp(const std::string& package_id) {
++  std::string stderr_str;
++  int rc = RunWaydroid({"app", "remove", package_id}, /*stdout=*/nullptr,
++                       &stderr_str, kFastWaydroidTimeoutSeconds);
++  if (rc != 0) {
++    LOG(WARNING) << "waydroid app remove " << package_id << " exit=" << rc
++                 << " stderr=" << stderr_str;
++  }
++  return rc == 0;
++}
++
++bool WaydroidCli::LaunchApp(const std::string& package_id) {
++  std::string stderr_str;
++  int rc = RunWaydroid({"app", "launch", package_id}, /*stdout=*/nullptr,
++                       &stderr_str, kFastWaydroidTimeoutSeconds);
++  if (rc != 0) {
++    LOG(WARNING) << "waydroid app launch " << package_id << " exit=" << rc
++                 << " stderr=" << stderr_str;
++  }
++  return rc == 0;
++}
++
++bool WaydroidCli::IsRunning() {
++  // `waydroid status` prints "Session: RUNNING" / "Session: STOPPED".
++  // We accept a clean exit AND the running marker.
++  std::string out;
++  int rc = RunWaydroid({"status"}, &out, /*stderr=*/nullptr,
++                       kFastWaydroidTimeoutSeconds);
++  if (rc != 0) {
++    return false;
++  }
++  return out.find("RUNNING") != std::string::npos;
++}
++
++bool WaydroidCli::ProbeBootCompleted(base::TimeDelta timeout) {
++  // timeout(1) needs an integer number of seconds; guarantee >=1s so we
++  // don't accidentally pass "0" (which would SIGTERM before lxc-attach
++  // even finishes execve).
++  const int64_t secs = std::max<int64_t>(1, timeout.InSeconds());
++  brillo::ProcessImpl getprop;
++  getprop.AddArg("/usr/bin/timeout");
++  getprop.AddArg("--kill-after=1");
++  getprop.AddArg(base::NumberToString(secs));
++  getprop.AddArg("/usr/bin/lxc-attach");
++  getprop.AddArg("-n");
++  getprop.AddArg("waydroid");
++  getprop.AddArg("-P");
++  getprop.AddArg("/usr/local/var/lib/waydroid/lxc");
++  getprop.AddArg("--");
++  getprop.AddArg("getprop");
++  getprop.AddArg("sys.boot_completed");
++  getprop.RedirectUsingMemory(STDOUT_FILENO);
++  if (getprop.Run() != 0) {
++    return false;
++  }
++  std::string val = getprop.GetOutputString(STDOUT_FILENO);
++  base::TrimWhitespaceASCII(val, base::TRIM_ALL, &val);
++  return val == "1";
++}
++
++bool WaydroidCli::IsBootCompleted() {
++  return ProbeBootCompleted(base::Seconds(3));
++}
++
++bool WaydroidCli::EnsureRunning(std::string* error_out) {
++  // The contract of EnsureRunning is "Android inside the container is
++  // ready to take requests", so we must check sys.boot_completed -- not
++  // just the LXC session state.  Returning early on IsRunning() alone
++  // would let LaunchApp/InstallApk/RemoveApp run while zygote is still
++  // initializing, where every `waydroid app ...` invocation hits its 5s
++  // timeout because waydroidplatform isn't on binder yet.
++  if (IsRunning() && IsBootCompleted()) {
++    return true;
++  }
++
++  // Container isn't even up yet -- kick the upstart job.  `initctl
++  // start` returns once the job's exec is spawned (not when Android
++  // is up), and we still need to wait for boot_completed below.
++  // Skip the initctl step if LXC is already running but Android is
++  // still booting.
++  if (!IsRunning()) {
++    brillo::ProcessImpl proc;
++    proc.AddArg("/sbin/initctl");
++    proc.AddArg("start");
++    proc.AddArg("waydroid-container");
++    proc.RedirectUsingMemory(STDERR_FILENO);
++    int rc = proc.Run();
++    if (rc != 0) {
++      // Already running shows up as exit 1 with "Job is already running"
++      // -- not a real failure, fall through to the boot_completed poll.
++      std::string err = proc.GetOutputString(STDERR_FILENO);
++      if (err.find("already running") == std::string::npos) {
++        if (error_out) {
++          *error_out = "initctl start waydroid-container: " + err;
++        }
++        return false;
++      }
++    }
++  }
++
++  // Poll sys.boot_completed with an absolute 30s deadline. Each probe
++  // reuses ProbeBootCompleted's timeout(1) wrapper so a wedged
++  // lxc-attach can't monopolize the D-Bus main thread (which would
++  // block other helper requests and powerd's SuspendImminent handshake).
++  // Per-probe timeout is capped to fit the remaining budget so the sum
++  // of probe timeouts never exceeds the poll budget.
++  constexpr base::TimeDelta kBootCompletePollBudget = base::Seconds(30);
++  constexpr base::TimeDelta kMaxProbeTimeout = base::Seconds(3);
++  constexpr base::TimeDelta kPollInterval = base::Milliseconds(500);
++  const base::TimeTicks deadline =
++      base::TimeTicks::Now() + kBootCompletePollBudget;
++  while (true) {
++    const base::TimeDelta remaining = deadline - base::TimeTicks::Now();
++    if (remaining < base::Seconds(1)) {
++      break;
++    }
++    if (ProbeBootCompleted(std::min(kMaxProbeTimeout, remaining))) {
++      return true;
++    }
++    const base::TimeDelta after = deadline - base::TimeTicks::Now();
++    if (after <= base::TimeDelta()) {
++      break;
++    }
++    base::PlatformThread::Sleep(std::min(kPollInterval, after));
++  }
++
++  if (error_out) {
++    *error_out =
++        "Timed out waiting for sys.boot_completed (container started but "
++        "Android did not finish booting within 30s)";
++  }
++  return false;
++}
++
++namespace {
++
++// Runs `waydroid shell -- <cmd...>` under coreutils `timeout(1)`.
++// Returns the child's exit status, -1 on spawn failure.  Output is
++// discarded; callers log on failure.
++//
++// timeout(1) wraps the whole pipeline (waydroid -> waydroid shell ->
++// lxc-attach -> Android side) and sends SIGTERM after |timeout|, then
++// SIGKILL after a further --kill-after grace.  Using it instead of
++// hand-rolled waitpid polling keeps the helper out of brillo::Process's
++// reap path (which has subtle interactions with SIGCHLD handlers in
++// libchrome's message loop) and gives us a single shell command that
++// is easy to reason about.
++//
++// We need this safety net because EnterDoze / ExitDoze run on the
++// daemon's D-Bus thread inside a SuspendImminent handler: if the
++// underlying `waydroid shell` blocks (binder backed up, session
++// daemon stuck, container half-frozen, etc.) we must still ack within
++// powerd's 7-second suspend delay or the whole suspend cycle fails.
++//
++// timeout(1) exit codes (per GNU coreutils):
++//   124 - command timed out (SIGTERM sent)
++//   125 - timeout itself failed
++//   126 - command found but not executable
++//   127 - command not found
++//   128+N - command killed by signal N (e.g. 137 = 128+9 after SIGKILL)
++int RunWaydroidShell(const std::string& waydroid_path,
++                     const std::vector<std::string>& cmd,
++                     base::TimeDelta timeout) {
++  brillo::ProcessImpl proc;
++  proc.AddArg("/usr/bin/timeout");
++  proc.AddArg("--kill-after=1");
++  proc.AddArg(base::NumberToString(timeout.InSeconds()));
++  proc.AddArg(waydroid_path);
++  proc.AddArg("shell");
++  proc.AddArg("--");
++  for (const std::string& a : cmd) {
++    proc.AddArg(a);
++  }
++  proc.RedirectUsingMemory(STDERR_FILENO);
++  const int rc = proc.Run();
++  if (rc == 124 || rc == 137) {
++    LOG(WARNING) << "waydroid shell -- " << cmd[0]
++                 << " ... timed out after " << timeout.InSecondsF()
++                 << "s (rc=" << rc << ")";
++    return rc;
++  }
++  if (rc != 0) {
++    LOG(WARNING) << "waydroid shell -- " << cmd[0] << " ... exit=" << rc
++                 << " stderr=" << proc.GetOutputString(STDERR_FILENO);
++  }
++  return rc;
++}
++
++}  // namespace
++
++bool WaydroidCli::EnterDoze() {
++  // `cmd deviceidle force-idle deep` works on Android 8+, including
++  // LineageOS 20 (Android 13).  It forces immediate transition to the
++  // deepest Doze state, which is the part of Android's normal sleep
++  // path that releases non-critical wake locks.
++  //
++  // 6s cap leaves ~1s headroom inside powerd's 7s suspend delay
++  // (kSuspendTimeout in suspend_coordinator.cc) so the helper always
++  // gets to ack even if `waydroid shell` is stuck.
++  return RunWaydroidShell(waydroid_path_,
++                          {"cmd", "deviceidle", "force-idle", "deep"},
++                          base::Seconds(6)) == 0;
++}
++
++bool WaydroidCli::ExitDoze() {
++  // `cmd deviceidle unforce` un-pins the device from forced Doze and
++  // returns it to normal scheduling.  Required after resume so apps
++  // can run again.  ExitDoze runs after SuspendDone (no powerd delay
++  // budget to respect), but keep a finite cap so a stuck container
++  // doesn't park the D-Bus thread indefinitely.
++  return RunWaydroidShell(waydroid_path_,
++                          {"cmd", "deviceidle", "unforce"},
++                          base::Seconds(10)) == 0;
++}
++
++bool WaydroidCli::SetCpuShares(int shares) {
++  // cgroup v1 path -- matches what LXC creates for our payload.
++  static const base::FilePath kCpuSharesPath(
++      "/sys/fs/cgroup/cpu/lxc.payload.waydroid/cpu.shares");
++  if (!base::PathExists(kCpuSharesPath)) {
++    // Container not running, or post-start hook hasn't created it yet.
++    // Caller can retry.
++    return false;
++  }
++  std::string val = base::NumberToString(shares);
++  if (!base::WriteFile(kCpuSharesPath, val)) {
++    LOG(WARNING) << "SetCpuShares: failed to write " << val << " to "
++                 << kCpuSharesPath.value();
++    return false;
++  }
++  return true;
++}
++
++}  // namespace waydroid_helper
+diff --git a/waydroid_helper/waydroid_cli.h b/waydroid_helper/waydroid_cli.h
+new file mode 100644
+index 0000000000..67593ad77d
+--- /dev/null
++++ b/waydroid_helper/waydroid_cli.h
+@@ -0,0 +1,136 @@
++// Copyright 2026 NAVER Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef WAYDROID_HELPER_WAYDROID_CLI_H_
++#define WAYDROID_HELPER_WAYDROID_CLI_H_
++
++#include <cstdint>
++#include <optional>
++#include <string>
++#include <vector>
++
++#include <base/time/time.h>
++
++namespace waydroid_helper {
++
++// Thin synchronous wrapper around the `waydroid app {list,install,remove,
++// launch}` CLI.  All methods block until the child process exits; callers
++// run them on the D-Bus thread but the operations themselves are fast
++// (typically <1s except for InstallApk which can take several seconds for
++// large APKs).
++class WaydroidCli {
++ public:
++  struct App {
++    std::string name;
++    std::string package_id;
++    // Always empty on this path: `waydroid app list` doesn't emit icon
++    // data.  Launcher icons come from a different pipeline -- the daemon
++    // parses the APK at InstallApk time (apk_metadata.cc) and stores the
++    // PNG at /var/lib/waydroid_helper/icons/<package_id>.png, which
++    // DBusAdaptor::ListApps overlays into the reply before it goes out
++    // to Chrome.  Kept as a struct field for wire-format compatibility.
++    std::vector<uint8_t> icon_png;
++  };
++
++  WaydroidCli() = default;
++  WaydroidCli(const WaydroidCli&) = delete;
++  WaydroidCli& operator=(const WaydroidCli&) = delete;
++  ~WaydroidCli() = default;
++
++  // Parses `waydroid app list` and returns user-installed apps only (the
++  // LineageOS system apps in kSystemAppBlocklist are filtered out).  Returns
++  // nullopt when the CLI failed (timeout, non-zero exit, container not
++  // running) -- callers must not treat that as "no apps installed", because
++  // right after login the Android side often needs several seconds to bring
++  // its waydroidplatform binder service up.  An empty vector means the CLI
++  // ran to completion and there really are no user apps.
++  std::optional<std::vector<App>> ListApps();
++
++  // Returns true on a clean exit code from `waydroid app install`.  On
++  // failure, |error_out| is populated with the CLI's stderr (truncated).
++  bool InstallApk(const std::string& apk_path, std::string* error_out);
++
++  // Returns true on clean exit from `waydroid app remove <package_id>`.
++  bool RemoveApp(const std::string& package_id);
++
++  // Returns true on clean exit from `waydroid app launch <package_id>`.
++  bool LaunchApp(const std::string& package_id);
++
++  // Returns true if the Waydroid LXC container is currently running.
++  // Fast (no boot wait); calls `waydroid status` and parses the output.
++  bool IsRunning();
++
++  // Returns true iff Android inside the container has finished booting,
++  // i.e. `getprop sys.boot_completed` reads "1".  Returns false if the
++  // container is down or `lxc-attach` fails for any reason.  Used by
++  // the daemon's background boot watcher to detect when it can drop
++  // cpu.shares to background without breaking cold-start time.
++  bool IsBootCompleted();
++
++  // Synchronously brings the container up.  If already running, returns
++  // true immediately.  Otherwise:
++  //   1. Triggers the waydroid-container upstart job (no-op if already
++  //      started).
++  //   2. Polls sys.boot_completed inside the container until "1" or
++  //      timeout (~30s).
++  // Returns false on failure; |error_out| gets a human-readable reason.
++  bool EnsureRunning(std::string* error_out);
++
++  // CPU share class for the LXC payload cgroup.  Phase C mirrors
++  // ARC++'s SetArcCpuRestriction(): 1024 = same priority as ChromeOS
++  // Chrome processes, 64 = background (~16x lower).  Returns false if
++  // the cgroup is not present (container not running yet).
++  static constexpr int kCpuSharesForeground = 1024;
++  static constexpr int kCpuSharesBackground = 64;
++  bool SetCpuShares(int shares);
++
++  // Cooperative suspend: ask Android to release non-critical wake locks
++  // before powerd freezes the container cgroup.  EnterDoze runs
++  // `cmd deviceidle force-idle deep` inside the container which puts
++  // Android into the deepest doze level (network off, alarms deferred,
++  // wake locks released).  ExitDoze undoes it on resume.
++  //
++  // Both return after the underlying `waydroid shell` invocation
++  // completes; typical latency is 1-3 seconds.  Best-effort: return
++  // value indicates only whether the subprocess exited cleanly --
++  // failures are non-fatal and merely mean Android did not get a
++  // chance to clean up before suspend (powerd's wakeup-source check
++  // will still serialize correctly).
++  bool EnterDoze();
++  bool ExitDoze();
++
++ private:
++  // Path to the waydroid binary; overridable in tests.
++  std::string waydroid_path_ = "/usr/bin/waydroid";
++
++  // Runs |args| under the waydroid binary, captures stdout/stderr, and
++  // returns the child's exit status.  Returns -1 on spawn failure.
++  //
++  // |timeout_seconds| is forwarded to /usr/bin/timeout so a wedged
++  // `waydroid` subprocess can't hang the helper's D-Bus method handler.
++  // Use kFastWaydroidTimeoutSeconds for read-mostly calls (status,
++  // app list, app launch -- these only marshal a Binder RPC).  Use
++  // kInstallWaydroidTimeoutSeconds for `app install`, where the
++  // container performs dexopt on the new APK and routinely takes
++  // tens of seconds (several minutes on the largest first-launch
++  // installs of a Play Store APK).
++  static constexpr int kFastWaydroidTimeoutSeconds = 5;
++  static constexpr int kInstallWaydroidTimeoutSeconds = 300;
++  int RunWaydroid(const std::vector<std::string>& args,
++                  std::string* stdout_out,
++                  std::string* stderr_out,
++                  int timeout_seconds);
++
++  // Runs `timeout N lxc-attach -- getprop sys.boot_completed`. Returns
++  // true iff the container reports "1". |timeout| is the per-probe
++  // budget passed to timeout(1); the reason IsBootCompleted() and
++  // EnsureRunning() share this helper is so the polling path can shrink
++  // each probe to fit within its absolute deadline instead of running
++  // raw lxc-attach that can block indefinitely on a wedged container.
++  bool ProbeBootCompleted(base::TimeDelta timeout);
++};
++
++}  // namespace waydroid_helper
++
++#endif  // WAYDROID_HELPER_WAYDROID_CLI_H_

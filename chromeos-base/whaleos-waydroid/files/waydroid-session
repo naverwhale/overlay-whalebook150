@@ -1,0 +1,20 @@
+#!/bin/sh
+# Copyright 2026 NAVER Authors. All rights reserved.
+# WhaleOS waydroid session launcher.
+#
+# ChromeOS exposes its Exo Wayland compositor socket at /run/chrome/wayland-0
+# rather than the standard $XDG_RUNTIME_DIR/wayland-0.
+# This wrapper sets the correct environment before starting a waydroid session.
+
+WAYLAND_SOCKET="/run/chrome/wayland-0"
+
+if [ ! -S "${WAYLAND_SOCKET}" ]; then
+  echo "ERROR: Wayland socket not found at ${WAYLAND_SOCKET}" >&2
+  echo "Is the ChromeOS UI running?" >&2
+  exit 1
+fi
+
+exec env \
+  WAYLAND_DISPLAY=wayland-0 \
+  XDG_RUNTIME_DIR=/run/chrome \
+  /usr/bin/waydroid "$@"

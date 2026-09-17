@@ -1,0 +1,26 @@
+CONFIG_VENDOR_GOOGLE=y
+CONFIG_BOARD_GOOGLE_QUANDISO2=y
+CONFIG_MAINBOARD_PART_NUMBER="Quandiso2_Ufs"
+
+# TWL FSP blobs
+CONFIG_FSP_M_FILE="3rdparty/blobs/intel/twl/fsp/fspm.bin"
+CONFIG_FSP_S_FILE="3rdparty/blobs/intel/twl/fsp/fsps.bin"
+CONFIG_FSP_HEADER_PATH="3rdparty/blobs/intel/twl/fsp/FullHeader/Include/"
+
+# SPI Descriptor
+CONFIG_IFD_BIN_PATH="3rdparty/blobs/mainboard/google/nissa/descriptor-quandiso2_ufs.bin"
+
+# Management Engine
+CONFIG_ME_BIN_PATH="3rdparty/blobs/mainboard/google/nissa/csme-quandiso2_ufs.bin"
+
+# Management Engine FW update
+CONFIG_SOC_INTEL_CSE_RW_FILE="3rdparty/blobs/mainboard/google/nissa/me_rw-quandiso2_ufs.bin"
+
+# Video Blob
+CONFIG_INTEL_GMA_VBT_FILE="3rdparty/blobs/mainboard/google/nissa/vbt-quandiso2.bin"
+
+# Microcode
+CONFIG_CPU_UCODE_BINARIES="3rdparty/blobs/mainboard/google/nissa/ucode-quandiso2.bin"
+
+# CSE Lite RW Version
+CONFIG_SOC_INTEL_CSE_RW_VERSION="16.50.22.1715"

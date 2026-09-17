@@ -1,0 +1,11 @@
+# Packages this overlay carries with WhaleOS modifications are pinned to the
+# versions the overlay was generated against.
+#
+# chromeos-chrome: newer upstream uprevs on the release branch are masked so
+# that the overlay ebuild (and its matching chrome-icu) is always selected.
+>chromeos-base/chromeos-chrome-150.0.7871.254_rc-r2
+>chromeos-base/chrome-icu-150.0.7871.254_rc-r2
+#
+# Packages WhaleOS keeps at a lower version than upstream; without the mask
+# portage would pick the higher upstream version over this overlay's ebuild.
+>net-libs/libiio-0.23-r6

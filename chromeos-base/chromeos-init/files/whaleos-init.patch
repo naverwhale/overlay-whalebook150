@@ -1,0 +1,160 @@
+diff --git a/init/clobber/clobber_state.cc b/init/clobber/clobber_state.cc
+index aa2ebf2a72..a06d5b4cad 100644
+--- a/init/clobber/clobber_state.cc
++++ b/init/clobber/clobber_state.cc
+@@ -30,6 +30,7 @@
+ #include <utility>
+ #include <vector>
+ 
++#include <brillo/whaleos_util.h>
+ #include <base/bits.h>
+ #include <base/files/file_enumerator.h>
+ #include <base/files/file_path.h>
+@@ -63,6 +64,7 @@ namespace {
+ 
+ constexpr char kStatefulPath[] = "/mnt/stateful_partition";
+ constexpr char kPowerWashCountPath[] = "unencrypted/preserve/powerwash_count";
++constexpr char kStartupManifestPath[] = "unencrypted/preserve/startup_manifest.json";
+ constexpr char kLastPowerWashTimePath[] =
+     "unencrypted/preserve/last_powerwash_time";
+ constexpr char kBioWashPath[] = "/usr/bin/bio_wash";
+@@ -517,6 +519,10 @@ std::vector<base::FilePath> ClobberState::GetPreservedFilesList() {
+           args_.safe_wipe, args_.ad_migration_wipe, args_.rollback_wipe,
+           args_.rma_wipe, debug_build == 1, false);
+ 
++  if (base::PathExists(stateful_.Append(kStartupManifestPath))) {
++    stateful_paths.insert(kStartupManifestPath);
++  }
++
+   if (args_.factory_wipe || args_.default_key_migration_wipe) {
+     for (auto& path :
+          libpreservation::GetFactoryPreservationPathList(stateful_)) {
+@@ -686,6 +692,15 @@ int ClobberState::Run() {
+           crossystem::Crossystem::kClearTpmOwnerRequest, 1)) {
+     LOG(ERROR) << "Requesting TPM wipe via crossystem failed";
+   }
++  if (brillo::IsWhalebook2Model()) {
++    base::WriteFile(base::FilePath("/sys/class/tpm/tpm0/ppi/request"), "5");
++
++    std::string response;
++    base::ReadFileToString(
++        base::FilePath("/sys/class/tpm/tpm0/ppi/response"), &response);
++    LOG(INFO) << "TPM clear result: " << response;
++  }
++
+ 
+   // In cases where biometric sensors are available, reset the internal entropy
+   // used by those sensors for encryption, to render related data/templates etc.
+@@ -992,7 +1007,7 @@ void ClobberState::AttemptSwitchToFastWipe(bool is_rotational) {
+ 
+   // Do not use legacy salt as a fast_wipe allowence marker on devices which
+   // allow non-tpm fallback for encryption.
+-  if (!USE_TPM_INSECURE_FALLBACK) {
++  if (brillo::IsWhalebook2Model()) {
+     if (!brillo::cryptohome::home::IsLegacySystemSalt(stateful_)) {
+       args_.fast_wipe = true;
+       LOG(INFO) << "No legacy salt file, switching to fast wipe";
+diff --git a/init/startup/chromeos_startup.cc b/init/startup/chromeos_startup.cc
+index e4bad8370a..ed873f4b1e 100644
+--- a/init/startup/chromeos_startup.cc
++++ b/init/startup/chromeos_startup.cc
+@@ -16,6 +16,8 @@
+ #include <utility>
+ #include <vector>
+ 
++#include <brillo/whaleos_util.h>
++
+ #include <base/files/file_enumerator.h>
+ #include <base/files/file_path.h>
+ #include <base/files/file_util.h>
+@@ -684,7 +686,7 @@ void ChromeosStartup::CleanupTpm(const base::FilePath& tpm_data_dir) {
+ }
+ 
+ bool ChromeosStartup::ExtendPCRForVersionAttestation() {
+-  if (USE_TPM_INSECURE_FALLBACK) {
++  if (!brillo::IsWhalebook2Model()) {
+     // Not needed on devices whereby the secure element is not mandatory.
+     return true;
+   }
+diff --git a/init/tpm_encryption/encryption_key.cc b/init/tpm_encryption/encryption_key.cc
+index 954a89e83e..93abc1f101 100644
+--- a/init/tpm_encryption/encryption_key.cc
++++ b/init/tpm_encryption/encryption_key.cc
+@@ -197,7 +197,7 @@ bool EncryptionKey::SetInsecureFallbackSystemKey() {
+   std::string product_uuid;
+   if (platform_->ReadFileToString(rootdir_.Append(paths::kProductUUID),
+                                   &product_uuid)) {
+-    system_key_ = Sha256(base::ToUpperASCII(product_uuid));
++    system_key_ = Sha256(product_uuid);
+     LOG(INFO) << "Using UUID as system key.";
+     system_key_status_ = SystemKeyStatus::kProductUUID;
+     return true;
+diff --git a/init/tpm_encryption/tpm_setup.cc b/init/tpm_encryption/tpm_setup.cc
+index 7edbdcab5d..698b0c6ee0 100644
+--- a/init/tpm_encryption/tpm_setup.cc
++++ b/init/tpm_encryption/tpm_setup.cc
+@@ -268,21 +268,8 @@ bool TpmSystemKey::HasChromeFw() {
+ }
+ 
+ bool TpmSystemKey::ShallUseTpmForSystemKey() {
+-  if (!USE_TPM_INSECURE_FALLBACK) {
+-    return true;
+-  }
+-
+-  /* Don't use tpm for system key if we are using runtime TPM selection. */
+-  if (USE_TPM_DYNAMIC) {
+-    return false;
+-  }
+-
+-  if (HasChromeFw()) {
+-    return true;
+-  }
+-
+-  /* Assume we have tpm for system_key when we are using vtpm tpm2 simulator. */
+-  return USE_TPM2_SIMULATOR && USE_VTPM_PROXY;
++  // https://example.com
++  return false;
+ }
+ 
+ bool TpmSystemKey::MigrateTpmOwnerShipStateFile() {
+diff --git a/init/upstart/boot-splash.conf b/init/upstart/boot-splash.conf
+index 8cf34120db..acd161107e 100644
+--- a/init/upstart/boot-splash.conf
++++ b/init/upstart/boot-splash.conf
+@@ -24,6 +24,7 @@ env ASSETLESS_ARGS="--enable-osc --enable-vts --pre-create-vts"
+ # Script stanzas can only execute one program,
+ # and that program needs to be frecon.
+ pre-start script
++  hwclock -s -l
+   # Do not change backlight if the display was already
+   # initialized in firmware (brightness is set in firmware).
+   if [ "$(cros_config /firmware has-splash-screen)" = "false" ] ||
+@@ -60,20 +61,25 @@ script
+       BACKGROUND=$(cat "${ASSETS}/splash_background")
+     fi
+ 
++    ROTATED=""
++    if grep -qsF "521QFD" /sys/class/dmi/id/product_name; then
++      ROTATED="rotated_"
++    fi
++
+     # Use differently-sized images depending on the framebuffer width.
+     if [ -e "${ASSETS_200}/boot_splash_frame01.png" ]; then
+       ARGS="--frame-interval 25"
+       BOOT_IMAGES=""
+ 
+-      for image in "${ASSETS_200}"/boot_splash_frame*.png; do
++      for image in "${ASSETS_200}"/"${ROTATED}"boot_splash_frame*.png; do
+         BOOT_IMAGES="${BOOT_IMAGES} --image-hires ${image}"
+       done
+-      for image in "${ASSETS_100}"/boot_splash_frame*.png; do
++      for image in "${ASSETS_100}"/"${ROTATED}"boot_splash_frame*.png; do
+         BOOT_IMAGES="${BOOT_IMAGES} --image ${image}"
+       done
+     elif [ -d "${ASSETS_100}" ]; then
+       ARGS="--frame-interval 25"
+-      BOOT_IMAGES="${ASSETS_100}"/boot_splash_frame*.png
++      BOOT_IMAGES="${ASSETS_100}"/"${ROTATED}"boot_splash_frame*.png
+     else
+       ARGS="${ASSETLESS_ARGS}"
+     fi

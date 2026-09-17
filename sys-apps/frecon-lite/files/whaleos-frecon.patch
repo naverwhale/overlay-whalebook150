@@ -1,0 +1,55 @@
+diff --git a/image.c b/image.c
+index de32da0..c4f80f2 100644
+--- a/image.c
++++ b/image.c
+@@ -128,6 +128,17 @@ int image_load_image_from_file(image_t* image)
+ 
+ 	png_set_filler(png, 0xff, PNG_FILLER_AFTER);
+ 
++	// WhaleOS tries white background if images don't have one.
++	{
++		png_color_16 *image_bg;
++		png_color_16 bg = { 0xff, 0xff, 0xff, 0xff, 0xff };
++
++		if (png_get_bKGD(png, info, &image_bg))
++			png_set_background(png, image_bg, PNG_BACKGROUND_GAMMA_FILE, 1, 1.0);
++		else
++			png_set_background(png, &bg, PNG_BACKGROUND_GAMMA_SCREEN, 0, 1.0);
++	}
++
+ 	png_set_read_user_transform_fn(png, image_rgb);
+ 	png_read_update_info(png, info);
+ 
+diff --git a/input.c b/input.c
+index 01c8764..1146a02 100644
+--- a/input.c
++++ b/input.c
+@@ -124,6 +124,7 @@ static int input_special_key(struct input_key_event* ev)
+ 	}
+ 
+ 	if (term_is_active(terminal)) {
++#if !FRECON_LITE
+ 		if (is_shift_pressed(&input.kbd_state) && ev->value) {
+ 			switch (ev->code) {
+ 			case KEY_PAGEUP:
+@@ -159,6 +160,7 @@ static int input_special_key(struct input_key_event* ev)
+ 				return 1;
+ 			}
+ 		}
++#endif
+ 
+ 		if (!(input.kbd_state.search_state ||
+ 		     is_alt_pressed(&input.kbd_state) ||
+diff --git a/splash.c b/splash.c
+index 12f7d57..05e8bd0 100644
+--- a/splash.c
++++ b/splash.c
+@@ -23,7 +23,7 @@
+ #include "term.h"
+ #include "util.h"
+ 
+-#define  MAX_SPLASH_IMAGES      (30)
++#define  MAX_SPLASH_IMAGES      (100)
+ #define  MAX_SPLASH_WAITTIME    (8)
+ 
+ typedef struct {

@@ -1,0 +1,30 @@
+diff --git a/diagnostics/cros_healthd/delegate/delegate_impl.cc b/diagnostics/cros_healthd/delegate/delegate_impl.cc
+index b56c2238dc..674066f06e 100644
+--- a/diagnostics/cros_healthd/delegate/delegate_impl.cc
++++ b/diagnostics/cros_healthd/delegate/delegate_impl.cc
+@@ -475,23 +475,9 @@ void DelegateImpl::MonitorStylus(
+ }
+ 
+ void DelegateImpl::GetLidAngle(GetLidAngleCallback callback) {
+-  auto cros_fd = base::ScopedFD(open(ec::kCrosEcPath, O_RDONLY));
+-  auto cmd = ec_command_factory_->MotionSenseCommandLidAngle();
+-  if (!cmd) {
+-    std::move(callback).Run(std::nullopt);
+-    return;
++  ec::MotionSenseCommandLidAngle cmd;
++    std::move(callback).Run(cmd.LidAngle());
+   }
+-  if (!cmd->Run(cros_fd.get())) {
+-    // TODO(b/274524224): Remove the below invalid EC result handling.
+-    if (cmd->Result() == 1 || cmd->Result() == 3) {
+-      std::move(callback).Run(LID_ANGLE_UNRELIABLE);
+-      return;
+-    }
+-    std::move(callback).Run(std::nullopt);
+-    return;
+-  }
+-  std::move(callback).Run(cmd->LidAngle());
+-}
+ 
+ void DelegateImpl::GetPsr(GetPsrCallback callback) {
+   PsrFetcher psr_fetcher;

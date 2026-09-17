@@ -1,0 +1,75 @@
+diff --git a/trunks/BUILD.gn b/trunks/BUILD.gn
+index ebd9f6a32d..5b2e13ed43 100644
+--- a/trunks/BUILD.gn
++++ b/trunks/BUILD.gn
+@@ -58,7 +58,9 @@ pkg_config("target_default_pkg_deps") {
+ 
+ config("target_defaults") {
+   configs = [ ":target_default_pkg_deps" ]
+-  defines = [ "USE_GENERIC_TPM2=${use.generic_tpm2}" ]
++  defines = [
++    "USE_GENERIC_TPM2=${use.generic_tpm2}",
++  ]
+   libs = [ "hwsec-foundation" ]
+ }
+ 
+diff --git a/trunks/trunksd.cc b/trunks/trunksd.cc
+index cf90101df2..051d0062d4 100644
+--- a/trunks/trunksd.cc
++++ b/trunks/trunksd.cc
+@@ -4,6 +4,7 @@
+ 
+ #include <signal.h>
+ #include <sysexits.h>
++#include <unistd.h>
+ 
+ #include <base/at_exit.h>
+ #include <base/check.h>
+@@ -110,13 +111,30 @@ int main(int argc, char** argv) {
+   } else {
+     low_level_transceiver = new trunks::TpmHandle(metrics, write_error_tracker);
+   }
+-  CHECK(low_level_transceiver->Init())
+-      << "Error initializing TPM communication.";
++  // On devices without a TPM (e.g. S1105ANR100) /dev/tpm0 never appears.
++  // Daemonize first so upstart's `expect fork` records `started trunksd` (the
++  // downstream tpm_managerd/attestationd/... chain depends on this event),
++  // then exit EX_OK. Paired with `normal exit 0` in trunksd.conf this skips
++  // respawn without CHECK-aborting. Upstream's retry + respawn safety net for
++  // real TPM boot-time races is preserved because we only short-circuit when
++  // the device node is absent entirely
++  //.
++  const bool no_tpm_device =
++      !cl->HasSwitch("ftdi") && access("/dev/tpm0", F_OK) != 0;
++  if (no_tpm_device) {
++    LOG(WARNING) << "No TPM device at /dev/tpm0; trunksd will not run.";
++  } else {
++    CHECK(low_level_transceiver->Init())
++        << "Error initializing TPM communication.";
++  }
+ 
+   // Upstart would know trunksd is ready after trunksd daemonized.
+   if (daemonize) {
+     PLOG_IF(FATAL, daemon(0, noclose) == -1) << "Failed to daemonize";
+   }
++  if (no_tpm_device) {
++    return EX_OK;
++  }
+ 
+   // This needs to be *after* opening the TPM handle and *before* starting the
+   // background thread.
+diff --git a/trunks/trunksd.conf b/trunks/trunksd.conf
+index b07c396443..39d824b8f1 100644
+--- a/trunks/trunksd.conf
++++ b/trunks/trunksd.conf
+@@ -10,6 +10,10 @@ author          "chromium-os-dev@chromium.org"
+ start on started boot-services and stopped cr50-result and started dbus
+ stop on hwsec-stop-low-level-tpm-daemon-signal
+ respawn
++# On no-TPM devices trunksd exits EX_OK via /dev/tpm0 absence guard; don't
++# respawn those. Real boot-time
++# races still use the upstream TpmHandle::Init retry + upstart respawn path.
++normal exit 0
+ 
+ 
+ oom score -100

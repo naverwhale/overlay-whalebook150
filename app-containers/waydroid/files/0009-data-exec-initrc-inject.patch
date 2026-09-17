@@ -1,0 +1,30 @@
+From: WhaleOS <whaleos-dev@navercorp.com>
+Subject: [PATCH 9/9] Fix /data noexec: rbind,exec and inject init.waydroid.rc
+
+ChromeOS encrypts the stateful partition (encstateful) and always mounts
+it with noexec.  Our waydroid work directory lives under
+/usr/local/var/lib/waydroid (set by patch 0008), and on ChromeOS
+/usr/local/var is a system-level symlink to /var, so the work dir
+resolves to /var/lib/waydroid -- i.e. on encstateful and inherits
+noexec.  Android's vold/init then re-mounts /data from the encstateful
+block device, also inheriting noexec, which prevents dlopen() of native
+libraries installed under /data/app.
+
+Two fixes in tools/helpers/lxc.py:
+
+1. Add exec to the rbind options for the waydroid_data bind-mount so the
+   initial LXC mount is already exec-capable.
+
+2. Bind-mount /usr/lib/waydroid/data/configs/init.waydroid.rc over
+   system/etc/init/init.waydroid.rc before Android init runs.  The
+   injected RC file adds an "exec -- /system/bin/mount -o remount,exec
+   /data" in the post-fs-data stage so that even after vold re-mounts
+   /data with noexec the flag is stripped before any app code runs.
+
+--- a/tools/helpers/lxc.py
++++ b/tools/helpers/lxc.py
+@@ -210,2 +210,3 @@
+-    if not make_entry(session["waydroid_data"], "data", options="rbind 0 0"):
++    if not make_entry(session["waydroid_data"], "data", options="rbind,exec 0 0"):
+         raise OSError("Failed to bind userdata")
++    make_entry("/usr/lib/waydroid/data/configs/init.waydroid.rc", "system/etc/init/init.waydroid.rc")

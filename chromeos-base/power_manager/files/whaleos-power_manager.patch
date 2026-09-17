@@ -1,0 +1,1004 @@
+diff --git a/power_manager/optional_prefs/suspend_to_idle_models b/power_manager/optional_prefs/suspend_to_idle_models
+new file mode 100644
+index 0000000000..af23b45164
+--- /dev/null
++++ b/power_manager/optional_prefs/suspend_to_idle_models
+@@ -0,0 +1,4 @@
++950QDB
++950QED
++930XDB/931XDB/930XDY
++521QFD
+diff --git a/power_manager/powerd/daemon.cc b/power_manager/powerd/daemon.cc
+index 7604507de7..8c98641203 100644
+--- a/power_manager/powerd/daemon.cc
++++ b/power_manager/powerd/daemon.cc
+@@ -13,6 +13,8 @@
+ #include <memory>
+ #include <utility>
+ 
++#include <brillo/whaleos_util.h>
++
+ #include <base/check.h>
+ #include <base/check_op.h>
+ #include <base/files/file_util.h>
+@@ -288,6 +290,10 @@ class Daemon::StateControllerDelegate
+       case policy::StateController::ActionReason::LID_CLOSED:
+         suspend_reason = SuspendImminent_Reason_LID_CLOSED;
+         break;
++      case policy::StateController::ActionReason::SLEEP_BUTTON_PRESS:
++        suspend_reason = SuspendImminent_Reason_OTHER;
++        daemon_->suspender_->HandleSleepButtonPressed();
++        break;
+     }
+     daemon_->Suspend(suspend_reason, std::nullopt, base::TimeDelta(),
+                      SuspendFlavor::SUSPEND_DEFAULT);
+@@ -516,6 +522,10 @@ void Daemon::Init() {
+   }
+ 
+   prefs_->GetBool(kManualEventlogAddPref, &log_suspend_manually_);
++  if (machine_quirks_->IsLGWhalebook3()) {
++    prefs_->SetInt64(kSuspendToIdlePref, 1);
++    LOG(INFO) << "Suspend to Idle Pref set to enabled";
++  }
+   prefs_->GetBool(kSuspendToIdlePref, &suspend_to_idle_);
+ 
+   battery_percentage_converter_ =
+@@ -525,6 +535,7 @@ void Daemon::Init() {
+       base::FilePath(kPowerStatusPath), cros_ec_path_,
+       ec_command_factory_.get(), prefs_.get(), udev_.get(), dbus_wrapper_.get(),
+       battery_percentage_converter_.get());
++  power_supply_->SetLGWhalebook3(machine_quirks_->IsLGWhalebook3());
+   power_supply_->AddObserver(this);
+   if (!power_supply_->RefreshImmediately()) {
+     LOG(ERROR) << "Initial power supply refresh failed; brace for weirdness";
+@@ -587,6 +598,16 @@ void Daemon::Init() {
+   state_controller_->Init(state_controller_delegate_.get(), prefs_.get(),
+                           dbus_wrapper_.get(), power_source, lid_state);
+ 
++  state_controller_->SetLenovo(machine_quirks_->IsLenovo());
++
++  // Check last TPM response
++  if (brillo::IsWhalebook2Model()) {
++    std::string response;
++    base::ReadFileToString(
++        base::FilePath("/sys/class/tpm/tpm0/ppi/response"), &response);
++    LOG(INFO) << "TPM response: " << response;
++  }
++
+   if (BoolPrefIsTrue(kUseCrasPref)) {
+     audio_client_ = delegate_->CreateAudioClient(dbus_wrapper_.get(), run_dir_);
+     audio_client_->AddObserver(this);
+@@ -623,6 +644,11 @@ void Daemon::Init() {
+     RunSetuidHelper("set_force_lid_open", "--noforce_lid_open", false);
+   }
+ 
++  // Remove leftover FARC runtime files on every boot. Safe to run when the
++  // files do not exist; the setuid helper uses base::DeleteFile() which
++  // treats a missing path as success.
++  RunSetuidHelper("cleanup_farc_files", "", false);
++
+   thermal_devices_ = delegate_->CreateThermalDevices();
+   std::vector<system::ThermalDeviceInterface*> weak_thermal_device;
+   for (const auto& thermal_device : thermal_devices_) {
+@@ -811,6 +837,14 @@ void Daemon::HandlePowerButtonEvent(ButtonState state) {
+   }
+ }
+ 
++void Daemon::HandleSleepButtonEvent(ButtonState state) {
++  // Don't log spammy repeat events if we see them.
++  if (state != ButtonState::REPEAT)
++    LOG(INFO) << "Sleep button " << ButtonStateToString(state);
++  if (state == ButtonState::DOWN)
++    state_controller_->HandleSleepButtonPress();
++}
++
+ void Daemon::HandleHoverStateChange(bool hovering) {
+   if (hovering) {
+     hovering_logger_->OnActivityStarted();
+@@ -1656,6 +1690,20 @@ std::unique_ptr<dbus::Response> Daemon::HandleRequestRestartMethod(
+   std::string description;
+   reader.PopString(&description);
+ 
++  // LGE requires Whalebook to run boot_complete before restart.
++  // This happens only at the very first boot in manufacturing.
++  if (description == "First boot in manufacturing") {
++    RunSetuidHelper("request_tpm_clear", "", true);
++    std::string response;
++    base::ReadFileToString(
++        base::FilePath("/sys/class/tpm/tpm0/ppi/response"), &response);
++    LOG(INFO) << "TPM clear result: " << response;
++
++    RunSetuidHelper("boot_complete", "", true);
++  } else if (description == "Update BIOS") {
++    RunSetuidHelper("run_bios_updater", "", true);
++  }
++
+   LOG(INFO) << "Got " << kRequestRestartMethod << " message from "
+             << method_call->GetSender() << " with reason "
+             << ShutdownReasonToString(reason) << " (" << description << ")";
+diff --git a/power_manager/powerd/daemon.h b/power_manager/powerd/daemon.h
+index bdb6cb4c24..006f9f1b17 100644
+--- a/power_manager/powerd/daemon.h
++++ b/power_manager/powerd/daemon.h
+@@ -176,6 +176,7 @@ class Daemon : public policy::AdaptiveChargingControllerInterface::Delegate,
+   void HandleLidClosed() override;
+   void HandleLidOpened() override;
+   void HandlePowerButtonEvent(ButtonState state) override;
++  void HandleSleepButtonEvent(ButtonState state) override;
+   void HandleHoverStateChange(bool hovering) override;
+   void HandleTabletModeChange(TabletMode mode) override;
+   void ShutDownForPowerButtonWithNoDisplay() override;
+diff --git a/power_manager/powerd/policy/input_event_handler.cc b/power_manager/powerd/policy/input_event_handler.cc
+index 43d667af65..39d0bf7626 100644
+--- a/power_manager/powerd/policy/input_event_handler.cc
++++ b/power_manager/powerd/policy/input_event_handler.cc
+@@ -167,6 +167,30 @@ void InputEventHandler::OnPowerButtonEvent(ButtonState state) {
+   delegate_->HandlePowerButtonEvent(state);
+ }
+ 
++void InputEventHandler::OnSleepButtonEvent(ButtonState state) {
++  if (factory_mode_) {
++    LOG(INFO) << "Ignoring sleep button " << ButtonStateToString(state)
++              << " for factory mode";
++    return;
++  }
++
++  if (clock_->GetCurrentTime() < ignore_sleep_button_deadline_) {
++    bool ignore = state == ButtonState::DOWN || sleep_button_down_ignored_;
++    if (state == ButtonState::UP)  // Consumed, we no longer need the deadline.
++      IgnoreNextSleepButtonPress(base::TimeDelta());
++    else if (state == ButtonState::DOWN)
++      sleep_button_down_ignored_ = true;
++    if (ignore) {
++      // Ignore down event or up event if it matches a down event.
++      LOG(INFO) << "Ignored sleep button " << ButtonStateToString(state);
++      // Do not forward this event.
++      return;
++    }
++  }
++
++  delegate_->HandleSleepButtonEvent(state);
++}
++
+ void InputEventHandler::OnHoverStateChange(bool hovering) {
+   delegate_->HandleHoverStateChange(hovering);
+ }
+@@ -184,6 +208,19 @@ void InputEventHandler::IgnoreNextPowerButtonPress(
+   }
+ }
+ 
++void InputEventHandler::IgnoreNextSleepButtonPress(
++    const base::TimeDelta& timeout) {
++  if (timeout.is_zero()) {
++    VLOG(1) << "Cancel sleep button press discarding";
++    ignore_sleep_button_deadline_ = base::TimeTicks();
++    sleep_button_down_ignored_ = false;
++  } else {
++    VLOG(1) << "Ignoring sleep button for " << timeout.InMilliseconds()
++            << " ms";
++    ignore_sleep_button_deadline_ = clock_->GetCurrentTime() + timeout;
++  }
++}
++
+ void InputEventHandler::OnPowerButtonAcknowledgmentTimeout() {
+   TRACE_EVENT("power", "InputEventHandler::OnPowerButtonAcknowledgmentTimeout");
+   delegate_->ReportPowerButtonAcknowledgmentDelay(
+diff --git a/power_manager/powerd/policy/input_event_handler.h b/power_manager/powerd/policy/input_event_handler.h
+index f7f2333a70..267fb03aa5 100644
+--- a/power_manager/powerd/policy/input_event_handler.h
++++ b/power_manager/powerd/policy/input_event_handler.h
+@@ -53,6 +53,9 @@ class InputEventHandler : public system::InputObserver {
+     // Handles the power button being pressed or released.
+     virtual void HandlePowerButtonEvent(ButtonState state) = 0;
+ 
++    // Handles the power button being pressed or released.
++    virtual void HandleSleepButtonEvent(ButtonState state) = 0;
++
+     // Handles hovering/proximity changes.
+     virtual void HandleHoverStateChange(bool hovering) = 0;
+ 
+@@ -101,6 +104,7 @@ class InputEventHandler : public system::InputObserver {
+   void OnLidEvent(LidState state) override;
+   void OnTabletModeEvent(TabletMode mode) override;
+   void OnPowerButtonEvent(ButtonState state) override;
++  void OnSleepButtonEvent(ButtonState state) override;
+   void OnHoverStateChange(bool hovering) override;
+ 
+  private:
+@@ -108,6 +112,10 @@ class InputEventHandler : public system::InputObserver {
+   // or a power button release was detected. Set |timeout| to 0 to cancel it.
+   void IgnoreNextPowerButtonPress(const base::TimeDelta& timeout);
+ 
++  // Discards all sleep button actions until |timeout| has elapsed
++  // or a sleep button release was detected. Set |timeout| to 0 to cancel it.
++  void IgnoreNextSleepButtonPress(const base::TimeDelta& timeout);
++
+   // Tells |delegate_| when Chrome hasn't acknowledged a power button press
+   // quickly enough.
+   void OnPowerButtonAcknowledgmentTimeout();
+@@ -153,6 +161,11 @@ class InputEventHandler : public system::InputObserver {
+   // The last key down event on the power button was ignored.
+   bool power_button_down_ignored_ = false;
+ 
++  // Timestamp until when we are ignoring actions on the sleep button.
++  base::TimeTicks ignore_sleep_button_deadline_;
++  // The last key down event on the sleep button was ignored.
++  bool sleep_button_down_ignored_ = false;
++
+   base::WeakPtrFactory<InputEventHandler> weak_ptr_factory_;
+ };
+ 
+diff --git a/power_manager/powerd/policy/state_controller.cc b/power_manager/powerd/policy/state_controller.cc
+index 9c881d594d..302ac19685 100644
+--- a/power_manager/powerd/policy/state_controller.cc
++++ b/power_manager/powerd/policy/state_controller.cc
+@@ -464,14 +464,34 @@ void StateController::Init(Delegate* delegate,
+   initialized_ = true;
+ }
+ 
++void StateController::DeferredUpdate()
++{
++  power_source_ = PowerSource::BATTERY;
++  UpdateLastUserActivityTime();
++  UpdateSettingsAndState();
++}
++
+ void StateController::HandlePowerSourceChange(PowerSource source) {
+   TRACE_EVENT("power", "StateController::HandlePowerSourceChange", "source",
+               source);
+   CHECK(initialized_);
++
++  if (IsLenovo() && deferred_update_timer_.IsRunning() && source == PowerSource::AC) {
++    deferred_update_timer_.Stop();
++    LOG(WARNING) << "The charger dropped for a while, but donot update";
++    return;
++  }
++
+   if (source == power_source_) {
+     return;
+   }
+ 
++  if (IsLenovo() && source == PowerSource::BATTERY) {
++    LOG(WARNING) << "The charger dropped, watch status for 150 ms.";
++    deferred_update_timer_.Start(FROM_HERE, base::Milliseconds(150), this, &StateController::DeferredUpdate);
++    return;
++  }
++
+   power_source_ = source;
+   UpdateLastUserActivityTime();
+   UpdateSettingsAndState();
+@@ -493,6 +513,13 @@ void StateController::HandleLidStateChange(LidState state) {
+   UpdateSettingsAndState();
+ }
+ 
++void StateController::HandleSleepButtonPress() {
++  CHECK(initialized_);
++
++  sleep_button_action_performed_ = false;
++  UpdateSettingsAndState();
++}
++
+ void StateController::HandleTabletModeChange(TabletMode mode) {
+   TRACE_EVENT("power", "StateController::HandleTabletModeChange", "mode", mode);
+   DCHECK(initialized_);
+@@ -1479,12 +1506,20 @@ void StateController::UpdateState() {
+     lid_closed_action_performed_ = false;
+   }
+ 
++  Action sleep_button_action_to_perform = Action::DO_NOTHING;
++  if (!sleep_button_action_performed_) {
++    sleep_button_action_to_perform = Action::SUSPEND;
++    sleep_button_action_performed_ = true;
++  }
++
+   if (idle_action_to_perform == Action::SHUT_DOWN ||
+       lid_closed_action_to_perform == Action::SHUT_DOWN) {
+     // If either of the actions is shutting down, don't perform the other.
+     PerformAction(Action::SHUT_DOWN, idle_action_to_perform == Action::SHUT_DOWN
+                                          ? ActionReason::IDLE
+                                          : ActionReason::LID_CLOSED);
++  } else if (sleep_button_action_to_perform == Action::SUSPEND) {
++    PerformAction(sleep_button_action_to_perform, ActionReason::SLEEP_BUTTON_PRESS);
+   } else if (idle_action_to_perform == lid_closed_action_to_perform) {
+     // If both actions are the same, only perform it once.
+     PerformAction(idle_action_to_perform, ActionReason::IDLE);
+diff --git a/power_manager/powerd/policy/state_controller.h b/power_manager/powerd/policy/state_controller.h
+index 53ef0b6346..3553ad2d71 100644
+--- a/power_manager/powerd/policy/state_controller.h
++++ b/power_manager/powerd/policy/state_controller.h
+@@ -51,6 +51,8 @@ class StateController : public PrefsObserver {
+     IDLE,
+     // The system's lid was closed.
+     LID_CLOSED,
++    // The system's sleep button was pushed.
++    SLEEP_BUTTON_PRESS,
+   };
+ 
+   // Interface for classes that perform the actions requested by
+@@ -196,6 +198,7 @@ class StateController : public PrefsObserver {
+   // Handles various changes to external state.
+   void HandlePowerSourceChange(PowerSource source);
+   void HandleLidStateChange(LidState state);
++  void HandleSleepButtonPress();
+   void HandleTabletModeChange(TabletMode mode);
+   void HandleSessionStateChange(SessionState state);
+   void HandleDisplayModeChange(DisplayMode mode);
+@@ -229,6 +232,14 @@ class StateController : public PrefsObserver {
+   // HPS.
+   bool ShouldRequestDimDeferSuggestion(base::TimeTicks now);
+ 
++  // W/A for issues that drop the charger.
++  void SetLenovo(bool lenovo) {
++    lenovo_ = lenovo;
++  }
++  bool IsLenovo() {
++    return lenovo_;
++  }
++
+  private:
+   // Holds a collection of delays. Unset delays take the zero value.
+   struct Delays {
+@@ -342,6 +353,9 @@ class StateController : public PrefsObserver {
+   base::TimeTicks GetLastActivityTimeForScreenLock(base::TimeTicks now) const;
+   base::TimeTicks GetLastActivityTimeForQuickLock(base::TimeTicks now) const;
+ 
++  // W/A for issues that drop the charger.
++  void DeferredUpdate();
++
+   // Updates |last_user_activity_time_| to contain the current time and
+   // calls |delegate_|'s ReportUserActivityMetrics() method.
+   void UpdateLastUserActivityTime();
+@@ -453,6 +467,10 @@ class StateController : public PrefsObserver {
+   bool got_initial_display_mode_ = false;
+   bool got_initial_policy_ = false;
+ 
++  // W/A for issues that drop the charger.
++  bool lenovo_;
++  base::OneShotTimer deferred_update_timer_;
++
+   // Runs HandleActionTimeout().
+   base::OneShotTimer action_timer_;
+ 
+@@ -491,6 +509,7 @@ class StateController : public PrefsObserver {
+   bool sent_idle_warning_ = false;
+   bool idle_action_performed_ = false;
+   bool lid_closed_action_performed_ = false;
++  bool sleep_button_action_performed_ = true;
+ 
+   // Set to true by UpdateSettingsAndState() if UpdateState() should send
+   // another warning if the delay has elapsed, even if |sent_idle_warning_| is
+diff --git a/power_manager/powerd/policy/suspender.cc b/power_manager/powerd/policy/suspender.cc
+index 4378dde635..cc0322a3d4 100644
+--- a/power_manager/powerd/policy/suspender.cc
++++ b/power_manager/powerd/policy/suspender.cc
+@@ -144,6 +144,10 @@ void Suspender::HandleLidOpened() {
+   HandleEvent(Event::USER_ACTIVITY);
+ }
+ 
++void Suspender::HandleSleepButtonPressed() {
++  sleep_button_pressed_ = true;
++}
++
+ void Suspender::HandleUserActivity() {
+   HandleEvent(Event::USER_ACTIVITY);
+ }
+@@ -528,6 +532,11 @@ Suspender::State Suspender::HandleWakeEventInSuspend(Event event) {
+     return state_;
+   }
+ 
++  if (sleep_button_pressed_) {
++    LOG(INFO) << "Not waking up when sleep button pressed";
++    return state_;
++  }
++
+   LOG(INFO) << "Aborting request in response to event " << EventToString(event);
+   FinishRequest(false, SuspendDone_WakeupType_NOT_APPLICABLE);
+   return State::IDLE;
+@@ -809,6 +818,9 @@ void Suspender::ScheduleResuspend(const base::TimeDelta& delay) {
+ void Suspender::EmitSuspendDoneSignal(int suspend_request_id,
+                                       const base::TimeDelta& suspend_duration,
+                                       SuspendDone::WakeupType wakeup_type) {
++  LOG(ERROR) << "Reset sleep_button_pressed_";
++  sleep_button_pressed_ = false;
++
+   SuspendDone proto;
+   proto.set_suspend_id(suspend_request_id);
+   proto.set_suspend_duration(suspend_duration.InMicroseconds());
+diff --git a/power_manager/powerd/policy/suspender.h b/power_manager/powerd/policy/suspender.h
+index 83847c78e8..256c4713d7 100644
+--- a/power_manager/powerd/policy/suspender.h
++++ b/power_manager/powerd/policy/suspender.h
+@@ -242,6 +242,7 @@ class Suspender : public SuspendDelayObserver,
+                       SuspendFlavor flavor);
+ 
+   // Handles events that may abort in-progress suspend attempts.
++  void HandleSleepButtonPressed();
+   void HandleLidOpened();
+   void HandleUserActivity();
+   void HandleWakeNotification();
+@@ -484,6 +485,8 @@ class Suspender : public SuspendDelayObserver,
+   // Whether the system is presenting or not.
+   DisplayMode display_mode_ = DisplayMode::NORMAL;
+ 
++  bool sleep_button_pressed_ = false;
++
+   // Keep this last.
+   base::WeakPtrFactory<Suspender> weak_ptr_factory_;
+ };
+diff --git a/power_manager/powerd/powerd_setuid_helper.cc b/power_manager/powerd/powerd_setuid_helper.cc
+index bfaf565278..31d0a2199c 100644
+--- a/power_manager/powerd/powerd_setuid_helper.cc
++++ b/power_manager/powerd/powerd_setuid_helper.cc
+@@ -99,6 +99,22 @@ int main(int argc, char* argv[]) {
+           isxdigit(FLAGS_eventlog_code[3]))
+         << "Invalid event code";
+     RunCommand("elogtool", "add", FLAGS_eventlog_code.c_str(), nullptr);
++  } else if (FLAGS_action == "request_tpm_clear") {
++    base::WriteFile(base::FilePath("/sys/class/tpm/tpm0/ppi/request"), "5");
++  // Whalebook can run boot_complete here as root.
++  } else if (FLAGS_action == "boot_complete") {
++    RunCommand("boot_complete", nullptr);
++  } else if (FLAGS_action == "run_bios_updater") {
++    RunCommand("/boot/syslinux/bios_upd/fw_upd_prepare.sh", "/boot/syslinux/bios_upd");
++  } else if (FLAGS_action == "cleanup_farc_files") {
++    // Remove leftover FARC runtime image files from /mnt/stateful_partition/unencrypted/.
++    // These may be present on devices that had FARC installed before it was removed.
++    // base::DeleteFile() returns true (no-op) if the file does not exist.
++    const base::FilePath kStatefulUnencrypted("/mnt/stateful_partition/unencrypted");
++    static const char* const kFarcFiles[] = {
++        "system.raw.img", "vendor.raw.img", "andruntime_version", "policy.30"};
++    for (const auto* f : kFarcFiles)
++      base::DeleteFile(kStatefulUnencrypted.Append(f));
+   } else if (FLAGS_action == "reboot" || FLAGS_action == "shut_down") {
+     std::string reason_arg;
+     if (!FLAGS_shutdown_reason.empty()) {
+diff --git a/power_manager/powerd/system/event_device.cc b/power_manager/powerd/system/event_device.cc
+index 28b2e55321..b5e3c9028b 100644
+--- a/power_manager/powerd/system/event_device.cc
++++ b/power_manager/powerd/system/event_device.cc
+@@ -84,6 +84,10 @@ bool EventDevice::IsPowerButton() {
+   return HasEventBit(0, EV_KEY) && HasEventBit(EV_KEY, KEY_POWER);
+ }
+ 
++bool EventDevice::IsSleepButton() {
++  return HasEventBit(0, EV_KEY) && HasEventBit(EV_KEY, KEY_SLEEP);
++}
++
+ bool EventDevice::HoverSupported() {
+   // Multitouch hover uses just the ABS_MT_DISTANCE event in addition to
+   // the normal multi-touch events.
+diff --git a/power_manager/powerd/system/event_device.h b/power_manager/powerd/system/event_device.h
+index a32db526ef..66bcdb1178 100644
+--- a/power_manager/powerd/system/event_device.h
++++ b/power_manager/powerd/system/event_device.h
+@@ -34,6 +34,7 @@ class EventDevice : public EventDeviceInterface {
+   bool IsLidSwitch() override;
+   bool IsTabletModeSwitch() override;
+   bool IsPowerButton() override;
++  bool IsSleepButton() override;
+   bool HoverSupported() override;
+   bool HasLeftButton() override;
+   LidState GetInitialLidState() override;
+diff --git a/power_manager/powerd/system/event_device_interface.h b/power_manager/powerd/system/event_device_interface.h
+index 6339333672..e99dd45da2 100644
+--- a/power_manager/powerd/system/event_device_interface.h
++++ b/power_manager/powerd/system/event_device_interface.h
+@@ -47,6 +47,9 @@ class EventDeviceInterface {
+   // Returns true if the device can report power button events.
+   virtual bool IsPowerButton() = 0;
+ 
++  // Returns true if the device can report sleep button events.
++  virtual bool IsSleepButton() = 0;
++
+   // Returns true if the device can report hover events.
+   virtual bool HoverSupported() = 0;
+ 
+diff --git a/power_manager/powerd/system/event_device_stub.cc b/power_manager/powerd/system/event_device_stub.cc
+index e4d2e78c33..d44bfab61f 100644
+--- a/power_manager/powerd/system/event_device_stub.cc
++++ b/power_manager/powerd/system/event_device_stub.cc
+@@ -51,6 +51,10 @@ bool EventDeviceStub::IsPowerButton() {
+   return is_power_button_;
+ }
+ 
++bool EventDeviceStub::IsSleepButton() {
++  return is_sleep_button_;
++}
++
+ bool EventDeviceStub::HoverSupported() {
+   return hover_supported_;
+ }
+diff --git a/power_manager/powerd/system/event_device_stub.h b/power_manager/powerd/system/event_device_stub.h
+index 19572910c5..94090ecef1 100644
+--- a/power_manager/powerd/system/event_device_stub.h
++++ b/power_manager/powerd/system/event_device_stub.h
+@@ -36,6 +36,7 @@ class EventDeviceStub : public EventDeviceInterface {
+     is_tablet_mode_switch_ = is_switch;
+   }
+   void set_is_power_button(bool is_button) { is_power_button_ = is_button; }
++  void set_is_sleep_button(bool is_button) { is_sleep_button_ = is_button; }
+   void set_hover_supported(bool supported) { hover_supported_ = supported; }
+   void set_has_left_button(bool has_button) { has_left_button_ = has_button; }
+   void set_initial_lid_state(LidState state) { initial_lid_state_ = state; }
+@@ -58,6 +59,7 @@ class EventDeviceStub : public EventDeviceInterface {
+   bool IsLidSwitch() override;
+   bool IsTabletModeSwitch() override;
+   bool IsPowerButton() override;
++  bool IsSleepButton() override;
+   bool HoverSupported() override;
+   bool HasLeftButton() override;
+   LidState GetInitialLidState() override;
+@@ -73,6 +75,7 @@ class EventDeviceStub : public EventDeviceInterface {
+   bool is_lid_switch_ = false;
+   bool is_tablet_mode_switch_ = false;
+   bool is_power_button_ = false;
++  bool is_sleep_button_ = false;
+   bool hover_supported_ = false;
+   bool has_left_button_ = false;
+   bool device_disconnected_ = false;
+diff --git a/power_manager/powerd/system/input_observer.h b/power_manager/powerd/system/input_observer.h
+index 43fd16fa28..8c7a783a03 100644
+--- a/power_manager/powerd/system/input_observer.h
++++ b/power_manager/powerd/system/input_observer.h
+@@ -28,6 +28,9 @@ class InputObserver : public base::CheckedObserver {
+   // Called when a power button event occurs.
+   virtual void OnPowerButtonEvent(ButtonState state) = 0;
+ 
++  // Called when a sleep button event occurs.
++  virtual void OnSleepButtonEvent(ButtonState state) = 0;
++
+   // Called when the user's hands start or stop hovering over the touchpad.
+   virtual void OnHoverStateChange(bool hovering) = 0;
+ };
+diff --git a/power_manager/powerd/system/input_watcher.cc b/power_manager/powerd/system/input_watcher.cc
+index 898be97325..2eea719845 100644
+--- a/power_manager/powerd/system/input_watcher.cc
++++ b/power_manager/powerd/system/input_watcher.cc
+@@ -99,6 +99,28 @@ bool GetPowerButtonStateFromEvent(const input_event& event,
+   return true;
+ }
+ 
++bool GetSleepButtonStateFromEvent(const input_event& event,
++                                  ButtonState* state_out) {
++  if (event.type != EV_KEY || event.code != KEY_SLEEP)
++    return false;
++
++  switch (event.value) {
++    case 0:
++      *state_out = ButtonState::UP;
++      break;
++    case 1:
++      *state_out = ButtonState::DOWN;
++      break;
++    case 2:
++      *state_out = ButtonState::REPEAT;
++      break;
++    default:
++      LOG(ERROR) << "Unhandled button state " << event.value;
++      return false;
++  }
++  return true;
++}
++
+ }  // namespace
+ 
+ const char InputWatcher::kPowerButtonToSkip[] = "LNXPWRBN";
+@@ -270,6 +292,9 @@ uint32_t InputWatcher::GetDeviceTypes(
+   if (power_button_devices_.count(device)) {
+     device_types |= DEVICE_POWER_BUTTON;
+   }
++  if (device == sleep_button_device_) {
++    device_types |= DEVICE_SLEEP_BUTTON;
++  }
+   if (device == lid_device_) {
+     device_types |= DEVICE_LID_SWITCH;
+   }
+@@ -354,6 +379,15 @@ void InputWatcher::ProcessEvent(const input_event& event,
+     }
+   }
+ 
++  ButtonState sleep_button_state = ButtonState::DOWN;
++  if ((device_types & DEVICE_SLEEP_BUTTON) &&
++      GetSleepButtonStateFromEvent(event, &sleep_button_state)) {
++    VLOG(1) << "Notifying observers about sleep button "
++            << ButtonStateToString(sleep_button_state) << " event";
++    for (InputObserver& observer : observers_)
++      observer.OnSleepButtonEvent(button_state);
++  }
++
+   if (device_types & DEVICE_HOVER) {
+     ProcessHoverEvent(event);
+   }
+@@ -436,6 +470,7 @@ void InputWatcher::HandleAddedInput(const std::string& input_name,
+   bool should_watch = false;
+ 
+   const std::string phys = device->GetPhysPath();
++
+   if (base::StartsWith(phys, power_button_to_skip_,
+                        base::CompareCase::SENSITIVE)) {
+     VLOG(1) << "Skipping event device with phys path: " << phys;
+@@ -443,6 +478,10 @@ void InputWatcher::HandleAddedInput(const std::string& input_name,
+     LOG(INFO) << "Watching power button: " << device->GetDebugName();
+     should_watch = true;
+     power_button_devices_.insert(device.get());
++  } else if (device->IsSleepButton()) {
++    LOG(INFO) << "Watching sleep button: " << device->GetDebugName();
++    should_watch = true;
++    sleep_button_device_ = device.get();
+   }
+ 
+   // Note that it's possible for a power button and lid switch to share a single
+@@ -518,6 +557,9 @@ void InputWatcher::HandleRemovedInput(int input_num) {
+   if (it != event_devices_.end()) {
+     LOG(INFO) << "Stopping watching " << it->second->GetDebugName();
+     power_button_devices_.erase(it->second.get());
++    if (sleep_button_device_ == it->second.get()) {
++      sleep_button_device_ = nullptr;
++    }
+     if (lid_device_ == it->second.get()) {
+       lid_device_ = nullptr;
+     }
+diff --git a/power_manager/powerd/system/input_watcher.h b/power_manager/powerd/system/input_watcher.h
+index 6245a23eb8..9febaec7f7 100644
+--- a/power_manager/powerd/system/input_watcher.h
++++ b/power_manager/powerd/system/input_watcher.h
+@@ -92,6 +92,7 @@ class InputWatcher : public InputWatcherInterface,
+     DEVICE_LID_SWITCH = 1 << 1,
+     DEVICE_TABLET_MODE_SWITCH = 1 << 2,
+     DEVICE_HOVER = 1 << 3,
++    DEVICE_SLEEP_BUTTON = 1 << 4,
+   };
+ 
+   // Returns a bitfield of DeviceType values describing |device|.
+@@ -138,6 +139,10 @@ class InputWatcher : public InputWatcherInterface,
+   // in |event_devices_|.
+   std::set<const EventDeviceInterface*> power_button_devices_;
+ 
++  // Event devices reporting sleep button events. Unowned pointers to elements in
++  // |event_devices_|.
++  EventDeviceInterface* sleep_button_device_ = nullptr;
++
+   // The event device exposing the lid switch. Unowned pointer to an element in
+   // |event_devices_|, or null if no lid device was found.
+   EventDeviceInterface* lid_device_ = nullptr;
+diff --git a/power_manager/powerd/system/machine_quirks.cc b/power_manager/powerd/system/machine_quirks.cc
+index f3ed4aff76..73030eee75 100644
+--- a/power_manager/powerd/system/machine_quirks.cc
++++ b/power_manager/powerd/system/machine_quirks.cc
+@@ -375,4 +375,42 @@ bool MachineQuirks::ContainsDMIMatch(std::string_view dmi_ids_pref) {
+   return false;
+ }
+ 
++bool MachineQuirks::IsLenovo() {
++  CHECK(prefs_) << "MachineQuirks::Init() wasn't called";
++
++  std::string_view lenovo = "81M9";
++
++  if (IsProductNameMatch(lenovo)) {
++    LOG(INFO) << "Product name " << lenovo;
++    return true;
++  }
++
++  // Normal case, no quirk is required.
++  return false;
++}
++
++bool MachineQuirks::IsLGWhalebook3() {
++  CHECK(prefs_) << "MachineQuirks::Init() wasn't called";
++
++  static const std::string_view kModelNameStartings[] = {
++    "14TN30S",
++    "14TW30S",
++    "14TN30T",
++    "14TW30T",
++  };
++
++  std::string productName;
++  if (!ReadDMIValFromFile(kDefaultProductNameFile, &productName))
++    return false;
++  for (size_t i = 0; i < std::size(kModelNameStartings); i++) {
++    if (base::StartsWith(productName, kModelNameStartings[i])) {
++      LOG(INFO) << "Product name " << kModelNameStartings[i];
++      return true;
++    }
++  }
++
++  // Normal case, no quirk is required.
++  return false;
++}
++
+ }  // namespace power_manager::system
+diff --git a/power_manager/powerd/system/machine_quirks.h b/power_manager/powerd/system/machine_quirks.h
+index 07cd3a2e39..0ce594721d 100644
+--- a/power_manager/powerd/system/machine_quirks.h
++++ b/power_manager/powerd/system/machine_quirks.h
+@@ -39,6 +39,9 @@ class MachineQuirksInterface {
+   // the device should suspend without writing
+   // to wakeup_count.
+   virtual bool IsSuspendWithoutWakeupCount() = 0;
++  // Check dmi info to apply W/A
++  virtual bool IsLenovo() = 0;
++  virtual bool IsLGWhalebook3() = 0;
+ };
+ 
+ // Check for machine specific quirks from the running machine.
+@@ -104,6 +107,10 @@ class MachineQuirks : public MachineQuirksInterface {
+   // device's DMI val(s).
+   bool ContainsDMIMatch(std::string_view dmi_ids_pref);
+ 
++  // Check dmi info to apply W/A
++  bool IsLenovo() override;
++  bool IsLGWhalebook3() override;
++
+   // Functions used to pass in mock directories for unit tests
+   void set_dmi_id_dir_for_test(const base::FilePath& dir) { dmi_id_dir_ = dir; }
+   void set_power_supply_dir_for_test(const base::FilePath& dir) {
+diff --git a/power_manager/powerd/system/power_supply.cc b/power_manager/powerd/system/power_supply.cc
+index 1c0034b71f..26c6a84e42 100644
+--- a/power_manager/powerd/system/power_supply.cc
++++ b/power_manager/powerd/system/power_supply.cc
+@@ -76,9 +76,9 @@ constexpr base::TimeDelta kDefaultBatteryStabilizedAfterBatterySaverDelay =
+ constexpr base::TimeDelta kLowBatteryShutdownDelay = base::Seconds(5);
+ 
+ // Number of retry attempts for reading the PowerStatus.
+-constexpr int kPowerRefreshRetries = 5;
++constexpr int kPowerRefreshRetries = 6;
+ // Delay in milliseconds of retry attempts for reading the PowerStatus.
+-constexpr int kPowerRefreshDelays[] = {1, 10, 100, 1000, 1000};
++constexpr int kPowerRefreshDelays[] = {1, 10, 100, 1000, 1000, 10000};
+ 
+ // Power supply driver names.
+ constexpr char kCrosUsbPdCharger[] = "CROS_USBPD_CHARGER";
+@@ -1542,6 +1542,9 @@ bool PowerSupply::ReadBatteryDirectory(const base::FilePath& path,
+     } else {
+       LOG(WARNING) << "Ignoring reading with battery charge " << charge
+                    << " and battery-full charge " << charge_full;
++      if (charge_full > 0.0 && charge >= 0.0) {
++        LOG(WARNING) << "update percentag event if bettery charge " << charge;
++      } else
+       return false;
+     }
+   }
+@@ -1822,6 +1825,11 @@ bool PowerSupply::IsBatteryBelowShutdownThreshold(
+ }
+ 
+ bool PowerSupply::IsSupplyIgnored(const std::string& sysname) const {
++  if (IsLGWhalebook3() && base::StartsWith(sysname, "ucsi-source-psy")) {
++    LOG(INFO) << "skip " << sysname << " for Whalebook3";
++    return true;
++  }
++
+   if (sysname == "AC" && !has_barreljack_) {
+     return true;
+   }
+diff --git a/power_manager/powerd/system/power_supply.h b/power_manager/powerd/system/power_supply.h
+index 8afda923e6..57bcab5c28 100644
+--- a/power_manager/powerd/system/power_supply.h
++++ b/power_manager/powerd/system/power_supply.h
+@@ -317,6 +317,9 @@ class PowerSupplyInterface {
+   // Helper function to check whether or not the power status is sufficiently
+   // initialized for low battery shutdown.
+   virtual bool GetLowBatteryShutdownEnabled() = 0;
++
++  virtual void SetLGWhalebook3(bool whalebook3) = 0;
++  virtual bool IsLGWhalebook3() const = 0;
+ };
+ 
+ // Real implementation of PowerSupplyInterface that reads from sysfs.
+@@ -452,6 +455,14 @@ class PowerSupply : public PowerSupplyInterface, public UdevSubsystemObserver {
+   // Blocking method to retry RefreshImmediately() when it failed.
+   bool RefreshImmediatelyWithRetry();
+ 
++    // W/A for LG whalebook3 charger.
++  void SetLGWhalebook3(bool whalebook3) override {
++    whalebook3_ = whalebook3;
++  }
++  bool IsLGWhalebook3() const override {
++    return whalebook3_;
++  }
++
+  private:
+   // Specifies when UpdatePowerStatus() should update |power_status_|.
+   enum class UpdatePolicy {
+@@ -718,6 +729,8 @@ class PowerSupply : public PowerSupplyInterface, public UdevSubsystemObserver {
+   // Set to true when charging is stopped by Charge Limit.
+   bool charge_limited_ = false;
+ 
++  bool whalebook3_;
++
+   // Calls HandlePollTimeout().
+   base::OneShotTimer poll_timer_;
+ 
+diff --git a/power_manager/powerd/system/suspend_freezer.cc b/power_manager/powerd/system/suspend_freezer.cc
+index 1b0887cd4d..bcdb963846 100644
+--- a/power_manager/powerd/system/suspend_freezer.cc
++++ b/power_manager/powerd/system/suspend_freezer.cc
+@@ -44,7 +44,31 @@ void SuspendFreezer::Init(PrefsInterface* prefs) {
+ }
+ 
+ bool SuspendFreezer::GetCgroups(std::vector<base::FilePath>* cgroups) {
+-  sys_utils_->GetSubDirs(kBasePath, cgroups);
++  std::vector<base::FilePath> all_cgroups;
++  sys_utils_->GetSubDirs(kBasePath, &all_cgroups);
++  for (const auto& cg : all_cgroups) {
++    // WhaleOS: skip Waydroid's LXC freezer cgroups only
++    // (lxc.payload.waydroid, lxc.monitor.waydroid). Freezing the Waydroid
++    // payload mid-suspend races with Android's cooperative Doze hand-off
++    // in waydroid_helper -- wake locks haven't all released by the time
++    // the freeze hits, which leaves a wake source active and wedges
++    // powerd in pm_get_wakeup_count() on resume. The monitor cgroup also
++    // rejects FROZEN writes (the supervisor moves itself between cgroups)
++    // and causes powerd to fail the whole suspend cycle even though the
++    // kernel-level suspend succeeded. SuspendCoordinator drives the
++    // container into Doze before acking, so freezing these two cgroups
++    // is both unnecessary and harmful. Other lxc.* cgroups (dev/debug
++    // containers) still freeze normally.
++    // Own the string: cg.BaseName() returns a temporary FilePath and
++    // FilePath::value() is LIFETIME_BOUND on that temporary, so binding
++    // by reference would dangle at the semicolon.
++    const std::string basename = cg.BaseName().value();
++    if (basename == "lxc.payload.waydroid" ||
++        basename == "lxc.monitor.waydroid") {
++      continue;
++    }
++    cgroups->push_back(cg);
++  }
+   if (cgroups->empty()) {
+     LOG(ERROR) << "No children cgroups found in " << kBasePath;
+     return false;
+diff --git a/power_manager/powerd/system/suspend_freezer_test.cc b/power_manager/powerd/system/suspend_freezer_test.cc
+index cda4908ed0..d88e1ff9ef 100644
+--- a/power_manager/powerd/system/suspend_freezer_test.cc
++++ b/power_manager/powerd/system/suspend_freezer_test.cc
+@@ -167,6 +167,66 @@ TEST_F(SuspendFreezerTest, TestThawProcesses) {
+   EXPECT_EQ(kFreezerStateFrozen, mock_sys_utils_->file_contents_[test2State]);
+ }
+ 
++// WhaleOS: only Waydroid's LXC freezer cgroups are exempt from userspace
++// freeze; other lxc.* cgroups (dev/debug containers, other LXC payloads)
++// must still freeze along with the rest of userspace.
++TEST_F(SuspendFreezerTest, TestWaydroidLxcExclusionScope) {
++  const base::FilePath waydroid_payload_state =
++      base::FilePath("/sys/fs/cgroup/freezer/lxc.payload.waydroid")
++          .Append(kStateFile);
++  const base::FilePath waydroid_monitor_state =
++      base::FilePath("/sys/fs/cgroup/freezer/lxc.monitor.waydroid")
++          .Append(kStateFile);
++  const base::FilePath debug_payload_state =
++      base::FilePath("/sys/fs/cgroup/freezer/lxc.payload.debug")
++          .Append(kStateFile);
++  const base::FilePath debug_monitor_state =
++      base::FilePath("/sys/fs/cgroup/freezer/lxc.monitor.debug")
++          .Append(kStateFile);
++  // Same-prefix decoys: names that would sneak through a StartsWith
++  // ("lxc.payload.waydroid") check but must NOT be treated as Waydroid.
++  const base::FilePath waydroid_prefix_debug_state =
++      base::FilePath("/sys/fs/cgroup/freezer/lxc.payload.waydroid-debug")
++          .Append(kStateFile);
++  const base::FilePath waydroid_prefix_v2_state =
++      base::FilePath("/sys/fs/cgroup/freezer/lxc.monitor.waydroid2")
++          .Append(kStateFile);
++  const base::FilePath other_state =
++      base::FilePath("/sys/fs/cgroup/freezer/other_group").Append(kStateFile);
++
++  mock_sys_utils_->file_contents_[waydroid_payload_state] = kFreezerStateThawed;
++  mock_sys_utils_->file_contents_[waydroid_monitor_state] = kFreezerStateThawed;
++  mock_sys_utils_->file_contents_[debug_payload_state] = kFreezerStateThawed;
++  mock_sys_utils_->file_contents_[debug_monitor_state] = kFreezerStateThawed;
++  mock_sys_utils_->file_contents_[waydroid_prefix_debug_state] =
++      kFreezerStateThawed;
++  mock_sys_utils_->file_contents_[waydroid_prefix_v2_state] =
++      kFreezerStateThawed;
++  mock_sys_utils_->file_contents_[other_state] = kFreezerStateThawed;
++
++  EXPECT_EQ(FreezeResult::SUCCESS, suspend_freezer_.FreezeUserspace(1, true));
++
++  // Waydroid cgroups: skipped, so still Thawed.
++  EXPECT_EQ(kFreezerStateThawed,
++            mock_sys_utils_->file_contents_[waydroid_payload_state]);
++  EXPECT_EQ(kFreezerStateThawed,
++            mock_sys_utils_->file_contents_[waydroid_monitor_state]);
++  // Other LXC containers and non-LXC cgroups: frozen as usual.
++  EXPECT_EQ(kFreezerStateFrozen,
++            mock_sys_utils_->file_contents_[debug_payload_state]);
++  EXPECT_EQ(kFreezerStateFrozen,
++            mock_sys_utils_->file_contents_[debug_monitor_state]);
++  // Same-prefix decoys: exact-match rule must NOT exempt these.
++  EXPECT_EQ(kFreezerStateFrozen,
++            mock_sys_utils_->file_contents_[waydroid_prefix_debug_state]);
++  EXPECT_EQ(kFreezerStateFrozen,
++            mock_sys_utils_->file_contents_[waydroid_prefix_v2_state]);
++  EXPECT_EQ(kFreezerStateFrozen, mock_sys_utils_->file_contents_[other_state]);
++  EXPECT_EQ(kFreezerStateFrozen, mock_sys_utils_->file_contents_[test_state_]);
++
++  EXPECT_TRUE(suspend_freezer_.ThawProcesses());
++}
++
+ // Test that we fail properly if a root level cgroup is added that we don't have
+ // permission to write to.
+ TEST_F(SuspendFreezerTest, TestPermissionsFail) {
+diff --git a/power_manager/tmpfiles.d/powerd_suspend_to_idle.conf b/power_manager/tmpfiles.d/powerd_suspend_to_idle.conf
+new file mode 100644
+index 0000000000..08974498f1
+--- /dev/null
++++ b/power_manager/tmpfiles.d/powerd_suspend_to_idle.conf
+@@ -0,0 +1,6 @@
++# Copyright 2024 The Whale OS Authors.
++
++r= /var/lib/power_manager/has_machine_quirks
++C= /var/lib/power_manager/has_machine_quirks 0640 power power - /usr/share/power_manager/has_machine_quirks
++r= /var/lib/power_manager/suspend_to_idle_models
++C= /var/lib/power_manager/suspend_to_idle_models 0640 power power - /usr/share/power_manager/suspend_to_idle_models
+diff --git a/power_manager/tools/boot_complete b/power_manager/tools/boot_complete
+new file mode 100644
+index 0000000000000000000000000000000000000000..eb8c556222055d331da055f08b2b7bc964f441c0
+GIT binary patch
+literal 8704
+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
+
+literal 0
+HcmV?d00001
+

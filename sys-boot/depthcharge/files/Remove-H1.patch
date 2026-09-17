@@ -1,0 +1,48 @@
+diff --git a/depthcharge/board/trogdor/defconfig b/depthcharge/board/trogdor/defconfig
+index 3996911a..d9c7df9d 100644
+--- a/depthcharge/board/trogdor/defconfig
++++ b/depthcharge/board/trogdor/defconfig
+@@ -11,7 +11,11 @@ CONFIG_HEAP_SIZE=0x01800000
+ CONFIG_KERNEL_START=0xD0000000
+ 
+ # Vboot
++#if defined(WHALEOS_BUILD)
++CONFIG_MOCK_TPM=y
++#else
+ #CONFIG_MOCK_TPM is not set
++#endif
+ CONFIG_CROSSYSTEM_FDT=y
+ CONFIG_NVDATA_FLASH=y
+ CONFIG_EC_VBOOT_SUPPORT=y
+@@ -23,8 +27,10 @@ CONFIG_KERNEL_FIT=y
+ CONFIG_KERNEL_FIT_FDT_ADDR=0xF0000000
+ 
+ # Drivers
+-CONFIG_DRIVER_TPM_GOOGLE_CR50=y
+-CONFIG_DRIVER_TPM_SPI=y
++#if !defined(WHALEOS_BUILD)
++#CONFIG_DRIVER_TPM_GOOGLE_CR50=y
++#CONFIG_DRIVER_TPM_SPI=y
++#endif
+ CONFIG_DRIVER_EC_CROS=y
+ CONFIG_DRIVER_EC_CROS_SPI=y
+ CONFIG_DRIVER_EC_PS8751=y
+diff --git a/depthcharge/src/boot/fit.c b/depthcharge/src/boot/fit.c
+index 5857d15c..4b3f5ce4 100644
+--- a/depthcharge/src/boot/fit.c
++++ b/depthcharge/src/boot/fit.c
+@@ -350,12 +350,14 @@ static void update_chosen(DeviceTree *tree, char *cmd_line)
+ 	ret = TlclGetRandom(seed->tpm_buf, sizeof(seed->tpm_buf), &size);
+ 	if (ret || size != sizeof(seed->tpm_buf)) {
+ 		printf("TPM failed to populate kASLR seed buffer.\n");
++                /* #if !defined(WHALEOS_BUILD)
+ 		if (!vboot_in_recovery()) {
+ 			struct vb2_context *ctx = vboot_get_context();
+ 			vb2api_fail(ctx, VB2_RECOVERY_RW_TPM_R_ERROR, ret);
+ 			vb2ex_commit_data(ctx);
+ 			cold_reboot();
+ 		}
++                 * #endif */
+ 		/* In recovery we'd rather continue with a weak seed than risk
+ 		   tripping up the kernel. We don't expect untrusted code to run
+ 		   there anyway, so kernel exploits are less of a concern. */

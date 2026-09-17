@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE pkgmetadata SYSTEM "https://www.gentoo.org/dtd/metadata.dtd">
+<pkgmetadata>
+  <longdescription>
+    GLib-based Android binder client library.
+    Required by Waydroid for Android container IPC via the binder protocol.
+  </longdescription>
+  <!--
+    License evidence (audited 2026-08-25 against the pinned tarball,
+    SHA512 as recorded in Manifest):
+
+      LICENSE file: 3-clause BSD
+      https://github.com/mer-hybris/libgbinder/blob/e176ef0c507898fbe7f3fdd1bb4955f2adaf370f/LICENSE
+
+      Copyright (C) 2025 Jolla Mobile Ltd.
+      Copyright (C) 2018-2025 Slava Monich <slava@monich.com>
+      Copyright (C) 2018-2024 Jolla Ltd.
+
+    125 of 186 files carry the same 3-clause BSD header; no GPL, LGPL,
+    MIT or Apache notice appears anywhere in the tree. rpm/libgbinder.spec
+    and debian/copyright both declare BSD, consistent with LICENSE.
+
+    src/binder.h is a bionic-scrubbed copy of the Linux UAPI binder header
+    and carries the standard AOSP notice stating it contains no
+    copyrightable information.
+
+    Gentoo's "BSD" license file is the 3-clause text, so LICENSE="BSD" is
+    the correct declaration; Gentoo has no "BSD-3" alias.
+  -->
+  <upstream>
+    <remote-id type="github">mer-hybris/libgbinder</remote-id>
+  </upstream>
+</pkgmetadata>

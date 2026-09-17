@@ -1,0 +1,46 @@
+# WhaleOS: audioserver.rc with vendor.audio-hal triggers removed.
+#
+# In passthrough mode audioserver dlopens the HAL directly (no HAL service
+# process). The upstream triggers that start/stop/restart vendor.audio-hal
+# based on audioserver state cause constant crash-loops on WhaleOS because
+# vendor.audio-hal cannot register with hwservicemanager when audioserver
+# already holds the passthrough HAL. All vendor.audio-hal-* references are
+# removed; everything else is identical to the image's original file.
+service audioserver /system/bin/audioserver
+    class core
+    user audioserver
+    # media gid needed for /dev/fm (radio) and for /data/misc/media (tee)
+    group audio camera drmrpc media mediadrm net_bt net_bt_admin net_bw_acct wakelock
+    capabilities BLOCK_SUSPEND
+    ioprio rt 4
+    task_profiles ProcessCapacityHigh HighPerformance
+
+on property:vts.native_server.on=1
+    stop audioserver
+on property:vts.native_server.on=0
+    start audioserver
+
+on property:sys.audio.restart.hal=1
+    setprop sys.audio.restart.hal 0
+
+on early-boot
+    # WhaleOS: linkerconfig's sphal→vndk shared_libs omits libfmq.so,
+    # libmedia_helper.so, and libaudioutils.so.  Without them the HIDL
+    # passthrough wrapper android.hardware.audio@4.0-impl.so cannot be
+    # loaded from the sphal namespace, causing audioserver to crash.
+    # Prepend the three libs to every sphal.link.vndk.shared_libs = line
+    # (both [system] and [vendor] sections) so the fix is in-section.
+    # The grep guard makes the exec idempotent across restarts.
+    exec -- /system/bin/sh -c "grep -q 'sphal.link.vndk.shared_libs.*libfmq' /linkerconfig/ld.config.txt 2>/dev/null || sed -i 's/link.vndk.shared_libs = android.hardware.common/link.vndk.shared_libs = libfmq.so:libmedia_helper.so:libaudioutils.so:android.hardware.common/g' /linkerconfig/ld.config.txt /linkerconfig/bootstrap/ld.config.txt 2>/dev/null"
+
+on boot
+    # WhaleOS: belt-and-suspenders stop of vendor.audio-hal.  In CRAS
+    # passthrough mode audioserver dlopens the HAL directly; a separate HAL
+    # service process would only crash-loop trying to re-register the same
+    # HIDL interface.  The android.hardware.audio.service.rc override already
+    # marks the service disabled, but explicit stop handles any edge-cases
+    # where that flag is processed before our vendor override wins.
+    stop vendor.audio-hal
+
+on init
+    mkdir /dev/socket/audioserver 0775 audioserver audioserver

@@ -1,0 +1,91 @@
+==============================================================================
+Android init and VINTF override files for the Waydroid container
+  audioserver.rc
+  android.hardware.audio.service.rc
+  manifest.xml
+
+  // SPDX-License-Identifier: Apache-2.0
+==============================================================================
+
+The waydroid package itself is GPL-3+ and is attributed separately.  The
+three files above are different: they are Android init and VINTF files
+that override their counterparts inside the LineageOS container image, and
+they are derived from AOSP material under the Apache License, Version 2.0.
+
+   =========================================================================
+   ==  NOTICE file corresponding to the section 4 d of                    ==
+   ==  the Apache License, Version 2.0,                                   ==
+   ==  in this case for the Android-specific code.                        ==
+   =========================================================================
+
+Android Code
+Copyright (C) The Android Open Source Project
+
+This product includes software developed as part of
+The Android Open Source Project (http://source.android.com).
+
+Upstream counterparts:
+
+  audioserver.rc                      frameworks/av/media/audioserver/
+  android.hardware.audio.service.rc   hardware/interfaces/audio/
+                                          common/all-versions/default/service/
+  manifest.xml                        the VINTF device manifest of the
+                                          LineageOS 20.0 waydroid_x86_64
+                                          vendor image
+
+   =========================================================================
+   ==  Notice of modification, per section 4 b of                         ==
+   ==  the Apache License, Version 2.0.                                   ==
+   =========================================================================
+
+NAVER Corporation has modified all three files.  The audio HAL runs in
+HIDL passthrough mode on WhaleOS: the 64-bit audioserver dlopens our
+64-bit CRAS HAL directly, because the hwbinder audio service is 32-bit
+and cannot load a 64-bit shared object.  The overrides make the
+container's init configuration match that.
+
+  audioserver.rc
+      All vendor.audio-hal-* triggers removed - with the HAL loaded in
+      process, a separate HAL service can never register with
+      hwservicemanager and only crash-loops.  Two WhaleOS-specific
+      actions added: an early-boot fixup that prepends libfmq.so,
+      libmedia_helper.so and libaudioutils.so to the sphal->vndk link in
+      /linkerconfig/ld.config.txt, and a belt-and-suspenders stop of
+      vendor.audio-hal on boot.  Everything else is identical to the
+      file in the image.
+
+  android.hardware.audio.service.rc
+      "disabled" added so class_start hal does not launch the service,
+      and the onrestart entry that restarts audioserver when the HAL
+      crashes removed.
+
+  manifest.xml
+      The android.hardware.audio HAL entry declares
+      <transport arch="64">passthrough</transport> instead of hwbinder.
+
+These files remain under the Apache License, Version 2.0; they are not
+relicensed.
+
+   =========================================================================
+   ==  Not AOSP                                                           ==
+   =========================================================================
+
+init.cras-audio.rc ships alongside the three files above but is not
+AOSP-derived.  It was written at NAVER and is covered by the BSD entry in
+this package's LICENSE.
+
+   =========================================================================
+   ==  Apache License, Version 2.0                                        ==
+   =========================================================================
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.

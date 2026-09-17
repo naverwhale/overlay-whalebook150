@@ -1,0 +1,52 @@
+Copyright (c) 2026 NAVER Corp.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions
+are met:
+
+  1. Redistributions of source code must retain the above copyright
+     notice, this list of conditions and the following disclaimer.
+  2. Redistributions in binary form must reproduce the above copyright
+     notice, this list of conditions and the following disclaimer in the
+     documentation and/or other materials provided with the distribution.
+  3. Neither the name of NAVER Corp. nor the names of its contributors
+     may be used to endorse or promote products derived from this
+     software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS
+BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF
+THE POSSIBILITY OF SUCH DAMAGE.
+
+--------------------------------------------------------------------------
+Scope
+--------------------------------------------------------------------------
+This BSD-3-Clause license applies only to the WhaleOS-authored wrapper
+files inside this ebuild's files/ directory:
+
+  * CMakeLists.txt
+  * arc-toolchain-t-x86-android.cmake
+  * arc-toolchain-t-x86_64-android.cmake
+  * 0001-cros_gralloc-plane-stride-offset-fallback.patch
+  * 0002-gbm_mesa-reshape-spoofed-format-on-import-and-map.patch
+
+The upstream tarballs shipped alongside them retain their own upstream
+licenses:
+
+  * files/waydroid-minigbm-*.tar.gz  -> Apache-2.0 / BSD / MIT
+                                       (see the tarball's top-level LICENSE
+                                        and Android.bp license_kinds)
+  * files/waydroid-libdrm-*.tar.gz   -> per-file MIT
+                                       (build-time header reference only;
+                                        libdrm at runtime is provided by
+                                        the container's vendor libdrm.so
+                                        and, on the host side, by
+                                        x11-libs/libdrm which carries its
+                                        own chromiumos credit entry)

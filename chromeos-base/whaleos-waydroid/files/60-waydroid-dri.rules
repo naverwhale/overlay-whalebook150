@@ -1,0 +1,11 @@
+# Copyright 2026 NAVER Authors. All rights reserved.
+# udev rules for Waydroid GPU access.
+# Grants read/write access to DRI render nodes so the Waydroid LXC container
+# (running as root) can pass through the host GPU to Android.
+
+# DRI render nodes (e.g. /dev/dri/renderD128)
+SUBSYSTEM=="drm", KERNEL=="renderD[0-9]*", MODE="0666"
+
+# DMA-BUF heaps used by Android gralloc
+SUBSYSTEM=="misc", KERNEL=="dma_heap", MODE="0666"
+SUBSYSTEM=="dma_heap", MODE="0666"

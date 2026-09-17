@@ -1,0 +1,23 @@
+# WhaleOS: audio HAL runs in HIDL passthrough mode.
+# audioserver (64-bit) dlopens the CRAS HAL directly; no separate hwbinder
+# HAL service process is needed or wanted.
+#
+# Changes vs upstream:
+#   disabled         — prevents class_start hal from launching this service
+#   no onrestart     — removes the restart-audioserver-on-HAL-crash loop
+#
+# The property trigger in audioserver.rc ("on property:init.svc.audioserver=running:
+# start vendor.audio-hal") can still fire an explicit start. Because this
+# service is disabled those starts exit immediately without registering, which
+# is harmless. audioserver.rc is also overridden (see system/etc/init/) to
+# remove those triggers entirely for a clean setup.
+service vendor.audio-hal /vendor/bin/hw/android.hardware.audio.service
+    override
+    class hal
+    user audioserver
+    group audio camera drmrpc inet media mediadrm net_bt net_bt_admin net_bw_acct wakelock context_hub
+    capabilities BLOCK_SUSPEND SYS_NICE
+    rlimit rtprio 10 10
+    ioprio rt 4
+    task_profiles ProcessCapacityHigh HighPerformance
+    disabled

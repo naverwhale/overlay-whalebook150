@@ -1,0 +1,90 @@
+From f1cc0466d5948ac91882b450d72a50a3830f097d Mon Sep 17 00:00:00 2001
+From: Jaewon Jung <jw.jung@navercorp.com>
+Date: Thu, 19 Jun 2025 16:00:07 +0900
+Subject: [PATCH 1/2] Add hidden hotkey to enter menu
+
+Signed-off-by: Jaewon Jung <jw.jung@navercorp.com>
+---
+ grub-core/kern/main.c   |  1 -
+ grub-core/normal/main.c |  2 +-
+ grub-core/normal/menu.c | 25 +++++++++++++++++++++++--
+ 3 files changed, 24 insertions(+), 4 deletions(-)
+
+diff --git a/grub-core/kern/main.c b/grub-core/kern/main.c
+index 731c07c..d281f2f 100644
+--- a/grub-core/kern/main.c
++++ b/grub-core/kern/main.c
+@@ -274,7 +274,6 @@ grub_main (void)
+ #ifndef GRUB_MACHINE_EFI
+   /* Hello.  */
+   grub_setcolorstate (GRUB_TERM_COLOR_HIGHLIGHT);
+-  grub_printf ("Welcome to GRUB!\n\n");
+   grub_setcolorstate (GRUB_TERM_COLOR_STANDARD);
+ #endif
+ 
+diff --git a/grub-core/normal/main.c b/grub-core/normal/main.c
+index bd44310..981a64f 100644
+--- a/grub-core/normal/main.c
++++ b/grub-core/normal/main.c
+@@ -209,7 +209,7 @@ grub_normal_init_page (struct grub_term_output *term,
+ 
+   grub_term_cls (term);
+ 
+-  msg_formatted = grub_xasprintf (_("GNU GRUB  version %s"), PACKAGE_VERSION);
++  msg_formatted = grub_xasprintf (_("WhaleOS Boot Mode List"));
+   if (!msg_formatted)
+     return;
+ 
+diff --git a/grub-core/normal/menu.c b/grub-core/normal/menu.c
+index 6a90e09..491a0d7 100644
+--- a/grub-core/normal/menu.c
++++ b/grub-core/normal/menu.c
+@@ -341,8 +341,6 @@ grub_menu_execute_with_fallback (grub_menu_t menu,
+ {
+   int fallback_entry;
+ 
+-  callback->notify_booting (entry, callback_data);
+-
+   grub_menu_execute_entry (entry, 1);
+ 
+   /* Deal with fallback entries.  */
+@@ -566,6 +564,8 @@ print_countdown (struct grub_term_coordinate *pos, int n)
+ 
+ #define GRUB_MENU_PAGE_SIZE 10
+ 
++int via_menu;
++
+ /* Show the menu and handle menu entry selection.  Returns the menu entry
+    index that should be executed or -1 if no entry should be executed (e.g.,
+    Esc pressed to exit a sub-menu or switching menu viewers).
+@@ -597,6 +597,27 @@ run_menu (grub_menu_t menu, int nested, int *auto_boot, int *notify_boot)
+        useful and likely to be a source of confusion, so we disallow this.  */
+     grub_env_unset ("timeout_style");
+ 
++  /* Initialize the time.  */
++  saved_time = grub_get_time_ms ();
++
++  while (1)
++  {
++    if (has_second_elapsed (&saved_time))
++    {
++      *auto_boot = 1;
++      return get_entry_number (menu, "default");
++    }
++
++    if (grub_getkey_noblock () == (GRUB_TERM_CTRL | GRUB_TERM_ALT | 'r'))
++    {
++      via_menu = 1;
++      *auto_boot = 0;
++      timeout = -1;
++      current_entry = default_entry;
++      goto refresh;
++    }
++  }
++
+   timeout_style = get_timeout_style ();
+ 
+   if (timeout_style == TIMEOUT_STYLE_COUNTDOWN
+-- 
+2.25.1
+

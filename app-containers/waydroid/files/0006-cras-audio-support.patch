@@ -1,0 +1,127 @@
+From: WhaleOS <whaleos-dev@navercorp.com>
+Subject: [PATCH 6/9] lxc.py, images.py: CRAS audio passthrough (HIDL passthrough mode)
+
+Enable CRAS audio in the Android container via HIDL passthrough mode.
+audioserver (64-bit) dlopens audio.primary.cras.so directly; no separate
+hwbinder HAL process is needed.
+
+Changes:
+
+1. generate_session_lxc_config(): on every container start, open CRAS
+   socket permissions and bind-mount overlay files when the files exist:
+   - Open /run/cras and its socket files to o+rwx/o+rw here (at session
+     start, after the user has logged in) rather than in waydroid-container.conf
+     pre-start. CRAS restarts on user login, which resets socket permissions to
+     770 after the pre-start chmod has already run.
+   - vendor/etc/vintf/manifest.xml: passthrough transport for audio so
+     64-bit audioserver can dlopen the 64-bit CRAS HAL directly.
+     The hwbinder audio service is 32-bit and cannot load a 64-bit .so.
+   - vendor/etc/init/android.hardware.audio.service.rc: disables
+     vendor.audio-hal (in passthrough mode audioserver owns the HAL;
+     a competing hwbinder HAL service causes crash loops).
+   - system/etc/init/audioserver.rc: removes vendor.audio-hal restart
+     triggers, patches linkerconfig sphal->vndk shared_libs to include
+     libfmq.so, libmedia_helper.so, libaudioutils.so (required for
+     android.hardware.audio@4.0-impl.so to load from sphal namespace).
+   - vendor/lib64/hw/audio.primary.waydroid.so: CRAS HAL binary.
+   - var/run/cras/.cras_{socket,playback,capture}: individual socket
+     files bound from host /run/cras/. Binding the whole directory
+     causes a kernel oops in do_faccessat on kernel 5.15; binding
+     individual files avoids it.
+   All entries are guarded by os.path.exists() and use optional so
+   missing files are silently skipped.
+
+2. make_base_props(): set ro.hardware.audio.primary=waydroid when the
+   CRAS HAL binary is present, telling audioserver to load
+   audio.primary.waydroid.so instead of the default stub HAL.
+
+3. images.py:make_prop(): also inject ro.hardware.audio.primary=waydroid
+   at every container start so the property is always present even if
+   waydroid was initialised before the HAL package was installed
+   (make_base_props only runs at waydroid init / upgrade).
+
+Note: ChromeOS host SELinux (SELINUXTYPE=arc, Enforcing) denies an
+unprivileged caller's faccessat() on cras_socket objects. This patch
+relies on the dedicated `whaleos_waydroid` SELinux domain (see
+platform2/sepolicy/policy/chromeos/whaleos_waydroid.te) which is
+granted cros_cras_client() so the container audioserver can connect
+to /run/cras/.cras_socket through the LXC bind-mount set up below.
+init.waydroid.rc also adds a property trigger to stop vendor.audio-hal
+when ro.hardware.audio.primary=waydroid is set.
+
+--- a/tools/helpers/lxc.py
++++ b/tools/helpers/lxc.py
+@@ -207,6 +207,44 @@
+     if os.path.exists(pulse_host_socket):
+         make_entry(pulse_host_socket, pulse_container_socket[1:])
+
++    # WhaleOS: CRAS audio passthrough - open socket permissions and bind files.
++    # chmod here (at session start, after user login) because CRAS restarts on
++    # user login and resets socket permissions to 770 after the waydroid-container
++    # pre-start chmod has already run.
++    _cras_hal = "/usr/lib/waydroid/android-overlay/system/lib64/hw/audio.primary.cras.so"
++    if os.path.exists(_cras_hal):
++        try:
++            os.chmod("/run/cras", 0o1777)
++        except OSError:
++            pass
++        for _sock in [".cras_socket", ".cras_playback", ".cras_capture"]:
++            try:
++                os.chmod("/run/cras/" + _sock, 0o666)
++            except OSError:
++                pass
++    _vendor_manifest = "/usr/lib/waydroid/android-overlay/vendor/etc/vintf/manifest.xml"
++    if os.path.exists(_vendor_manifest):
++        make_entry(_vendor_manifest, "vendor/etc/vintf/manifest.xml",
++                   options="bind,create=file,optional 0 0")
++    _audio_hal_rc = "/usr/lib/waydroid/android-overlay/vendor/etc/init/android.hardware.audio.service.rc"
++    if os.path.exists(_audio_hal_rc):
++        make_entry(_audio_hal_rc, "vendor/etc/init/android.hardware.audio.service.rc",
++                   options="bind,create=file,optional 0 0")
++    _audioserver_rc = "/usr/lib/waydroid/android-overlay/system/etc/init/audioserver.rc"
++    if os.path.exists(_audioserver_rc):
++        make_entry(_audioserver_rc, "system/etc/init/audioserver.rc",
++                   options="bind,create=file,optional 0 0")
++    if os.path.exists(_cras_hal):
++        make_entry(_cras_hal, "vendor/lib64/hw/audio.primary.waydroid.so",
++                   options="bind,create=file,optional 0 0")
++    # Bind individual CRAS sockets as files. Binding the directory triggers
++    # a kernel oops in do_faccessat on kernel 5.15; individual file binds work.
++    for _cras_sock in [".cras_socket", ".cras_playback", ".cras_capture"]:
++        _sock_path = "/run/cras/" + _cras_sock
++        if os.path.exists(_sock_path):
++            make_entry(_sock_path, "var/run/cras/" + _cras_sock,
++                       options="bind,create=file,optional 0 0")
++
+     if not make_entry(session["waydroid_data"], "data", options="rbind 0 0"):
+         raise OSError("Failed to bind userdata")
+
+@@ -255,6 +293,11 @@
+     props.append("ro.adb.secure=0")
+     props.append("ro.debuggable=1")
+
++    # WhaleOS: CRAS passthrough audio HAL
++    _cras_hal = "/usr/lib/waydroid/android-overlay/system/lib64/hw/audio.primary.cras.so"
++    if os.path.exists(_cras_hal):
++        props.append("ro.hardware.audio.primary=waydroid")
++
+     egl = tools.helpers.props.host_get(args, "ro.hardware.egl")
+     dri, _ = tools.helpers.gpu.getDriNode(args)
+
+--- a/tools/helpers/images.py
++++ b/tools/helpers/images.py
+@@ -156,6 +156,14 @@
+     dpi = cfg["lcd_density"]
+     if dpi != "0":
+         props.append("ro.sf.lcd_density=" + dpi)
+
++    # WhaleOS: inject CRAS audio HAL property at every container start so it
++    # is set even when waydroid was initialised before the HAL package was
++    # installed (make_base_props only writes waydroid_base.prop at init/upgrade).
++    _cras_hal = "/usr/lib/waydroid/android-overlay/system/lib64/hw/audio.primary.cras.so"
++    if os.path.exists(_cras_hal):
++        props = [p for p in props if not p.startswith("ro.hardware.audio.primary=")]
++        props.append("ro.hardware.audio.primary=waydroid")
++
+     final_props = open(full_props_path, "w")
+     for prop in props:

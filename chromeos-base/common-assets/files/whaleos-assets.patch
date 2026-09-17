@@ -1,0 +1,152 @@
+diff --git a/text/boot_messages/cros_bootmsg.grd b/text/boot_messages/cros_bootmsg.grd
+index 09b04d4..2591a7a 100644
+--- a/text/boot_messages/cros_bootmsg.grd
++++ b/text/boot_messages/cros_bootmsg.grd
+@@ -58,32 +58,32 @@
+   </translations>
+   <release seq="1">
+     <structures fallback_to_english="true">
+-       <structure type="txt" name="ENTER_DEV1_VIRTUAL"
+-        file="en/enter_dev1_virtual.txt"/>
+-      <structure type="txt" name="ENTER_DEV2" file="en/enter_dev2.txt" />
+-      <structure type="txt" name="LEAVE_DEV" file="en/leave_dev.txt" />
+-      <structure type="txt" name="POWER_WASH" file="en/power_wash.txt" />
+-      <structure type="txt" name="SELF_REPAIR" file="en/self_repair.txt" />
++      <structure type="txt" name="ENTER_DEV1_VIRTUAL"
++        file="ko/enter_dev1_virtual.txt"/>
++      <structure type="txt" name="ENTER_DEV2" file="ko/enter_dev2.txt" />
++      <structure type="txt" name="LEAVE_DEV" file="ko/leave_dev.txt" />
++      <structure type="txt" name="POWER_WASH" file="ko/power_wash.txt" />
++      <structure type="txt" name="SELF_REPAIR" file="ko/self_repair.txt" />
+       <structure type="txt" name="UPDATE_FIRMWARE"
+-        file="en/update_firmware.txt" />
++        file="ko/update_firmware.txt" />
+       <structure type="txt" name="BLOCK_DEVMODE_VIRTUAL"
+-        file="en/block_devmode_virtual.txt" />
++        file="ko/block_devmode_virtual.txt" />
+       <structure type="txt" name="UPDATE_DETACHABLE_BASE_FIRMWARE"
+-        file="en/update_detachable_base_firmware.txt" />
++        file="ko/update_detachable_base_firmware.txt" />
+       <structure type="txt" name="UPDATE_FIRMWARE_SLOW_EXTRA_WARNING"
+-        file="en/update_firmware_slow_extra_warning.txt" />
++        file="ko/update_firmware_slow_extra_warning.txt" />
+       <structure type="txt" name="UPDATE_TOUCHPAD_FIRMWARE"
+-        file="en/update_touchpad_firmware.txt" />
++        file="ko/update_touchpad_firmware.txt" />
+       <structure type="txt" name="UPDATE_TOUCHSCREEN_FIRMWARE"
+-        file="en/update_touchscreen_firmware.txt" />
++        file="ko/update_touchscreen_firmware.txt" />
+       <structure type="txt" name="UPDATE_TPM_FIRMWARE"
+-        file="en/update_tpm_firmware.txt" />
++        file="ko/update_tpm_firmware.txt" />
+       <structure type="txt" name="UPDATE_TPM_FIRMWARE_FAILURE"
+-        file="en/update_tpm_firmware_failure.txt" />
++        file="ko/update_tpm_firmware_failure.txt" />
+       <structure type="txt" name="UPDATE_TPM_FIRMWARE_LOW_BATTERY"
+-        file="en/update_tpm_firmware_low_battery.txt" />
++        file="ko/update_tpm_firmware_low_battery.txt" />
+       <structure type="txt" name="UPDATE_TPM_FIRMWARE_LOW_BATTERY_CHARGING"
+-        file="en/update_tpm_firmware_low_battery_charging.txt" />
++        file="ko/update_tpm_firmware_low_battery_charging.txt" />
+       <structure type="txt" name="UPDATE_FWUPD_FIRMWARE"
+         file="en/update_fwupd_firmware.txt" />
+     </structures>
+diff --git a/text/boot_messages/en/enter_dev1_virtual.txt b/text/boot_messages/en/enter_dev1_virtual.txt
+index b5fc14c..afdec61 100644
+--- a/text/boot_messages/en/enter_dev1_virtual.txt
++++ b/text/boot_messages/en/enter_dev1_virtual.txt
+@@ -1,7 +1,7 @@
+ Your system is transitioning to Developer Mode.
+ Local data has been cleared.
+ 
+-Modifications you make to the system are not supported by Google, may cause
++Modifications you make to the system are not supported by Naver, may cause
+ hardware issues and may void warranty.
+ 
+ To cancel, turn your computer off now.
+diff --git a/text/boot_messages/en/power_wash.txt b/text/boot_messages/en/power_wash.txt
+index 93ef8a1..71fe31e 100644
+--- a/text/boot_messages/en/power_wash.txt
++++ b/text/boot_messages/en/power_wash.txt
+@@ -1,3 +1,3 @@
+ Powerwash in progress...
+ 
+-Powerwashes happen when critical errors are detected, or when you choose to reset your device. This will reset ChromeOS to be just like new, and you'll be back in operation in just a minute.
++Powerwashes happen when critical errors are detected, or when you choose to reset your device. This will reset WhaleOS to be just like new, and you'll be back in operation in just a minute.
+diff --git a/text/boot_messages/en/update_tpm_firmware_failure.txt b/text/boot_messages/en/update_tpm_firmware_failure.txt
+index 1c9b888..43dc1f0 100644
+--- a/text/boot_messages/en/update_tpm_firmware_failure.txt
++++ b/text/boot_messages/en/update_tpm_firmware_failure.txt
+@@ -1,6 +1,6 @@
+ Something went wrong and the update wasn't successful.
+ 
+ You may need to recover your device. For more information on
+-ChromeOS recovery, visit: https://www.google.com/chromeos/recovery
++WhaleOS recovery, visit: https://www.google.com/chromeos/recovery
+ 
+ Press the space bar to reboot.
+diff --git a/text/boot_messages/en/update_tpm_firmware_low_battery.txt b/text/boot_messages/en/update_tpm_firmware_low_battery.txt
+index 7c4adc6..e5c31fe 100644
+--- a/text/boot_messages/en/update_tpm_firmware_low_battery.txt
++++ b/text/boot_messages/en/update_tpm_firmware_low_battery.txt
+@@ -1,4 +1,4 @@
+ Battery too low for update.
+ 
+-Please connect your Chromebook to a power source. The update will
++Please connect your Whalebook to a power source. The update will
+ automatically begin as soon as the battery has enough charge.
+diff --git a/text/boot_messages/en/warn_dev.txt b/text/boot_messages/en/warn_dev.txt
+index c9cc10d..5a95054 100644
+--- a/text/boot_messages/en/warn_dev.txt
++++ b/text/boot_messages/en/warn_dev.txt
+@@ -16,4 +16,4 @@
+                    |_ |        |
+                      \         |
+                       \_______/
+- ChromeOS verification is turned off.
++ WhaleOS verification is turned off.
+diff --git a/text/boot_messages/ko/enter_dev1_virtual.txt b/text/boot_messages/ko/enter_dev1_virtual.txt
+index 93fa2b9..48ae00e 100644
+--- a/text/boot_messages/ko/enter_dev1_virtual.txt
++++ b/text/boot_messages/ko/enter_dev1_virtual.txt
+@@ -2,7 +2,7 @@
+ 시스템을 개발자 모드로 전환 중입니다.
+ 로컬 데이터가 삭제되었습니다.
+ 
+-시스템을 수정하면 Google의 지원을 받을 수 없으며,
++시스템을 수정하면 네이버의 지원을 받을 수 없으며,
+ 이로 인해 하드웨어 문제가 발생하더라도 보증이 적용되지 않을 수 있습니다.
+ 
+ 취소하려면 지금 컴퓨터를 끄세요.
+diff --git a/text/boot_messages/ko/power_wash.txt b/text/boot_messages/ko/power_wash.txt
+index 583acdc..3c62a58 100644
+--- a/text/boot_messages/ko/power_wash.txt
++++ b/text/boot_messages/ko/power_wash.txt
+@@ -1,4 +1,4 @@
+ ﻿
+ Powerwash 진행 중...
+ 
+-Powerwash는 치명적 오류가 발견되거나 기기 초기화를 선택하면 작동합니다. ChromeOS를 새것처럼 초기화하며 잠시 후에 다시 작업할 수 있습니다.
++Powerwash는 치명적 오류가 발견되거나 기기 초기화를 선택하면 작동합니다. WhaleOS를 새것처럼 초기화하며 잠시 후에 다시 작업할 수 있습니다.
+diff --git a/text/boot_messages/ko/update_tpm_firmware_failure.txt b/text/boot_messages/ko/update_tpm_firmware_failure.txt
+index 7c96fe3..1dc8c81 100644
+--- a/text/boot_messages/ko/update_tpm_firmware_failure.txt
++++ b/text/boot_messages/ko/update_tpm_firmware_failure.txt
+@@ -1,6 +1,6 @@
+ 문제가 발생하여 업데이트를 완료하지 못했습니다.
+ 
+-기기를 복구해야 할 수 있습니다. ChromeOS 복구에 관한 자세한 내용은
++기기를 복구해야 할 수 있습니다. WhaleOS 복구에 관한 자세한 내용은
+ 다음 페이지를 참조하세요. https://www.google.com/chromeos/recovery
+ 
+ 재부팅하려면 스페이스바를 누르세요.
+diff --git a/text/boot_messages/ko/update_tpm_firmware_low_battery.txt b/text/boot_messages/ko/update_tpm_firmware_low_battery.txt
+index 99968ff..d3958e0 100644
+--- a/text/boot_messages/ko/update_tpm_firmware_low_battery.txt
++++ b/text/boot_messages/ko/update_tpm_firmware_low_battery.txt
+@@ -1,4 +1,4 @@
+ 배터리 잔량이 부족하여 업데이트할 수 없습니다.
+ 
+-Chromebook을 전원에 연결해 주세요. 배터리가 충분히
++Whalebook을 전원에 연결해 주세요. 배터리가 충분히
+ 충전되면 업데이트가 자동으로 시작됩니다.

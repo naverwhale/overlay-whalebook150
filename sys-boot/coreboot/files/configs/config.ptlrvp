@@ -1,0 +1,26 @@
+CONFIG_VENDOR_INTEL=y
+CONFIG_BOARD_INTEL_PTLRVP=y
+CONFIG_VBOOT_FWID_MODEL="Google_Ptlrvp_chromeec4es"
+
+# Enable Early Splash Screen
+CONFIG_CHROMEOS_FW_SPLASH_SCREEN=y
+CONFIG_CHROMEOS_LOGO_PATH="bootsplash_assets/chromeos_200_percent.bmp"
+CONFIG_CHROMEBOOK_PLUS_LOGO_PATH="bootsplash_assets/chromebook_plus_200_percent.bmp"
+
+# SPI Descriptor
+CONFIG_IFD_BIN_PATH="3rdparty/blobs/mainboard/google/fatcat/descriptor-ptlrvp.bin"
+
+CONFIG_HAVE_EC_BIN=y
+CONFIG_EC_BIN_PATH="3rdparty/blobs/mainboard/google/fatcat/ec-ptlrvp.bin"
+
+# CSE data
+# CONFIG_CSE_DATA_FILE="cse_data/cse_data-fatcat.bin"
+CONFIG_ME_BIN_PATH="3rdparty/blobs/mainboard/google/fatcat/csme-ptlrvp.bin"
+CONFIG_SOC_INTEL_CSE_RW_UPDATE=n
+#CONFIG_SOC_INTEL_CSE_RW_FILE="3rdparty/blobs/mainboard/google/fatcat/me_rw-ptlrvp.bin"
+
+# Video Blob
+CONFIG_INTEL_GMA_VBT_FILE="3rdparty/blobs/mainboard/google/fatcat/vbt/vbt.bin"
+
+# Microcode
+CONFIG_CPU_INTEL_UCODE_SPLIT_BINARIES="3rdparty/blobs/mainboard/google/fatcat/microcode_inputs/ptlrvp"

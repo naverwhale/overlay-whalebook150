@@ -1,0 +1,55 @@
+From: WhaleOS <whaleos-dev@navercorp.com>
+Subject: [PATCH 11/11] lxc.py: bind-mount camera HAL + gralloc overrides
+
+generate_session_lxc_config() bind-mounts WhaleOS-provided drop-in
+replacements for three container files when they exist on the host
+(installed by sibling ebuilds):
+
+  - /vendor/lib/camera.device@3.4-external-impl.so
+    Replaced by the binary-patched copy from waydroid-camera-hal-fix
+    so that ExternalCameraDeviceSession::configureV4l2StreamLocked()
+    no longer rejects UVC MJPG frames that over-report buffer size
+    (LG Sonix FHD Webcam et al.).
+
+  - /vendor/lib/libminigbm_gralloc_gbm_mesa.so   (32-bit)
+  - /vendor/lib64/libminigbm_gralloc_gbm_mesa.so (64-bit)
+    Replaced by the rebuilt copies from waydroid-gralloc-fix, which
+    contain three source-level fixes: a zero-stride fallback in
+    cros_gralloc_driver::allocate(), a matching R8-2D reshape on both
+    the import and the map side of gbm_mesa_bo_*(), and a lazy SW
+    import when an unspecified-SW-mask buffer (e.g. JPEG output BLOB
+    from the camera HAL) is first locked.  Together they make
+    lockYCbCr() return valid y/cb/cr layouts for flexible YUV
+    buffers, which the external camera HAL needs to write V4L2 frames
+    into Surface buffers.
+
+All three entries use optional bind so that a missing host file (i.e.
+the corresponding fix-ebuild not installed yet) is silently skipped
+instead of aborting session start.
+
+--- a/tools/helpers/lxc.py
++++ b/tools/helpers/lxc.py
+@@ -249,6 +249,23 @@
+         raise OSError("Failed to bind userdata")
+     make_entry("/usr/lib/waydroid/data/configs/init.waydroid.rc", "system/etc/init/init.waydroid.rc")
+ 
++    # WhaleOS: external camera HAL + gralloc overlays (see ebuilds
++    # waydroid-camera-hal-fix and waydroid-gralloc-fix).  Each entry is
++    # optional so an unbuilt component just falls back to the upstream
++    # Lineage-20 binary already inside the container image.
++    _cam_impl = "/usr/lib/waydroid/android-overlay/vendor/lib/camera.device@3.4-external-impl.so"
++    if os.path.exists(_cam_impl):
++        make_entry(_cam_impl, "vendor/lib/camera.device@3.4-external-impl.so",
++                   options="bind,create=file,optional 0 0")
++    _mgbm32 = "/usr/lib/waydroid/android-overlay/vendor/lib/libminigbm_gralloc_gbm_mesa.so"
++    if os.path.exists(_mgbm32):
++        make_entry(_mgbm32, "vendor/lib/libminigbm_gralloc_gbm_mesa.so",
++                   options="bind,create=file,optional 0 0")
++    _mgbm64 = "/usr/lib/waydroid/android-overlay/vendor/lib64/libminigbm_gralloc_gbm_mesa.so"
++    if os.path.exists(_mgbm64):
++        make_entry(_mgbm64, "vendor/lib64/libminigbm_gralloc_gbm_mesa.so",
++                   options="bind,create=file,optional 0 0")
++
+     lxc_path = tools.config.defaults["lxc"] + "/waydroid"
+     config_nodes_tmp_path = args.work + "/config_session"
+     config_nodes = open(config_nodes_tmp_path, "w")

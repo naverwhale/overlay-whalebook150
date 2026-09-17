@@ -1,0 +1,4678 @@
+diff --git a/crash-reporter/BUILD.gn b/crash-reporter/BUILD.gn
+index 27dd3bfcc8..386d63347b 100644
+--- a/crash-reporter/BUILD.gn
++++ b/crash-reporter/BUILD.gn
+@@ -153,6 +153,9 @@ static_library("libcrash_reporter") {
+     "user_collector_base.cc",
+     "vm_collector.cc",
+   ]
++  sources += [
++    "update_failure_collector.cc",
++  ]
+   all_dependent_configs = [ ":libcrash_reporter_config" ]
+   include_dirs = [ "${sysroot}/usr/include/redaction_tool" ]
+   libs = [
+@@ -230,6 +233,8 @@ pkg_config("libcrash_sender_config") {
+     "libminijail",
+     "libsession_manager-client",
+     "libshill-client",
++    "openssl",
++    "zlib",
+   ]
+   if (use.fuzzer) {
+     pkg_deps += [ "protobuf" ]
+@@ -250,6 +255,35 @@ static_library("libcrash_sender") {
+     "crash_sender_base.cc",
+     "crash_sender_paths.cc",
+     "crash_sender_util.cc",
++    # Migration from crashpad(third_party/crashpad/crashpad/*) in whale
++    "crashpad/file_io.cc",
++    "crashpad/file_io.h",
++    "crashpad/file_io_posix.cc",
++    "crashpad/file_reader.cc",
++    "crashpad/file_reader.h",
++    "crashpad/file_seeker.cc",
++    "crashpad/file_seeker.h",
++    "crashpad/http_body.cc",
++    "crashpad/http_body.h",
++    "crashpad/http_body_gzip.cc",
++    "crashpad/http_body_gzip.h",
++    "crashpad/http_headers.h",
++    "crashpad/http_nelo_builder.cc",
++    "crashpad/http_nelo_builder.h",
++    "crashpad/http_transport.cc",
++    "crashpad/http_transport.h",
++    "crashpad/http_transport_socket.cc",
++    "crashpad/implicit_cast.h",
++    "crashpad/random_string.cc",
++    "crashpad/random_string.h",
++    "crashpad/split_string.cc",
++    "crashpad/split_string.h",
++    "crashpad/string_number_conversion.cc",
++    "crashpad/string_number_conversion.h",
++    "crashpad/url.cc",
++    "crashpad/url.h",
++    "crashpad/zlib.cc",
++    "crashpad/zlib.h",
+   ]
+   all_dependent_configs = [ ":libcrash_sender_config" ]
+   deps = [ ":crash_sender_proto" ]
+diff --git a/crash-reporter/crash_collector_names.cc b/crash-reporter/crash_collector_names.cc
+index b8d74e0c92..bbb109e7d2 100644
+--- a/crash-reporter/crash_collector_names.cc
++++ b/crash-reporter/crash_collector_names.cc
+@@ -45,6 +45,7 @@ constexpr std::pair<CrashReporterCollector, const char*> kNameCollectorPairs[] =
+         {CrashReporterCollector::kArcvmKernel, "ARCVM_kernel"},
+         {CrashReporterCollector::kArcppCxx, "ARCPP_cxx"},
+         {CrashReporterCollector::kMock, "mock"},
++        {CrashReporterCollector::kUpdateFailure, "update_failure"},
+ };
+ // LINT.ThenChange(crash_collector_names.h:collector_list)
+ 
+diff --git a/crash-reporter/crash_collector_names.h b/crash-reporter/crash_collector_names.h
+index 33a1e68092..513702cca6 100644
+--- a/crash-reporter/crash_collector_names.h
++++ b/crash-reporter/crash_collector_names.h
+@@ -39,8 +39,9 @@ enum class CrashReporterCollector {
+   kArcvmKernel = 21,
+   kArcppCxx = 22,
+   kMock = 23,
++  kUpdateFailure = 24,
+ 
+-  kMaxValue = kMock
++  kMaxValue = kUpdateFailure
+ };
+ // LINT.ThenChange(crash_collector_names.cc:collector_list)
+ 
+diff --git a/crash-reporter/crash_reporter.cc b/crash-reporter/crash_reporter.cc
+index f9f06325b9..b3d3c2904f 100644
+--- a/crash-reporter/crash_reporter.cc
++++ b/crash-reporter/crash_reporter.cc
+@@ -56,6 +56,8 @@
+ #include "crash-reporter/util.h"
+ #include "crash-reporter/vm_collector.h"
+ 
++#include "crash-reporter/update_failure_collector.h"
++
+ using base::FilePath;
+ using base::StringPrintf;
+ 
+@@ -458,6 +460,12 @@ int main(int argc, char* argv[]) {
+               "OOM event in Crostini (captured via stdin)");
+   DEFINE_bool(tethering_failure, false, "Report tethering failure");
+   DEFINE_bool(browser_hang, false, "Report browser hang");
++  DEFINE_string(update_failure, "",
++                "The module where update failure occurred "
++                "(update_engine, installer, or browser)");
++  DEFINE_string(update_error_type, "",
++                "The specific update error type "
++                "(e.g., kPostinstallRunnerError)");
+ 
+   OpenStandardFileDescriptors();
+ 
+@@ -772,6 +780,13 @@ int main(int argc, char* argv[]) {
+   collectors.push_back(GenericFailureCollector::GetHandlerInfo(
+       handler_info_options, metrics_lib));
+ 
++  UpdateFailureCollector::HandlerInfoOptions update_failure_options = {
++      .update_failure = FLAGS_update_failure,
++      .update_error_type = FLAGS_update_error_type,
++  };
++  collectors.push_back(UpdateFailureCollector::GetHandlerInfo(
++      update_failure_options, metrics_lib));
++
+   collectors.push_back(SELinuxViolationCollector::GetHandlerInfo(
+       FLAGS_selinux_violation, FLAGS_weight, metrics_lib));
+ 
+diff --git a/crash-reporter/crash_reporter_logs.conf b/crash-reporter/crash_reporter_logs.conf
+index 6d1ff116df..d39fbd31be 100644
+--- a/crash-reporter/crash_reporter_logs.conf
++++ b/crash-reporter/crash_reporter_logs.conf
+@@ -1030,3 +1030,25 @@ dlc_service_failure=\
+     echo "===/var/log/update_engine.log==="; \
+     tail -n 60 /var/log/update_engine.log; \
+     echo EOF
++# Generic update failure: update_engine logs + syslog.
++# Module-specific keys (e.g., update-failure-update_engine) that are not
++# defined here will fall back to this generic entry via the collector's
++# fallback logic in update_failure_collector.cc.
++update-failure=\
++  echo "=== update_engine log ==="; \
++  cat $(ls -1tr /var/log/update_engine | tail -5 | \
++    sed s.^./var/log/update_engine/.) 2>/dev/null | tail -n 100; \
++  echo "=== syslog ==="; \
++  tail -n 50 /var/log/messages; \
++  echo EOF
++
++# Browser module additionally collects chrome logs.
++update-failure-browser=\
++  echo "=== update_engine log ==="; \
++  cat $(ls -1tr /var/log/update_engine | tail -5 | \
++    sed s.^./var/log/update_engine/.) 2>/dev/null | tail -n 50; \
++  echo "=== syslog ==="; \
++  tail -n 50 /var/log/messages; \
++  echo "=== chrome log ==="; \
++  tail -n 50 /var/log/chrome/chrome 2>/dev/null; \
++  echo EOF
+diff --git a/crash-reporter/crash_sender_util.cc b/crash-reporter/crash_sender_util.cc
+index 4449538838..763dd3ed2a 100644
+--- a/crash-reporter/crash_sender_util.cc
++++ b/crash-reporter/crash_sender_util.cc
+@@ -52,6 +52,9 @@
+ #include "crash-reporter/paths.h"
+ #include "crash-reporter/util.h"
+ 
++#include "crash-reporter/crashpad/http_nelo_builder.h"
++#include "crash-reporter/crashpad/http_transport.h"
++
+ namespace util {
+ 
+ namespace {
+@@ -82,13 +85,6 @@ constexpr char kCollectorNameEmbeddedController[] = "ec";
+ // Values used for kJsonLogKeySource.
+ constexpr char kMetadataValueRedacted[] = "REDACTED";
+ 
+-// Created when we would normally send a message, if we are in test mode.
+-// MUST MATCH testModeSuccessfulFile in chrome_crash_loop.go.
+-constexpr char kTestModeSuccessfulFile[] =
+-    "/var/spool/crash/crash_sender_test_mode_successful";
+-
+-constexpr char kTestModeSuccessful[] =
+-    "Test Mode: Logging success and exiting instead of actually uploading";
+ 
+ // UMA metrics to track crash removal attempts and failures.
+ constexpr char kUMAFailedCrashRemoval[] = "Crash.Sender.FailedCrashRemoval";
+@@ -102,6 +98,21 @@ constexpr char kCrashSenderRemoveHistName[] =
+ // Receipt ID that indicates the crash report was rejected due to throttling.
+ constexpr char kCrashSenderDroppedDueToThrottlingId[] = "0000000000000001";
+ 
++const char kNeloProjectName[] = "P2c89bdKR16191989c08_whale_os";
++// Nelo server url for uploading crash dump and logs.
++const char kNeloUploadURL[] = "https://example.com";
++constexpr char kKernelCrashFileType[] = ".kcrash";
++constexpr char kLogFileType[] = ".log";
++constexpr char kBertDumpFileType[] = ".bertdump";
++constexpr char kTextFileType[] = ".txt";
++constexpr char kGzipLogFileType[] = ".log.gz";
++constexpr char kUpdateFailurePrefix[] = "update_failure_";
++constexpr char kBluetoothFirmwarePrefix[] = "bt_firmware";
++constexpr char kDrmErrorPrefix[] = "change_card0_drm";
++// Upper bound on the crash-time log embedded into the NELO request, so a
++// runaway log can't bloat the upload. The captured log is normally tens of KB.
++constexpr size_t kMaxAttachedLogBytes = 1 * 1024 * 1024;
++
+ }  // namespace
+ 
+ void ParseCommandLine(int argc,
+@@ -921,147 +932,152 @@ base::DictValue Sender::CreateJsonEntity(const std::string& report_id,
+   return root_dict;
+ }
+ 
+-SenderBase::CrashRemoveReason Sender::RequestToSendCrash(
+-    const CrashDetails& details) {
+-  std::string product_name;
+-  std::unique_ptr<brillo::http::FormData> form_data =
+-      CreateCrashFormData(details, &product_name);
+-  if (!form_data) {
+-    // No form data, retry later
+-    return CrashRemoveReason::kRetryUploading;
+-  }
+-
+-  if (dry_run_) {
+-    if (IsMock()) {
+-      CHECK(!crash_during_testing_) << "crashing as requested";
+-    }
+-    return WriteUploadLog(details, "", std::move(product_name));
+-  }
+-
+-  if (test_mode_) {
+-    LOG(WARNING) << kTestModeSuccessful;
+-
+-    auto result = brillo::SafeFD::Root();
+-    if (brillo::SafeFD::IsError(result.second)) {
+-      LOG(ERROR) << "Could not open root directory: "
+-                 << static_cast<int>(result.second);
+-      return CrashRemoveReason::kFinishedUploading;
+-    }
+-
+-    const base::FilePath kTestModeSuccessfulFilePath(kTestModeSuccessfulFile);
+-    // We must use the GID that owns /var/spool/crash for the file as well.
+-    gid_t crash_group_gid = -1;
+-    if (!brillo::userdb::GetGroupInfo(constants::kCrashGroupName,
+-                                      &crash_group_gid)) {
+-      PLOG(ERROR) << "Couldn't look up group " << constants::kCrashGroupName;
+-      return CrashRemoveReason::kFinishedUploading;
+-    }
+-
+-    // Set the file permissions to kSystemCrashFilesMode (0660) instead of the
+-    // default 0640. We don't actually care if the group is able to write to the
+-    // file, but if we don't, SafeFD will refuse to create the file because
+-    // /var/spool/crash is group writable.
+-    result = result.first.MakeFile(
+-        kTestModeSuccessfulFilePath,
+-        /*permissions=*/constants::kSystemCrashFilesMode,
+-        /*uid=*/constants::kRootUid, /*gid=*/crash_group_gid);
+-    if (brillo::SafeFD::IsError(result.second)) {
+-      LOG(ERROR) << "Could not create " << kTestModeSuccessfulFile << ": "
+-                 << static_cast<int>(result.second);
+-    }
+-
+-    return CrashRemoveReason::kFinishedUploading;
+-  }
+-
+-  auto stream_data = form_data->ExtractDataStream();
+-  uint64_t uncompressed_size = stream_data->GetSize();
+-  // Compress the data before sending it to the server. We compress the entire
+-  // request body and then specify the Content-Encoding as gzip to achieve this.
+-  std::vector<unsigned char> compressed_form_data =
+-      util::GzipStream(std::move(stream_data));
+-
+-  // Record the send attempt even if it fails. We may still have used up network
+-  // bandwidth even if we lose the connection at the end.
+-  const base::FilePath timestamps_dir = paths::Get(paths::kTimestampsDirectory);
+-  int size = static_cast<int>(compressed_form_data.size());
+-  if (size == 0) {
+-    // Compression failed; we'll end up using the uncompressed stream below.
+-    size = static_cast<int>(uncompressed_size);
+-  }
+-  RecordSendAttempt(timestamps_dir, size);
+-
+-  if (IsMock()) {
+-    CHECK(!crash_during_testing_) << "crashing as requested";
+-    // Integration Tests-specific behavior
+-    if (IsIntegrationTest()) {
+-      if (!IsMockSuccessful()) {
+-        LOG(INFO) << "Mocking unsuccessful send";
+-        return CrashRemoveReason::kRetryUploading;
+-      }
+-
+-      LOG(INFO) << "Mocking successful send";
+-      WriteUploadLog(details, /*report_id=*/"mockreport",
+-                     std::move(product_name));
+-      return CrashRemoveReason::kFinishedUploading;
+-    }
+-  } else {
+-    // Determine the proxy server if it's not given from the options.
+-    if (proxy_servers_.empty()) {
+-      EnsureDBusIsReady();
+-      brillo::http::GetChromeProxyServers(bus_, kReportUploadProdUrl,
+-                                          &proxy_servers_);
++// Name of the crash-time log attachment in the .meta file (upload_file_log),
++// as it appears in FullCrash::files after the "upload_file_" prefix is
++// stripped.
++constexpr char kCrashLogAttachmentName[] = "log";
++
++// Reads the contents of the crash-time log attached to the crash
++// (upload_file_log) so it can be embedded into the same NELO request as the
++// crash payload. NELO's store API uploads a single file per request and groups
++// events by the dump's call stack, so a separately-uploaded log would land in
++// an unrelated event and could not be paired back with its crash. Embedding the
++// log keeps the call stack and the failure-cause log together in one event.
++// Returns an empty string when there is no readable log attachment.
++//
++// The attachment is matched by its exact name ("log"), not by a ".log" suffix:
++// a crash can carry several log attachments (e.g. upload_file_ec_log,
++// upload_file_panic_log) and only upload_file_log is the cryptohome failure-
++// cause log this feature targets.
++std::string Sender::ReadAttachedCrashLog(const CrashDetails& details) {
++  FullCrash crash = ReadMetaFile(details);
++  for (const auto& file : crash.files) {
++    if (file.first != kCrashLogAttachmentName) {
++      continue;
+     }
+-  }
+-
+-  std::shared_ptr<brillo::http::Transport> transport = GetTransport();
+-
+-  brillo::ErrorPtr upload_error;
+-  std::unique_ptr<brillo::http::Response> response;
+-  if (!compressed_form_data.empty()) {
+-    response = brillo::http::PostBinaryAndBlock(
+-        allow_dev_sending_ ? kReportUploadStagingUrl : kReportUploadProdUrl,
+-        compressed_form_data.data(), compressed_form_data.size(),
+-        form_data->GetContentType(),
+-        {{brillo::http::request_header::kContentEncoding, "gzip"}}, transport,
+-        &upload_error);
+-  } else {
+-    LOG(ERROR) << "Failed compressing crash data for upload, perform the "
+-               << "upload uncompressed";
+-    // This really should never happen, but it's probably better to try to
+-    // send this uncompressed even though it requires regenerating all the
+-    // data since extracting the data stream from the FormData is a
+-    // potentially destructive operation.
+-    form_data = CreateCrashFormData(details, &product_name);
+-    if (!form_data) {
+-      return CrashRemoveReason::kRetryUploading;
++    std::string contents;
++    // The captured log is small (a tail of /var/log/messages plus storage
++    // info); cap the read defensively so a runaway log can't bloat the request.
++    if (base::ReadFileToStringWithMaxSize(file.second, &contents,
++                                          kMaxAttachedLogBytes)) {
++      return contents;
+     }
+-    response = brillo::http::PostFormDataAndBlock(
+-        allow_dev_sending_ ? kReportUploadStagingUrl : kReportUploadProdUrl,
+-        std::move(form_data), {} /* headers */, transport, &upload_error);
+-  }
+-
+-  if (!response) {
+-    LOG(ERROR) << "Crash sending failed with error: "
+-               << upload_error->GetMessage();
+-    return CrashRemoveReason::kRetryUploading;
++    LOG(ERROR) << "Failed to read attached crash log: " << file.second.value();
++    break;
+   }
+-  if (!response->IsSuccessful()) {
+-    int statusCode = response->GetStatusCode();
++  return std::string();
++}
+ 
+-    if (statusCode == brillo::http::status_code::TooManyRequests) {
+-      LOG(WARNING) << "Crash being discarded due to throttling, HTTP "
+-                   << statusCode << ": " << response->GetStatusText();
+-      return CrashRemoveReason::kTooManyRequests;
++bool Sender::SendFileToNelo(const CrashDetails& details,
++                            const base::FilePath& file_path,
++                            const std::string& attached_log) {
++  bool dmp_symbol_require = true;
++  std::string version;
++  if (!details.metadata.GetString("ver", &version)) {
++    version = "unknown";
++  }
++
++  crashpad::HTTPNeloBuilder http_nelo_builder(kNeloProjectName, version);
++
++  crashpad::HTTPNeloBuilder::FileFormat format =
++      crashpad::HTTPNeloBuilder::FileFormat::Bin;
++  if (base::EndsWith(file_path.value(), kKernelCrashFileType)) {
++    dmp_symbol_require = false;
++    format = crashpad::HTTPNeloBuilder::FileFormat::Text;
++    http_nelo_builder.SetExceptionType(
++        crashpad::HTTPNeloBuilder::ExceptionType::KernelCrash);
++  } else if (base::EndsWith(file_path.value(), kLogFileType)) {
++    base::FilePath::StringType filename = file_path.BaseName().value();
++
++    // Log files are plain text and do not need symbolication.
++    dmp_symbol_require = false;
++    format = crashpad::HTTPNeloBuilder::FileFormat::Text;
++
++    // Check if the file is an update failure log.
++    if (base::StartsWith(filename, kUpdateFailurePrefix)) {
++      http_nelo_builder.SetExceptionType(
++          crashpad::HTTPNeloBuilder::ExceptionType::UpdateFailure);
+     }
++  } else if (base::EndsWith(file_path.value(), kBertDumpFileType)) {
++    // A BERT dump is a raw ACPI firmware record (Boot Error Record Table), not
++    // a minidump, so there is no call stack to symbolicate. Leaving symbol
++    // resolution requested makes the server group every unsymbolizable dump
++    // under one empty stack hash, which merges unrelated firmware events into a
++    // single crash issue. The payload stays binary.
++    dmp_symbol_require = false;
++    http_nelo_builder.SetExceptionType(
++        crashpad::HTTPNeloBuilder::ExceptionType::FirmwareError);
++  } else if (base::EndsWith(file_path.value(), kTextFileType) &&
++             base::StartsWith(file_path.BaseName().value(),
++                              kBluetoothFirmwarePrefix)) {
++    // A Bluetooth device coredump is parsed into a plain-text summary of the
++    // controller firmware exception before it is uploaded (see
++    // UdevCollector::AppendBluetoothCoredump), so it is neither binary nor a
++    // minidump and has no call stack to symbolicate. The prefix is checked
++    // because ".txt" alone is too generic to identify the payload.
++    dmp_symbol_require = false;
++    format = crashpad::HTTPNeloBuilder::FileFormat::Text;
++    http_nelo_builder.SetExceptionType(
++        crashpad::HTTPNeloBuilder::ExceptionType::FirmwareError);
++  } else if (base::EndsWith(file_path.value(), kGzipLogFileType) &&
++             base::StartsWith(file_path.BaseName().value(), kDrmErrorPrefix)) {
++    // A drm/card0 udev error report is a gzipped dump of the i915 error state.
++    // It has no call stack to symbolicate, and it covers both real GPU hangs
++    // and forced captures with no hung engine, so it is classified rather than
++    // dropped to keep the trend observable. Every udev collection shares the
++    // ".log.gz" suffix, so the prefix is what identifies this one. The payload
++    // stays binary because it is gzip-compressed.
++    dmp_symbol_require = false;
++    http_nelo_builder.SetExceptionType(
++        crashpad::HTTPNeloBuilder::ExceptionType::GpuError);
++  }
++
++  http_nelo_builder.SetField("clientID", details.client_id);
++  // Embed the captured crash-time log so it shows up in the same NELO event as
++  // the call stack (see ReadAttachedCrashLog). Empty when no log is attached.
++  if (!attached_log.empty()) {
++    http_nelo_builder.SetAnnotation("crash_log", attached_log);
++  }
++  http_nelo_builder.SetFileInfo(file_path, format, dmp_symbol_require);
++
++  std::unique_ptr<crashpad::HTTPTransport> http_transport(
++      crashpad::HTTPTransport::Create());
++  crashpad::HTTPHeaders content_headers;
++  http_nelo_builder.PopulateContentHeaders(&content_headers);
++  for (const auto& content_header : content_headers) {
++    http_transport->SetHeader(content_header.first, content_header.second);
++  }
++  http_transport->SetBodyStream(http_nelo_builder.GetBodyStream());
++  // Nelo sdk uses 20 seconds timeout.
++  // https://example.com
++  http_transport->SetTimeout(20.0);
++  http_transport->SetURL(kNeloUploadURL);
++
++  std::string response_body;
++  return http_transport->ExecuteSynchronously(&response_body);
++}
+ 
+-    LOG(ERROR) << "Crash sending failed with HTTP " << statusCode << ": "
+-               << response->GetStatusText();
++SenderBase::CrashRemoveReason Sender::RequestToSendCrash(
++    const CrashDetails& details) {
++  // Embed the crash-time log (upload_file_log) into the payload request so the
++  // call stack and the failure-cause log arrive in a single NELO event; a
++  // separately-uploaded log would group under an unrelated event and could not
++  // be paired back with this crash. Only crash dumps have a call stack to pair
++  // with, so when the payload is itself a log (e.g. update_failure_*.log) the
++  // log is not embedded. If the payload upload fails, retry later.
++  std::string attached_log;
++  if (!base::EndsWith(details.payload_file.value(), kLogFileType)) {
++    attached_log = ReadAttachedCrashLog(details);
++  }
++  if (!SendFileToNelo(details, details.payload_file, attached_log)) {
++    LOG(ERROR) << "Sender::RequestToSendCrash() is failed";
+     return CrashRemoveReason::kRetryUploading;
+   }
+ 
+-  std::string report_id = response->ExtractDataAsString();
++  WriteUploadLog(details, "",
++                 details.payload_file.BaseName().ReplaceExtension("").value());
+ 
+-  return WriteUploadLog(details, report_id, std::move(product_name));
++  return CrashRemoveReason::kFinishedUploading;
+ }
+ 
+ SenderBase::CrashRemoveReason Sender::WriteUploadLog(
+diff --git a/crash-reporter/crash_sender_util.h b/crash-reporter/crash_sender_util.h
+index 81502ce2a4..fb0f374068 100644
+--- a/crash-reporter/crash_sender_util.h
++++ b/crash-reporter/crash_sender_util.h
+@@ -259,12 +259,29 @@ class Sender : public SenderBase {
+                        const std::string& product_name,
+                        const CrashDetails& details);
+ 
++ protected:
+   // Requests to send a crash report represented with the given crash details.
+   // If the return code is kRetryUploading, the failure can be retried and the
+   // caller should not remove the crash report. Otherwise, the caller should
+   // remove the crash report using the returned removal reason code.
++  // Protected so tests can drive a single report through the upload path.
+   SenderBase::CrashRemoveReason RequestToSendCrash(const CrashDetails& details);
+ 
++  // Reads the .log attachment (upload_file_log) captured at crash time so it
++  // can be embedded into the crash payload's NELO request. Returns an empty
++  // string when there is no readable log attachment. Virtual so tests can
++  // supply log contents without a real meta file on disk.
++  virtual std::string ReadAttachedCrashLog(const CrashDetails& details);
++
++  // Uploads the crash payload (e.g. the minidump) to the NELO server as one
++  // crash-store request, embedding |attached_log| (the crash-time log) so the
++  // call stack and the failure-cause log land in the same NELO event. Returns
++  // true on a successful upload. Virtual so tests can observe the upload.
++  virtual bool SendFileToNelo(const CrashDetails& details,
++                              const base::FilePath& file_path,
++                              const std::string& attached_log);
++
++ private:
+   // Writes upload.log based on crash details and report ID. Writes to stdout
+   // under the dry run mode.
+   SenderBase::CrashRemoveReason WriteUploadLog(const CrashDetails& details,
+diff --git a/crash-reporter/crash_sender_util_test.cc b/crash-reporter/crash_sender_util_test.cc
+index 8c40d7d645..1e52c648e9 100644
+--- a/crash-reporter/crash_sender_util_test.cc
++++ b/crash-reporter/crash_sender_util_test.cc
+@@ -2076,6 +2076,249 @@ INSTANTIATE_TEST_SUITE_P(
+     testing::Combine(
+         testing::Values(kNone, kPayloadFile, kLogFile, kTextFile, kBinFile)));
+ 
++// One recorded NELO upload: the file sent and the crash-time log embedded with
++// it.
++struct NeloUpload {
++  base::FilePath file_path;
++  std::string attached_log;
++};
++
++// Sender subclass that records the NELO upload(s) RequestToSendCrash()
++// performs, instead of making a real network request.
++class RecordingNeloSender : public util::Sender {
++ public:
++  using util::Sender::Sender;
++
++  std::vector<NeloUpload> uploads;
++
++  // Exposes the protected RequestToSendCrash() to the test body.
++  SenderBase::CrashRemoveReason RequestToSendCrashForTest(
++      const CrashDetails& details) {
++    return RequestToSendCrash(details);
++  }
++
++ protected:
++  bool SendFileToNelo(const CrashDetails& details,
++                      const base::FilePath& file_path,
++                      const std::string& attached_log) override {
++    uploads.push_back({file_path, attached_log});
++    return true;
++  }
++};
++
++// Verifies that RequestToSendCrash() uploads the crash payload in a single NELO
++// request with the attached .log (upload_file_log) embedded, so the call stack
++// and the failure-cause log land in the same NELO event (and can be paired).
++// Non-.log attachments (e.g. .bin) must not be embedded, and the .log must not
++// be uploaded as a separate request.
++TEST_F(CrashSenderUtilTest, RequestToSendCrashEmbedsAttachedLogIntoPayload) {
++  const base::FilePath system_dir = paths::Get(paths::kSystemCrashDirectory);
++  ASSERT_TRUE(base::CreateDirectory(system_dir));
++
++  const base::FilePath payload_file("0.0.0.0.0.dmp");
++  ASSERT_TRUE(
++      test_util::CreateFile(system_dir.Append(payload_file), "fake_dmp"));
++
++  const base::FilePath log_file("0.0.0.0.0.log");
++  const std::string log_contents = "===/var/log/messages===\nfailure cause";
++  ASSERT_TRUE(test_util::CreateFile(system_dir.Append(log_file), log_contents));
++
++  // A non-log attachment that must not be embedded as the crash log.
++  const base::FilePath bin_file("data.bin");
++  ASSERT_TRUE(test_util::CreateFile(system_dir.Append(bin_file), "fake_bin"));
++
++  brillo::KeyValueStore metadata;
++  metadata.SetString("exec_name", "cryptohomed");
++  metadata.SetString("ver", "fake_chromeos_ver");
++  metadata.SetString("upload_file_log", log_file.value());
++  metadata.SetString("upload_file_foofile", bin_file.value());
++
++  CrashDetails details = {
++      .meta_file = system_dir.Append("0.0.0.0.0.meta"),
++      .payload_file = system_dir.Append(payload_file),
++      .payload_kind = "minidump",
++      .client_id = kFakeClientId,
++      .metadata = metadata,
++  };
++
++  Sender::Options options;
++  RecordingNeloSender sender(
++      nullptr, std::make_unique<test_util::AdvancingClock>(), options);
++
++  EXPECT_EQ(sender.RequestToSendCrashForTest(details),
++            SenderBase::CrashRemoveReason::kFinishedUploading);
++
++  // Exactly one upload: the payload, carrying the .log contents (not the .bin).
++  ASSERT_EQ(sender.uploads.size(), 1u);
++  EXPECT_EQ(sender.uploads[0].file_path, system_dir.Append(payload_file));
++  EXPECT_EQ(sender.uploads[0].attached_log, log_contents);
++}
++
++// When a crash carries multiple .log attachments, only upload_file_log (the
++// cryptohome failure-cause log) must be embedded -- not another .log that
++// happens to sort earlier (e.g. upload_file_ec_log). Guards against matching by
++// ".log" suffix over the KeyValueStore's key-sorted iteration order.
++TEST_F(CrashSenderUtilTest, RequestToSendCrashEmbedsOnlyUploadFileLog) {
++  const base::FilePath system_dir = paths::Get(paths::kSystemCrashDirectory);
++  ASSERT_TRUE(base::CreateDirectory(system_dir));
++
++  const base::FilePath payload_file("0.0.0.0.0.dmp");
++  ASSERT_TRUE(
++      test_util::CreateFile(system_dir.Append(payload_file), "fake_dmp"));
++
++  // "ec_log" sorts before "log" in the meta's key order; it must be ignored.
++  const base::FilePath ec_log_file("0.0.0.0.0.ec.log");
++  ASSERT_TRUE(
++      test_util::CreateFile(system_dir.Append(ec_log_file), "ec log content"));
++
++  const base::FilePath log_file("0.0.0.0.0.log");
++  const std::string log_contents = "cryptohome failure cause";
++  ASSERT_TRUE(test_util::CreateFile(system_dir.Append(log_file), log_contents));
++
++  brillo::KeyValueStore metadata;
++  metadata.SetString("ver", "fake_chromeos_ver");
++  metadata.SetString("upload_file_ec_log", ec_log_file.value());
++  metadata.SetString("upload_file_log", log_file.value());
++
++  CrashDetails details = {
++      .meta_file = system_dir.Append("0.0.0.0.0.meta"),
++      .payload_file = system_dir.Append(payload_file),
++      .payload_kind = "minidump",
++      .client_id = kFakeClientId,
++      .metadata = metadata,
++  };
++
++  Sender::Options options;
++  RecordingNeloSender sender(
++      nullptr, std::make_unique<test_util::AdvancingClock>(), options);
++
++  EXPECT_EQ(sender.RequestToSendCrashForTest(details),
++            SenderBase::CrashRemoveReason::kFinishedUploading);
++
++  ASSERT_EQ(sender.uploads.size(), 1u);
++  EXPECT_EQ(sender.uploads[0].attached_log, log_contents);
++}
++
++// When there is no attached .log, the payload is still uploaded, with an empty
++// embedded log.
++TEST_F(CrashSenderUtilTest, RequestToSendCrashWithoutAttachedLog) {
++  const base::FilePath system_dir = paths::Get(paths::kSystemCrashDirectory);
++  ASSERT_TRUE(base::CreateDirectory(system_dir));
++
++  const base::FilePath payload_file("0.0.0.0.0.dmp");
++  ASSERT_TRUE(
++      test_util::CreateFile(system_dir.Append(payload_file), "fake_dmp"));
++
++  brillo::KeyValueStore metadata;
++  metadata.SetString("ver", "fake_chromeos_ver");
++
++  CrashDetails details = {
++      .meta_file = system_dir.Append("0.0.0.0.0.meta"),
++      .payload_file = system_dir.Append(payload_file),
++      .payload_kind = "minidump",
++      .client_id = kFakeClientId,
++      .metadata = metadata,
++  };
++
++  Sender::Options options;
++  RecordingNeloSender sender(
++      nullptr, std::make_unique<test_util::AdvancingClock>(), options);
++
++  EXPECT_EQ(sender.RequestToSendCrashForTest(details),
++            SenderBase::CrashRemoveReason::kFinishedUploading);
++
++  ASSERT_EQ(sender.uploads.size(), 1u);
++  EXPECT_EQ(sender.uploads[0].file_path, system_dir.Append(payload_file));
++  EXPECT_TRUE(sender.uploads[0].attached_log.empty());
++}
++
++// When the payload is itself a log file (e.g. update_failure_*.log), there is
++// no call stack to pair with, so the crash log must not be embedded even if a
++// .log attachment happens to be present.
++TEST_F(CrashSenderUtilTest, RequestToSendCrashDoesNotEmbedLogIntoLogPayload) {
++  const base::FilePath system_dir = paths::Get(paths::kSystemCrashDirectory);
++  ASSERT_TRUE(base::CreateDirectory(system_dir));
++
++  const base::FilePath payload_file("update_failure_0.0.0.0.0.log");
++  ASSERT_TRUE(
++      test_util::CreateFile(system_dir.Append(payload_file), "fake_payload"));
++
++  const base::FilePath log_file("0.0.0.0.0.log");
++  ASSERT_TRUE(
++      test_util::CreateFile(system_dir.Append(log_file), "attached_log"));
++
++  brillo::KeyValueStore metadata;
++  metadata.SetString("ver", "fake_chromeos_ver");
++  metadata.SetString("upload_file_log", log_file.value());
++
++  CrashDetails details = {
++      .meta_file = system_dir.Append("0.0.0.0.0.meta"),
++      .payload_file = system_dir.Append(payload_file),
++      .payload_kind = "log",
++      .client_id = kFakeClientId,
++      .metadata = metadata,
++  };
++
++  Sender::Options options;
++  RecordingNeloSender sender(
++      nullptr, std::make_unique<test_util::AdvancingClock>(), options);
++
++  EXPECT_EQ(sender.RequestToSendCrashForTest(details),
++            SenderBase::CrashRemoveReason::kFinishedUploading);
++
++  // The log-payload is uploaded once, with no crash log embedded.
++  ASSERT_EQ(sender.uploads.size(), 1u);
++  EXPECT_EQ(sender.uploads[0].file_path, system_dir.Append(payload_file));
++  EXPECT_TRUE(sender.uploads[0].attached_log.empty());
++}
++
++// If the payload upload itself fails, the whole report must be retried.
++TEST_F(CrashSenderUtilTest, RequestToSendCrashRetriesWhenPayloadUploadFails) {
++  const base::FilePath system_dir = paths::Get(paths::kSystemCrashDirectory);
++  ASSERT_TRUE(base::CreateDirectory(system_dir));
++
++  const base::FilePath payload_file("0.0.0.0.0.dmp");
++  ASSERT_TRUE(
++      test_util::CreateFile(system_dir.Append(payload_file), "fake_dmp"));
++
++  // Sender subclass whose payload upload always fails.
++  class FailingNeloSender : public util::Sender {
++   public:
++    using util::Sender::Sender;
++
++    // Exposes the protected RequestToSendCrash() to the test body.
++    SenderBase::CrashRemoveReason RequestToSendCrashForTest(
++        const CrashDetails& details) {
++      return RequestToSendCrash(details);
++    }
++
++   protected:
++    bool SendFileToNelo(const CrashDetails& details,
++                        const base::FilePath& file_path,
++                        const std::string& attached_log) override {
++      return false;
++    }
++  };
++
++  brillo::KeyValueStore metadata;
++  metadata.SetString("ver", "fake_chromeos_ver");
++
++  CrashDetails details = {
++      .meta_file = system_dir.Append("0.0.0.0.0.meta"),
++      .payload_file = system_dir.Append(payload_file),
++      .payload_kind = "minidump",
++      .client_id = kFakeClientId,
++      .metadata = metadata,
++  };
++
++  Sender::Options options;
++  FailingNeloSender sender(
++      nullptr, std::make_unique<test_util::AdvancingClock>(), options);
++
++  EXPECT_EQ(sender.RequestToSendCrashForTest(details),
++            SenderBase::CrashRemoveReason::kRetryUploading);
++}
++
+ class CrashSenderSendCrashesTest : public CrashSenderUtilTest,
+                                    public ::testing::WithParamInterface<
+                                        std::tuple<bool, int, base::TimeDelta>> {
+diff --git a/crash-reporter/crashpad/file_io.cc b/crash-reporter/crashpad/file_io.cc
+new file mode 100644
+index 0000000000..945ef4bd5e
+--- /dev/null
++++ b/crash-reporter/crashpad/file_io.cc
+@@ -0,0 +1,184 @@
++// Copyright 2014 The Crashpad Authors. All rights reserved.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++#include "crash-reporter/crashpad/file_io.h"
++
++#include <base/check_op.h>
++#include <base/logging.h>
++#include <base/numerics/safe_conversions.h>
++
++namespace crashpad {
++
++namespace {
++
++class FileIOReadExactly final : public internal::ReadExactlyInternal {
++ public:
++  explicit FileIOReadExactly(FileHandle file)
++      : ReadExactlyInternal(), file_(file) {}
++  ~FileIOReadExactly() {}
++
++ private:
++  // ReadExactlyInternal:
++  crashpad::FileOperationResult Read(void* buffer, size_t size, bool can_log) override {
++    crashpad::FileOperationResult rv = ReadFile(file_, buffer, size);
++    if (rv < 0) {
++      PLOG_IF(ERROR, can_log) << internal::kNativeReadFunctionName;
++      return -1;
++    }
++    return rv;
++  }
++
++  FileHandle file_;
++};
++
++class FileIOWriteAll final : public internal::WriteAllInternal {
++ public:
++  explicit FileIOWriteAll(FileHandle file) : WriteAllInternal(), file_(file) {}
++  ~FileIOWriteAll() {}
++
++ private:
++  // WriteAllInternal:
++  crashpad::FileOperationResult Write(const void* buffer, size_t size) override {
++    return internal::NativeWriteFile(file_, buffer, size);
++  }
++
++  FileHandle file_;
++};
++
++}  // namespace
++
++namespace internal {
++
++bool ReadExactlyInternal::ReadExactly(void* buffer, size_t size, bool can_log) {
++  char* buffer_c = static_cast<char*>(buffer);
++  size_t total_bytes = 0;
++  size_t remaining = size;
++  while (remaining > 0) {
++    crashpad::FileOperationResult bytes_read = Read(buffer_c, remaining, can_log);
++    if (bytes_read < 0) {
++      return false;
++    }
++
++    DCHECK_LE(static_cast<size_t>(bytes_read), remaining);
++
++    if (bytes_read == 0) {
++      break;
++    }
++
++    buffer_c += bytes_read;
++    remaining -= bytes_read;
++    total_bytes += bytes_read;
++  }
++
++  if (total_bytes != size) {
++    LOG_IF(ERROR, can_log) << "ReadExactly: expected " << size << ", observed "
++                           << total_bytes;
++    return false;
++  }
++
++  return true;
++}
++
++bool WriteAllInternal::WriteAll(const void* buffer, size_t size) {
++  const char* buffer_c = static_cast<const char*>(buffer);
++
++  while (size > 0) {
++    crashpad::FileOperationResult bytes_written = Write(buffer_c, size);
++    if (bytes_written < 0) {
++      return false;
++    }
++
++    DCHECK_NE(bytes_written, 0);
++
++    buffer_c += bytes_written;
++    size -= bytes_written;
++  }
++
++  return true;
++}
++
++}  // namespace internal
++
++bool ReadFileExactly(FileHandle file, void* buffer, size_t size) {
++  FileIOReadExactly read_exactly(file);
++  return read_exactly.ReadExactly(buffer, size, false);
++}
++
++bool LoggingReadFileExactly(FileHandle file, void* buffer, size_t size) {
++  FileIOReadExactly read_exactly(file);
++  return read_exactly.ReadExactly(buffer, size, true);
++}
++
++bool WriteFile(FileHandle file, const void* buffer, size_t size) {
++  FileIOWriteAll write_all(file);
++  return write_all.WriteAll(buffer, size);
++}
++
++bool LoggingWriteFile(FileHandle file, const void* buffer, size_t size) {
++  if (!WriteFile(file, buffer, size)) {
++    PLOG(ERROR) << internal::kNativeWriteFunctionName;
++    return false;
++  }
++
++  return true;
++}
++
++void CheckedReadFileExactly(FileHandle file, void* buffer, size_t size) {
++  CHECK(LoggingReadFileExactly(file, buffer, size));
++}
++
++void CheckedWriteFile(FileHandle file, const void* buffer, size_t size) {
++  CHECK(LoggingWriteFile(file, buffer, size));
++}
++
++void CheckedReadFileAtEOF(FileHandle file) {
++  char c;
++  crashpad::FileOperationResult rv = ReadFile(file, &c, 1);
++  if (rv < 0) {
++    PCHECK(rv == 0) << internal::kNativeReadFunctionName;
++  } else {
++    CHECK_EQ(rv, 0) << internal::kNativeReadFunctionName;
++  }
++}
++
++bool LoggingReadToEOF(FileHandle file, std::string* contents) {
++  char buffer[4096];
++  crashpad::FileOperationResult rv;
++  std::string local_contents;
++  while ((rv = ReadFile(file, buffer, sizeof(buffer))) > 0) {
++    DCHECK_LE(static_cast<size_t>(rv), sizeof(buffer));
++    local_contents.append(buffer, rv);
++  }
++  if (rv < 0) {
++    PLOG(ERROR) << internal::kNativeReadFunctionName;
++    return false;
++  }
++  contents->swap(local_contents);
++  return true;
++}
++
++bool LoggingReadEntireFile(const base::FilePath& path, std::string* contents) {
++  ScopedFileHandle handle(LoggingOpenFileForRead(path));
++  if (!handle.is_valid()) {
++    return false;
++  }
++
++  return LoggingReadToEOF(handle.get(), contents);
++}
++
++void CheckedCloseFile(FileHandle file) {
++  CHECK(LoggingCloseFile(file));
++}
++
++}  // namespace crashpad
+diff --git a/crash-reporter/crashpad/file_io.h b/crash-reporter/crashpad/file_io.h
+new file mode 100644
+index 0000000000..88611ede3e
+--- /dev/null
++++ b/crash-reporter/crashpad/file_io.h
+@@ -0,0 +1,524 @@
++// Copyright 2014 The Crashpad Authors. All rights reserved.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++#ifndef CRASH_REPORTER_CRASHPAD_FILE_IO_H_
++#define CRASH_REPORTER_CRASHPAD_FILE_IO_H_
++
++#include <sys/types.h>
++
++#include <string>
++
++#include <build/build_config.h>
++
++#if defined(OS_POSIX)
++#include <base/files/scoped_file.h>
++#elif defined(OS_WIN)
++#include <windows.h>
++#include "crash-reporter/crashpad/scoped_handle.h"
++#endif
++
++namespace base {
++class FilePath;
++}  // namespace base
++
++namespace crashpad {
++
++#if defined(OS_POSIX) || DOXYGEN
++
++//! \brief Platform-specific alias for a low-level file handle.
++using FileHandle = int;
++
++//! \brief Platform-specific alias for a position in an open file.
++using FileOffset = off_t;
++
++//! \brief Scoped wrapper of a FileHandle.
++using ScopedFileHandle = base::ScopedFD;
++
++//! \brief The return value of read and write calls.
++using FileOperationResult = ssize_t;
++
++//! \brief A value that can never be a valid FileHandle.
++const FileHandle kInvalidFileHandle = -1;
++
++#elif defined(OS_WIN)
++
++using FileHandle = HANDLE;
++using FileOffset = LONGLONG;
++using ScopedFileHandle = ScopedFileHANDLE;
++using crashpad::FileOperationResult = LONG_PTR;
++
++const FileHandle kInvalidFileHandle = INVALID_HANDLE_VALUE;
++
++#endif
++
++//! \brief Determines the mode that LoggingOpenFileForWrite() uses.
++enum class FileWriteMode {
++  //! \brief Opens the file if it exists, or fails if it does not.
++  kReuseOrFail,
++
++  //! \brief Opens the file if it exists, or creates a new file.
++  kReuseOrCreate,
++
++  //! \brief Creates a new file. If the file already exists, it will be
++  //!     overwritten.
++  kTruncateOrCreate,
++
++  //! \brief Creates a new file. If the file already exists, the open will fail.
++  kCreateOrFail,
++};
++
++//! \brief Determines the permissions bits for files created on POSIX systems.
++enum class FilePermissions : bool {
++  //! \brief Equivalent to `0600`.
++  kOwnerOnly,
++
++  //! \brief Equivalent to `0644`.
++  kWorldReadable,
++};
++
++//! \brief Determines the locking mode that LoggingLockFile() uses.
++enum class FileLocking : bool {
++  //! \brief Equivalent to `flock()` with `LOCK_SH`.
++  kShared,
++
++  //! \brief Equivalent to `flock()` with `LOCK_EX`.
++  kExclusive,
++};
++
++//! \brief Determines the FileHandle that StdioFileHandle() returns.
++enum class StdioStream {
++  //! \brief Standard input, or `stdin`.
++  kStandardInput,
++
++  //! \brief Standard output, or `stdout`.
++  kStandardOutput,
++
++  //! \brief Standard error, or `stderr`.
++  kStandardError,
++};
++
++namespace internal {
++
++#if defined(OS_POSIX) || DOXYGEN
++
++//! \brief The name of the native read function used by ReadFile().
++//!
++//! This value may be useful for logging.
++//!
++//! \sa kNativeWriteFunctionName
++constexpr char kNativeReadFunctionName[] = "read";
++
++//! \brief The name of the native write function used by WriteFile().
++//!
++//! This value may be useful for logging.
++//!
++//! \sa kNativeReadFunctionName
++constexpr char kNativeWriteFunctionName[] = "write";
++
++#elif defined(OS_WIN)
++
++constexpr char kNativeReadFunctionName[] = "ReadFile";
++constexpr char kNativeWriteFunctionName[] = "WriteFile";
++
++#endif
++
++//! \brief The internal implementation of ReadFileExactly() and its wrappers.
++//!
++//! The logic is exposed so that it may be reused by FileReaderInterface, and
++//! so that it may be tested without requiring large files to be read. It is not
++//! intended to be used more generally. Use ReadFileExactly(),
++//! LoggingReadFileExactly(), CheckedReadFileExactly(), or
++//! FileReaderInterface::ReadExactly() instead.
++class ReadExactlyInternal {
++ public:
++  //! \brief Calls Read(), retrying following a short read, ensuring that
++  //!     exactly \a size bytes are read.
++  //!
++  //! \return `true` on success. `false` if the underlying Read() fails or if
++  //!     fewer than \a size bytes were read. When returning `false`, if \a
++  //!     can_log is `true`, logs a message.
++  bool ReadExactly(void* buffer, size_t size, bool can_log);
++
++ protected:
++  ReadExactlyInternal() {}
++  ~ReadExactlyInternal() {}
++
++ private:
++  //! \brief Wraps a read operation, such as ReadFile().
++  //!
++  //! \return The number of bytes read and placed into \a buffer, or `-1` on
++  //!     error. When returning `-1`, if \a can_log is `true`, logs a message.
++  virtual crashpad::FileOperationResult Read(void* buffer, size_t size, bool can_log) = 0;
++};
++
++//! \brief The internal implementation of WriteFile() and its wrappers.
++//!
++//! The logic is exposed so that it may be tested without requiring large files
++//! to be written. It is not intended to be used more generally. Use
++//! WriteFile(), LoggingWriteFile(), CheckedWriteFile(), or
++//! FileWriterInterface::Write() instead.
++class WriteAllInternal {
++ public:
++  //! \brief Calls Write(), retrying following a short write, ensuring that
++  //!     exactly \a size bytes are written.
++  //!
++  //! \return `true` on success. `false` if the underlying Write() fails or if
++  //!     fewer than \a size bytes were written.
++  bool WriteAll(const void* buffer, size_t size);
++
++ protected:
++  WriteAllInternal() {}
++  ~WriteAllInternal() {}
++
++ private:
++  //! \brief Wraps a write operation, such as NativeWriteFile().
++  //!
++  //! \return The number of bytes written from \a buffer, or `-1` on error.
++  virtual crashpad::FileOperationResult Write(const void* buffer, size_t size) = 0;
++};
++
++//! \brief Writes to a file, retrying when interrupted on POSIX.
++//!
++//! Fewer than \a size bytes may be written to \a file. This can happen if the
++//! underlying write operation returns before writing the entire buffer, or if
++//! the buffer is too large to write in a single operation, possibly due to a
++//! limitation of a data type used to express the number of bytes written.
++//!
++//! This function adapts native write operations for uniform use by WriteFile().
++//! This function should only be called by WriteFile(). Other code should call
++//! WriteFile() or another function that wraps WriteFile().
++//!
++//! \param[in] file The file to write to.
++//! \param[in] buffer A buffer containing data to be written.
++//! \param[in] size The number of bytes from \a buffer to write.
++//!
++//! \return The number of bytes actually written from \a buffer to \a file on
++//!     success. `-1` on error, with `errno` or `GetLastError()` set
++//!     appropriately.
++crashpad::FileOperationResult NativeWriteFile(FileHandle file,
++                                    const void* buffer,
++                                    size_t size);
++
++}  // namespace internal
++
++//! \brief Reads from a file, retrying when interrupted before reading any data
++//!     on POSIX.
++//!
++//! This function reads into \a buffer. Fewer than \a size bytes may be read.
++//! On Windows, reading from sockets is not currently supported.
++//!
++//! \return The number of bytes read and placed into \a buffer, or `-1` on
++//!     error, with `errno` or `GetLastError()` set appropriately. On error, a
++//!     portion of \a file may have been read into \a buffer.
++//!
++//! \sa WriteFile
++//! \sa ReadFileExactly
++//! \sa LoggingReadFileExactly
++//! \sa CheckedReadFileExactly
++//! \sa CheckedReadFileAtEOF
++crashpad::FileOperationResult ReadFile(FileHandle file, void* buffer, size_t size);
++
++//! \brief Writes to a file, retrying when interrupted on POSIX or following a
++//!     short write.
++//!
++//! This function writes to \a file, stopping only when \a size bytes have been
++//! written.
++//!
++//! \return `true` on success. `false` on error, with `errno` or
++//!     `GetLastError()` set appropriately. On error, a portion of \a buffer may
++//!     have been written to \a file.
++//!
++//! \sa ReadFile
++//! \sa LoggingWriteFile
++//! \sa CheckedWriteFile
++bool WriteFile(FileHandle file, const void* buffer, size_t size);
++
++//! \brief Wraps ReadFile(), retrying following a short read, ensuring that
++//!     exactly \a size bytes are read.
++//!
++//! \return `true` on success. If the underlying ReadFile() fails, or if fewer
++//!     than \a size bytes were read, this function logs a message and
++//!     returns `false`.
++//!
++//! \sa LoggingWriteFile
++//! \sa ReadFile
++//! \sa LoggingReadFileExactly
++//! \sa CheckedReadFileExactly
++//! \sa CheckedReadFileAtEOF
++bool ReadFileExactly(FileHandle file, void* buffer, size_t size);
++
++//! \brief Wraps ReadFile(), retrying following a short read, ensuring that
++//!     exactly \a size bytes are read.
++//!
++//! \return `true` on success. If the underlying ReadFile() fails, or if fewer
++//!     than \a size bytes were read, this function logs a message and
++//!     returns `false`.
++//!
++//! \sa LoggingWriteFile
++//! \sa ReadFile
++//! \sa ReadFileExactly
++//! \sa CheckedReadFileExactly
++//! \sa CheckedReadFileAtEOF
++bool LoggingReadFileExactly(FileHandle file, void* buffer, size_t size);
++
++//! \brief Wraps WriteFile(), ensuring that exactly \a size bytes are written.
++//!
++//! \return `true` on success. If the underlying WriteFile() fails, or if fewer
++//!     than \a size bytes were written, this function logs a message and
++//!     returns `false`.
++//!
++//! \sa LoggingReadFileExactly
++//! \sa WriteFile
++//! \sa CheckedWriteFile
++bool LoggingWriteFile(FileHandle file, const void* buffer, size_t size);
++
++//! \brief Wraps ReadFile(), ensuring that exactly \a size bytes are read.
++//!
++//! If the underlying ReadFile() fails, or if fewer than \a size bytes were
++//! read, this function causes execution to terminate without returning.
++//!
++//! \sa CheckedWriteFile
++//! \sa ReadFile
++//! \sa LoggingReadFileExactly
++//! \sa CheckedReadFileAtEOF
++void CheckedReadFileExactly(FileHandle file, void* buffer, size_t size);
++
++//! \brief Wraps WriteFile(), ensuring that exactly \a size bytes are written.
++//!
++//! if the underlying WriteFile() fails, or if fewer than \a size bytes were
++//! written, this function causes execution to terminate without returning.
++//!
++//! \sa CheckedReadFileExactly
++//! \sa WriteFile
++//! \sa LoggingWriteFile
++void CheckedWriteFile(FileHandle file, const void* buffer, size_t size);
++
++//! \brief Wraps ReadFile(), ensuring that it indicates end-of-file.
++//!
++//! Attempts to read a single byte from \a file, expecting no data to be read.
++//! If the underlying ReadFile() fails, or if a byte actually is read, this
++//! function causes execution to terminate without returning.
++//!
++//! \sa CheckedReadFileExactly
++//! \sa ReadFile
++void CheckedReadFileAtEOF(FileHandle file);
++
++//! \brief Wraps ReadFile() to read from the current file position to the end of
++//!     the file into \a contents.
++//!
++//! \return `true` on success, or `false` with a message logged.
++bool LoggingReadToEOF(FileHandle file, std::string* contents);
++
++//! \brief Wraps LoggingOpenFileForRead() and ReadFile() reading the entire file
++//!     into \a contents.
++//!
++//! \return `true` on success, or `false` with a message logged.
++bool LoggingReadEntireFile(const base::FilePath& path, std::string* contents);
++
++//! \brief Wraps `open()` or `CreateFile()`, opening an existing file for
++//!     reading.
++//!
++//! \return The newly opened FileHandle, or an invalid FileHandle on failure.
++//!
++//! \sa ScopedFileHandle
++//! \sa OpenFileForWrite
++//! \sa OpenFileForReadAndWrite
++//! \sa LoggingOpenFileForRead
++FileHandle OpenFileForRead(const base::FilePath& path);
++
++//! \brief Wraps `open()` or `CreateFile()`, creating a file for output.
++//!
++//! \a mode determines the style (truncate, reuse, etc.) that is used to open
++//! the file. On POSIX, \a permissions determines the value that is passed as
++//! `mode` to `open()`. On Windows, the file is always opened in binary mode
++//! (that is, no CRLF translation). On Windows, the file is opened for sharing,
++//! see LoggingLockFile() and LoggingUnlockFile() to control concurrent access.
++//!
++//! \return The newly opened FileHandle, or an invalid FileHandle on failure.
++//!
++//! \sa ScopedFileHandle
++//! \sa OpenFileForRead
++//! \sa OpenFileForReadAndWrite
++//! \sa LoggingOpenFileForWrite
++FileHandle OpenFileForWrite(const base::FilePath& path,
++                            FileWriteMode mode,
++                            FilePermissions permissions);
++
++//! \brief Wraps `open()` or `CreateFile()`, creating a file for both input and
++//!     output.
++//!
++//! \a mode determines the style (truncate, reuse, etc.) that is used to open
++//! the file. On POSIX, \a permissions determines the value that is passed as
++//! `mode` to `open()`. On Windows, the file is always opened in binary mode
++//! (that is, no CRLF translation). On Windows, the file is opened for sharing,
++//! see LoggingLockFile() and LoggingUnlockFile() to control concurrent access.
++//!
++//! \return The newly opened FileHandle, or an invalid FileHandle on failure.
++//!
++//! \sa ScopedFileHandle
++//! \sa OpenFileForRead
++//! \sa OpenFileForWrite
++//! \sa LoggingOpenFileForReadAndWrite
++FileHandle OpenFileForReadAndWrite(const base::FilePath& path,
++                                   FileWriteMode mode,
++                                   FilePermissions permissions);
++
++//! \brief Wraps OpenFileForRead(), logging an error if the operation fails.
++//!
++//! \return The newly opened FileHandle, or an invalid FileHandle on failure.
++//!
++//! \sa ScopedFileHandle
++//! \sa LoggingOpenFileForWrite
++//! \sa LoggingOpenFileForReadAndWrite
++FileHandle LoggingOpenFileForRead(const base::FilePath& path);
++
++//! \brief Wraps OpenFileForWrite(), logging an error if the operation fails.
++//!
++//! \return The newly opened FileHandle, or an invalid FileHandle on failure.
++//!
++//! \sa ScopedFileHandle
++//! \sa LoggingOpenFileForRead
++//! \sa LoggingOpenFileForReadAndWrite
++FileHandle LoggingOpenFileForWrite(const base::FilePath& path,
++                                   FileWriteMode mode,
++                                   FilePermissions permissions);
++
++#if defined(OS_LINUX)
++//! \brief Opens an in-memory file for input and output.
++//!
++//! This function first attempts to open the file with `memfd_create()`. If
++//! `memfd_create()` isn't supported by the kernel, this function next attempts
++//! to open a file using `O_TMPFILE`. If `O_TMPFILE` isn't supported, this
++//! function finally falls back to creating a file with a randomized name in
++//! `/tmp` and immediately `unlink()`ing it.
++//!
++//! Unlike other file open operations, this function doesn't set `O_CLOEXEC`.
++//!
++//! \param name A name associated with the file. This name does not indicate any
++//!     exact path and may not be used at all, depending on the strategy used to
++//!     create the file. The name should not contain any '/' characters.
++//! \return The newly opened FileHandle, or an invalid FileHandle on failure,
++//!     with a message logged.
++//!
++//! \sa ScopedFileHandle
++//! \sa LoggingOpenFileForRead
++//! \sa LoggingOpenFileForWrite
++//! \sa LoggingOpenFileForReadAndWrite
++FileHandle LoggingOpenMemoryFileForReadAndWrite(const base::FilePath& name);
++#endif  // OS_LINUX
++
++//! \brief Wraps OpenFileForReadAndWrite(), logging an error if the operation
++//!     fails.
++//!
++//! \return The newly opened FileHandle, or an invalid FileHandle on failure.
++//!
++//! \sa ScopedFileHandle
++//! \sa LoggingOpenFileForRead
++//! \sa LoggingOpenFileForWrite
++FileHandle LoggingOpenFileForReadAndWrite(const base::FilePath& path,
++                                          FileWriteMode mode,
++                                          FilePermissions permissions);
++
++// Fuchsia does not currently support any sort of file locking. See
++// https://crashpad.chromium.org/bug/196 and
++// https://crashpad.chromium.org/bug/217.
++#if !defined(OS_FUCHSIA)
++
++//! \brief Locks the given \a file using `flock()` on POSIX or `LockFileEx()` on
++//!     Windows.
++//!
++//! It is an error to attempt to lock a file in a different mode when it is
++//! already locked. This call will block until the lock is acquired. The
++//! entire file is locked.
++//!
++//! If \a locking is FileLocking::kShared, \a file must have been opened for
++//! reading, and if it's FileLocking::kExclusive, \a file must have been opened
++//! for writing.
++//!
++//! \param[in] file The open file handle to be locked.
++//! \param[in] locking Controls whether the lock is a shared reader lock, or an
++//!     exclusive writer lock.
++//!
++//! \return `true` on success, or `false` and a message will be logged.
++bool LoggingLockFile(FileHandle file, FileLocking locking);
++
++//! \brief Unlocks a file previously locked with LoggingLockFile().
++//!
++//! It is an error to attempt to unlock a file that was not previously locked.
++//! A previously-locked file should be unlocked before closing the file handle,
++//! otherwise on some OSs the lock may not be released immediately.
++//!
++//! \param[in] file The open locked file handle to be unlocked.
++//!
++//! \return `true` on success, or `false` and a message will be logged.
++bool LoggingUnlockFile(FileHandle file);
++
++#endif  // !OS_FUCHSIA
++
++//! \brief Wraps `lseek()` or `SetFilePointerEx()`. Logs an error if the
++//!     operation fails.
++//!
++//! Repositions the offset of the open \a file to the specified \a offset,
++//! relative to \a whence. \a whence must be one of `SEEK_SET`, `SEEK_CUR`, or
++//! `SEEK_END`, and is interpreted in the usual way.
++//!
++//! \return The resulting offset in bytes from the beginning of the file, or
++//!     `-1` on failure.
++FileOffset LoggingSeekFile(FileHandle file, FileOffset offset, int whence);
++
++//! \brief Truncates the given \a file to zero bytes in length.
++//!
++//! \return `true` on success, or `false`, and a message will be logged.
++bool LoggingTruncateFile(FileHandle file);
++
++//! \brief Wraps `close()` or `CloseHandle()`, logging an error if the operation
++//!     fails.
++//!
++//! \return On success, `true` is returned. On failure, an error is logged and
++//!     `false` is returned.
++bool LoggingCloseFile(FileHandle file);
++
++//! \brief Wraps `close()` or `CloseHandle()`, ensuring that it succeeds.
++//!
++//! If the underlying function fails, this function causes execution to
++//! terminate without returning.
++void CheckedCloseFile(FileHandle file);
++
++//! \brief Determines the size of a file.
++//!
++//! \param[in] file The handle to the file for which the size should be
++//!     retrieved.
++//!
++//! \return The size of the file. If an error occurs when attempting to
++//!     determine its size, returns `-1` with an error logged.
++FileOffset LoggingFileSizeByHandle(FileHandle file);
++
++//! \brief Returns a FileHandle corresponding to the requested standard I/O
++//!     stream.
++//!
++//! The returned FileHandle should not be closed on POSIX, where it is
++//! important to maintain valid file descriptors occupying the slots reserved
++//! for these streams. If a need to close such a stream arises on POSIX,
++//! `dup2()` should instead be used to replace the existing file descriptor with
++//! one opened to `/dev/null`. See CloseStdinAndStdout().
++//!
++//! \param[in] stdio_stream The requested standard I/O stream.
++//!
++//! \return A corresponding FileHandle on success. kInvalidFileHandle on error,
++//!     with a message logged.
++FileHandle StdioFileHandle(StdioStream stdio_stream);
++
++}  // namespace crashpad
++
++#endif  // CRASH_REPORTER_CRASHPAD_FILE_IO_H_
+diff --git a/crash-reporter/crashpad/file_io_posix.cc b/crash-reporter/crashpad/file_io_posix.cc
+new file mode 100644
+index 0000000000..a6b130f8fb
+--- /dev/null
++++ b/crash-reporter/crashpad/file_io_posix.cc
+@@ -0,0 +1,272 @@
++// Copyright 2014 The Crashpad Authors. All rights reserved.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++#include "crash-reporter/crashpad/file_io.h"
++
++#include <errno.h>
++#include <fcntl.h>
++#include <sys/file.h>
++#include <sys/mman.h>
++#include <sys/stat.h>
++#include <unistd.h>
++
++#include <algorithm>
++#include <limits>
++
++#include <base/check_op.h>
++#include <base/files/file_path.h>
++#include <base/logging.h>
++#include <base/notreached.h>
++#include <base/posix/eintr_wrapper.h>
++#include <base/strings/stringprintf.h>
++#include <build/build_config.h>
++
++#include "crash-reporter/crashpad/random_string.h"
++
++namespace crashpad {
++
++namespace {
++
++struct ReadTraits {
++  using BufferType = void*;
++  static FileOperationResult Operate(int fd, BufferType buffer, size_t size) {
++    return read(fd, buffer, size);
++  }
++};
++
++struct WriteTraits {
++  using BufferType = const void*;
++  static FileOperationResult Operate(int fd, BufferType buffer, size_t size) {
++    return write(fd, buffer, size);
++  }
++};
++
++template <typename Traits>
++FileOperationResult ReadOrWrite(int fd,
++                                typename Traits::BufferType buffer,
++                                size_t size) {
++  constexpr size_t kMaxReadWriteSize =
++      static_cast<size_t>(std::numeric_limits<ssize_t>::max());
++  const size_t requested_bytes = std::min(size, kMaxReadWriteSize);
++
++  FileOperationResult transacted_bytes =
++      HANDLE_EINTR(Traits::Operate(fd, buffer, requested_bytes));
++  if (transacted_bytes < 0) {
++    return -1;
++  }
++
++  DCHECK_LE(static_cast<size_t>(transacted_bytes), requested_bytes);
++  return transacted_bytes;
++}
++
++FileHandle OpenFileForOutput(int rdwr_or_wronly,
++                             const base::FilePath& path,
++                             FileWriteMode mode,
++                             FilePermissions permissions) {
++#if defined(OS_FUCHSIA)
++  // O_NOCTTY is invalid on Fuchsia, and O_CLOEXEC isn't necessary.
++  int flags = 0;
++#else
++  int flags = O_NOCTTY | O_CLOEXEC;
++#endif
++
++  DCHECK(rdwr_or_wronly & (O_RDWR | O_WRONLY));
++  DCHECK_EQ(rdwr_or_wronly & ~(O_RDWR | O_WRONLY), 0);
++  flags |= rdwr_or_wronly;
++
++  switch (mode) {
++    case FileWriteMode::kReuseOrFail:
++      break;
++    case FileWriteMode::kReuseOrCreate:
++      flags |= O_CREAT;
++      break;
++    case FileWriteMode::kTruncateOrCreate:
++      flags |= O_CREAT | O_TRUNC;
++      break;
++    case FileWriteMode::kCreateOrFail:
++      flags |= O_CREAT | O_EXCL;
++      break;
++  }
++
++  return HANDLE_EINTR(
++      open(path.value().c_str(),
++           flags,
++           permissions == FilePermissions::kWorldReadable ? 0644 : 0600));
++}
++}  // namespace
++
++namespace internal {
++
++FileOperationResult NativeWriteFile(FileHandle file,
++                                    const void* buffer,
++                                    size_t size) {
++  return ReadOrWrite<WriteTraits>(file, buffer, size);
++}
++
++}  // namespace internal
++
++FileOperationResult ReadFile(FileHandle file, void* buffer, size_t size) {
++  return ReadOrWrite<ReadTraits>(file, buffer, size);
++}
++
++FileHandle OpenFileForRead(const base::FilePath& path) {
++  int flags = O_RDONLY;
++#if !defined(OS_FUCHSIA)
++  // O_NOCTTY is invalid on Fuchsia, and O_CLOEXEC isn't necessary.
++  flags |= O_NOCTTY | O_CLOEXEC;
++#endif
++  return HANDLE_EINTR(open(path.value().c_str(), flags));
++}
++
++FileHandle OpenFileForWrite(const base::FilePath& path,
++                            FileWriteMode mode,
++                            FilePermissions permissions) {
++  return OpenFileForOutput(O_WRONLY, path, mode, permissions);
++}
++
++FileHandle OpenFileForReadAndWrite(const base::FilePath& path,
++                                   FileWriteMode mode,
++                                   FilePermissions permissions) {
++  return OpenFileForOutput(O_RDWR, path, mode, permissions);
++}
++
++FileHandle LoggingOpenFileForRead(const base::FilePath& path) {
++  FileHandle fd = OpenFileForRead(path);
++  PLOG_IF(ERROR, fd < 0) << "open " << path.value();
++  return fd;
++}
++
++FileHandle LoggingOpenFileForWrite(const base::FilePath& path,
++                                   FileWriteMode mode,
++                                   FilePermissions permissions) {
++  FileHandle fd = OpenFileForWrite(path, mode, permissions);
++  PLOG_IF(ERROR, fd < 0) << "open " << path.value();
++  return fd;
++}
++
++#if defined(OS_LINUX)
++FileHandle LoggingOpenMemoryFileForReadAndWrite(const base::FilePath& name) {
++  DCHECK(name.value().find('/') == std::string::npos);
++
++  int result = HANDLE_EINTR(memfd_create(name.value().c_str(), 0));
++  if (result >= 0 || errno != ENOSYS) {
++    PLOG_IF(ERROR, result < 0) << "memfd_create";
++    return result;
++  }
++
++  const char* tmp = getenv("TMPDIR");
++  tmp = tmp ? tmp : "/tmp";
++
++  result = HANDLE_EINTR(open(tmp, O_RDWR | O_EXCL | O_TMPFILE, 0600));
++  if (result >= 0 ||
++      // These are the expected possible error codes indicating that O_TMPFILE
++      // doesn't have kernel or filesystem support. O_TMPFILE was added in Linux
++      // 3.11. Experimentation confirms that at least Linux 2.6.29 and Linux
++      // 3.10 set errno to EISDIR. EOPNOTSUPP is returned when the filesystem
++      // doesn't support O_TMPFILE. The man pages also mention ENOENT as an
++      // error code to check, but the language implies it would only occur when
++      // |tmp| is also an invalid directory. EINVAL is mentioned as a possible
++      // error code for any invalid values in flags, but O_TMPFILE isn't
++      // mentioned explicitly in this context and hasn't been observed in
++      // practice.
++      (errno != EISDIR && errno != EOPNOTSUPP)) {
++    PLOG_IF(ERROR, result < 0) << "open";
++    return result;
++  }
++
++  std::string path = base::StringPrintf("%s/%s.%d.%s",
++                                        tmp,
++                                        name.value().c_str(),
++                                        getpid(),
++                                        RandomString().c_str());
++  result = HANDLE_EINTR(open(path.c_str(), O_RDWR | O_CREAT | O_EXCL, 0600));
++  if (result < 0) {
++    PLOG(ERROR) << "open";
++    return result;
++  }
++  if (unlink(path.c_str()) != 0) {
++    PLOG(WARNING) << "unlink";
++  }
++  return result;
++}
++#endif
++
++FileHandle LoggingOpenFileForReadAndWrite(const base::FilePath& path,
++                                          FileWriteMode mode,
++                                          FilePermissions permissions) {
++  FileHandle fd = OpenFileForReadAndWrite(path, mode, permissions);
++  PLOG_IF(ERROR, fd < 0) << "open " << path.value();
++  return fd;
++}
++
++#if !defined(OS_FUCHSIA)
++
++bool LoggingLockFile(FileHandle file, FileLocking locking) {
++  int operation = (locking == FileLocking::kShared) ? LOCK_SH : LOCK_EX;
++  int rv = HANDLE_EINTR(flock(file, operation));
++  PLOG_IF(ERROR, rv != 0) << "flock";
++  return rv == 0;
++}
++
++bool LoggingUnlockFile(FileHandle file) {
++  int rv = flock(file, LOCK_UN);
++  PLOG_IF(ERROR, rv != 0) << "flock";
++  return rv == 0;
++}
++
++#endif  // !OS_FUCHSIA
++
++FileOffset LoggingSeekFile(FileHandle file, FileOffset offset, int whence) {
++  off_t rv = lseek(file, offset, whence);
++  PLOG_IF(ERROR, rv < 0) << "lseek";
++  return rv;
++}
++
++bool LoggingTruncateFile(FileHandle file) {
++  if (HANDLE_EINTR(ftruncate(file, 0)) != 0) {
++    PLOG(ERROR) << "ftruncate";
++    return false;
++  }
++  return true;
++}
++
++bool LoggingCloseFile(FileHandle file) {
++  int rv = IGNORE_EINTR(close(file));
++  PLOG_IF(ERROR, rv != 0) << "close";
++  return rv == 0;
++}
++
++FileOffset LoggingFileSizeByHandle(FileHandle file) {
++  struct stat st;
++  if (fstat(file, &st) != 0) {
++    PLOG(ERROR) << "fstat";
++    return -1;
++  }
++  return st.st_size;
++}
++
++FileHandle StdioFileHandle(StdioStream stdio_stream) {
++  switch (stdio_stream) {
++    case StdioStream::kStandardInput:
++      return STDIN_FILENO;
++    case StdioStream::kStandardOutput:
++      return STDOUT_FILENO;
++    case StdioStream::kStandardError:
++      return STDERR_FILENO;
++  }
++
++  NOTREACHED();
++}
++
++}  // namespace crashpad
+diff --git a/crash-reporter/crashpad/file_reader.cc b/crash-reporter/crashpad/file_reader.cc
+new file mode 100644
+index 0000000000..343471ea7f
+--- /dev/null
++++ b/crash-reporter/crashpad/file_reader.cc
+@@ -0,0 +1,110 @@
++// Copyright 2015 The Crashpad Authors. All rights reserved.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++#include "crash-reporter/crashpad/file_reader.h"
++
++#include <base/check_op.h>
++#include <base/logging.h>
++#include <base/numerics/safe_conversions.h>
++#include <build/build_config.h>
++
++namespace crashpad {
++
++namespace {
++
++class FileReaderReadExactly final : public internal::ReadExactlyInternal {
++ public:
++  explicit FileReaderReadExactly(FileReaderInterface* file_reader)
++      : ReadExactlyInternal(), file_reader_(file_reader) {}
++  ~FileReaderReadExactly() {}
++
++ private:
++  // ReadExactlyInternal:
++  FileOperationResult Read(void* buffer, size_t size, bool can_log) override {
++    DCHECK(can_log);
++    return file_reader_->Read(buffer, size);
++  }
++
++  FileReaderInterface* file_reader_;  // weak
++};
++
++}  // namespace
++
++bool FileReaderInterface::ReadExactly(void* data, size_t size) {
++  FileReaderReadExactly read_exactly(this);
++  return read_exactly.ReadExactly(data, size, true);
++}
++
++WeakFileHandleFileReader::WeakFileHandleFileReader(FileHandle file_handle)
++    : file_handle_(file_handle) {
++}
++
++WeakFileHandleFileReader::~WeakFileHandleFileReader() {
++}
++
++FileOperationResult WeakFileHandleFileReader::Read(void* data, size_t size) {
++  DCHECK_NE(file_handle_, kInvalidFileHandle);
++
++  base::checked_cast<FileOperationResult>(size);
++  FileOperationResult rv = ReadFile(file_handle_, data, size);
++  if (rv < 0) {
++    PLOG(ERROR) << internal::kNativeReadFunctionName;
++    return -1;
++  }
++
++  return rv;
++}
++
++FileOffset WeakFileHandleFileReader::Seek(FileOffset offset, int whence) {
++  DCHECK_NE(file_handle_, kInvalidFileHandle);
++  return LoggingSeekFile(file_handle_, offset, whence);
++}
++
++FileReader::FileReader()
++    : file_(),
++      weak_file_handle_file_reader_(kInvalidFileHandle) {
++}
++
++FileReader::~FileReader() {
++}
++
++bool FileReader::Open(const base::FilePath& path) {
++  CHECK(!file_.is_valid());
++  file_.reset(LoggingOpenFileForRead(path));
++  if (!file_.is_valid()) {
++    return false;
++  }
++
++  weak_file_handle_file_reader_.set_file_handle(file_.get());
++  return true;
++}
++
++void FileReader::Close() {
++  CHECK(file_.is_valid());
++
++  weak_file_handle_file_reader_.set_file_handle(kInvalidFileHandle);
++  file_.reset();
++}
++
++FileOperationResult FileReader::Read(void* data, size_t size) {
++  DCHECK(file_.is_valid());
++  return weak_file_handle_file_reader_.Read(data, size);
++}
++
++FileOffset FileReader::Seek(FileOffset offset, int whence) {
++  DCHECK(file_.is_valid());
++  return weak_file_handle_file_reader_.Seek(offset, whence);
++}
++
++}  // namespace crashpad
+diff --git a/crash-reporter/crashpad/file_reader.h b/crash-reporter/crashpad/file_reader.h
+new file mode 100644
+index 0000000000..8cc0429edc
+--- /dev/null
++++ b/crash-reporter/crashpad/file_reader.h
+@@ -0,0 +1,142 @@
++// Copyright 2015 The Crashpad Authors. All rights reserved.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++#ifndef CRASH_REPORTER_CRASHPAD_FILE_READER_H_
++#define CRASH_REPORTER_CRASHPAD_FILE_READER_H_
++
++#include <sys/types.h>
++
++#include <base/files/file_path.h>
++
++#include "crash-reporter/crashpad/file_io.h"
++#include "crash-reporter/crashpad/file_seeker.h"
++
++namespace crashpad {
++
++//! \brief An interface to read to files and other file-like objects with
++//!     semantics matching the underlying platform (POSIX or Windows).
++class FileReaderInterface : public virtual FileSeekerInterface {
++ public:
++  virtual ~FileReaderInterface() {}
++
++  //! \brief Wraps ReadFile(), or provides an implementation with identical
++  //!     semantics.
++  //!
++  //! \return The number of bytes actually read if the operation succeeded,
++  //!     which may be `0` or any positive value less than or equal to \a size.
++  //!     `-1` if the operation failed, with an error message logged.
++  virtual FileOperationResult Read(void* data, size_t size) = 0;
++
++  //! \brief Wraps Read(), ensuring that the read succeeded and exactly \a size
++  //!     bytes were read.
++  //!
++  //! Semantically, this behaves as LoggingReadFileExactly().
++  //!
++  //! \return `true` if the operation succeeded, `false` if it failed, with an
++  //!     error message logged. Short reads are treated as failures.
++  bool ReadExactly(void* data, size_t size);
++};
++
++//! \brief A file reader backed by a FileHandle.
++//!
++//! FileReader requires users to provide a FilePath to open, but this class
++//! accepts an already-open FileHandle instead. Like FileReader, this class may
++//! read from a filesystem-based file, but unlike FileReader, this class is not
++//! responsible for opening or closing the file. Users of this class must ensure
++//! that the file handle is closed appropriately elsewhere. Objects of this
++//! class may be used to read from file handles not associated with
++//! filesystem-based files, although special attention should be paid to the
++//! Seek() method, which may not function on file handles that do not refer to
++//! disk-based files.
++//!
++//! This class is expected to be used when other code is responsible for
++//! opening files and already provides file handles.
++class WeakFileHandleFileReader : public FileReaderInterface {
++ public:
++  explicit WeakFileHandleFileReader(FileHandle file_handle);
++  ~WeakFileHandleFileReader() override;
++
++  // FileReaderInterface:
++  FileOperationResult Read(void* data, size_t size) override;
++
++  // FileSeekerInterface:
++
++  //! \copydoc FileReaderInterface::Seek()
++  //!
++  //! \note This method is only guaranteed to function on file handles referring
++  //!     to disk-based files.
++  FileOffset Seek(FileOffset offset, int whence) override;
++
++ private:
++  void set_file_handle(FileHandle file_handle) { file_handle_ = file_handle; }
++
++  FileHandle file_handle_;  // weak
++
++  // FileReader uses this class as its internal implementation, and it needs to
++  // be able to call set_file_handle(). FileReader cannot initialize a
++  // WeakFileHandleFileReader with a correct file descriptor at the time of
++  // construction because no file descriptor will be available until
++  // FileReader::Open() is called.
++  friend class FileReader;
++};
++
++//! \brief A file reader implementation that wraps traditional system file
++//!     operations on files accessed through the filesystem.
++class FileReader : public FileReaderInterface {
++ public:
++  FileReader();
++  ~FileReader() override;
++
++  // FileReaderInterface:
++
++  //! \brief Wraps LoggingOpenFileForRead().
++  //!
++  //! \return `true` if the operation succeeded, `false` if it failed, with an
++  //!     error message logged.
++  //!
++  //! \note After a successful call, this method cannot be called again until
++  //!     after Close().
++  bool Open(const base::FilePath& path);
++
++  //! \brief Wraps CheckedCloseHandle().
++  //!
++  //! \note It is only valid to call this method on an object that has had a
++  //!     successful Open() that has not yet been matched by a subsequent call
++  //!     to this method.
++  void Close();
++
++  // FileReaderInterface:
++
++  //! \copydoc FileReaderInterface::Read()
++  //!
++  //! \note It is only valid to call this method between a successful Open() and
++  //!     a Close().
++  FileOperationResult Read(void* data, size_t size) override;
++
++  // FileSeekerInterface:
++
++  //! \copydoc FileReaderInterface::Seek()
++  //!
++  //! \note It is only valid to call this method between a successful Open() and
++  //!     a Close().
++  FileOffset Seek(FileOffset offset, int whence) override;
++
++ private:
++  ScopedFileHandle file_;
++  WeakFileHandleFileReader weak_file_handle_file_reader_;
++};
++
++}  // namespace crashpad
++
++#endif  // CRASH_REPORTER_CRASHPAD_FILE_READER_H_
+diff --git a/crash-reporter/crashpad/file_seeker.cc b/crash-reporter/crashpad/file_seeker.cc
+new file mode 100644
+index 0000000000..fb74ed5999
+--- /dev/null
++++ b/crash-reporter/crashpad/file_seeker.cc
+@@ -0,0 +1,37 @@
++// Copyright 2015 The Crashpad Authors. All rights reserved.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++#include "crash-reporter/crashpad/file_seeker.h"
++
++#include <base/logging.h>
++
++namespace crashpad {
++
++crashpad::FileOffset FileSeekerInterface::SeekGet() {
++  return Seek(0, SEEK_CUR);
++}
++
++bool FileSeekerInterface::SeekSet(crashpad::FileOffset offset) {
++  crashpad::FileOffset rv = Seek(offset, SEEK_SET);
++  if (rv < 0) {
++    // Seek() will have logged its own error.
++    return false;
++  } else if (rv != offset) {
++    LOG(ERROR) << "SeekSet(): expected " << offset << ", observed " << rv;
++    return false;
++  }
++  return true;
++}
++
++}  // namespace crashpad
+diff --git a/crash-reporter/crashpad/file_seeker.h b/crash-reporter/crashpad/file_seeker.h
+new file mode 100644
+index 0000000000..fe83b117bb
+--- /dev/null
++++ b/crash-reporter/crashpad/file_seeker.h
+@@ -0,0 +1,54 @@
++// Copyright 2015 The Crashpad Authors. All rights reserved.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++#ifndef CRASH_REPORTER_CRASHPAD_FILE_SEEKER_H_
++#define CRASH_REPORTER_CRASHPAD_FILE_SEEKER_H_
++
++#include "crash-reporter/crashpad/file_io.h"
++
++namespace crashpad {
++
++//! \brief An interface to seek in files and other file-like objects with
++//!     semantics matching the underlying platform (POSIX or Windows).
++class FileSeekerInterface {
++ public:
++  //! \brief Wraps LoggingSeekFile() or provides an alternate implementation
++  //!     with identical semantics.
++  //!
++  //! \return The return value of LoggingSeekFile(). `-1` on failure,
++  //!     with an error message logged.
++  virtual crashpad::FileOffset Seek(crashpad::FileOffset offset, int whence) = 0;
++
++  //! \brief Wraps Seek(), using `SEEK_CUR` to obtain the file’s current
++  //!     position.
++  //!
++  //! \return The file’s current position on success. `-1` on failure, with an
++  //!     error message logged.
++  crashpad::FileOffset SeekGet();
++
++  //! \brief Wraps Seek(), using `SEEK_SET`, ensuring that the seek succeeded
++  //!     and the file is positioned as desired.
++  //!
++  //! \return `true` if the operation succeeded, `false` if it failed, with an
++  //!     error message logged. A failure to reposition the file as desired is
++  //!     treated as a failure.
++  bool SeekSet(crashpad::FileOffset offset);
++
++ protected:
++  ~FileSeekerInterface() {}
++};
++
++}  // namespace crashpad
++
++#endif  // CRASH_REPORTER_CRASHPAD_FILE_SEEKER_H_
+diff --git a/crash-reporter/crashpad/http_body.cc b/crash-reporter/crashpad/http_body.cc
+new file mode 100644
+index 0000000000..278571fc2b
+--- /dev/null
++++ b/crash-reporter/crashpad/http_body.cc
+@@ -0,0 +1,102 @@
++// Copyright 2014 The Crashpad Authors. All rights reserved.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++#include "crash-reporter/crashpad/http_body.h"
++
++#include <string.h>
++
++#include <algorithm>
++#include <limits>
++
++#include "crash-reporter/crashpad/implicit_cast.h"
++
++namespace crashpad {
++
++StringHTTPBodyStream::StringHTTPBodyStream(const std::string& string)
++    : HTTPBodyStream(), string_(string), bytes_read_() {
++}
++
++StringHTTPBodyStream::~StringHTTPBodyStream() {
++}
++
++FileOperationResult StringHTTPBodyStream::GetBytesBuffer(uint8_t* buffer,
++                                                         size_t max_len) {
++  size_t num_bytes_remaining = string_.length() - bytes_read_;
++  if (num_bytes_remaining == 0) {
++    return num_bytes_remaining;
++  }
++
++  size_t num_bytes_returned = std::min(
++      std::min(num_bytes_remaining, max_len),
++      implicit_cast<size_t>(std::numeric_limits<FileOperationResult>::max()));
++  memcpy(buffer, &string_[bytes_read_], num_bytes_returned);
++  bytes_read_ += num_bytes_returned;
++  return num_bytes_returned;
++}
++
++FileReaderHTTPBodyStream::FileReaderHTTPBodyStream(FileReaderInterface* reader)
++    : HTTPBodyStream(), reader_(reader), reached_eof_(false) {
++  DCHECK(reader_);
++}
++
++FileReaderHTTPBodyStream::~FileReaderHTTPBodyStream() {}
++
++FileOperationResult FileReaderHTTPBodyStream::GetBytesBuffer(uint8_t* buffer,
++                                                             size_t max_len) {
++  if (reached_eof_) {
++    return 0;
++  }
++
++  FileOperationResult rv = reader_->Read(buffer, max_len);
++  if (rv == 0) {
++    reached_eof_ = true;
++  }
++  return rv;
++}
++
++CompositeHTTPBodyStream::CompositeHTTPBodyStream(
++    const CompositeHTTPBodyStream::PartsList& parts)
++    : HTTPBodyStream(), parts_(parts), current_part_(parts_.begin()) {
++}
++
++CompositeHTTPBodyStream::~CompositeHTTPBodyStream() {
++  for (auto& item : parts_)
++    delete item;
++}
++
++FileOperationResult CompositeHTTPBodyStream::GetBytesBuffer(uint8_t* buffer,
++                                                            size_t buffer_len) {
++  FileOperationResult max_len = std::min(
++      buffer_len,
++      implicit_cast<size_t>(std::numeric_limits<FileOperationResult>::max()));
++  FileOperationResult bytes_copied = 0;
++  while (bytes_copied < max_len && current_part_ != parts_.end()) {
++    FileOperationResult this_read =
++        (*current_part_)
++            ->GetBytesBuffer(buffer + bytes_copied, max_len - bytes_copied);
++
++    if (this_read == 0) {
++      // If the current part has returned 0 indicating EOF, advance the current
++      // part and try again.
++      ++current_part_;
++    } else if (this_read < 0) {
++      return this_read;
++    }
++    bytes_copied += this_read;
++  }
++
++  return bytes_copied;
++}
++
++}  // namespace crashpad
+diff --git a/crash-reporter/crashpad/http_body.h b/crash-reporter/crashpad/http_body.h
+new file mode 100644
+index 0000000000..a7430302b5
+--- /dev/null
++++ b/crash-reporter/crashpad/http_body.h
+@@ -0,0 +1,118 @@
++// Copyright 2014 The Crashpad Authors. All rights reserved.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++#ifndef CRASH_REPORTER_CRASHPAD_HTTP_BODY_H_
++#define CRASH_REPORTER_CRASHPAD_HTTP_BODY_H_
++
++#include <stdint.h>
++#include <sys/types.h>
++
++#include <string>
++#include <vector>
++
++#include <base/files/file_path.h>
++
++#include "crash-reporter/crashpad/file_io.h"
++#include "crash-reporter/crashpad/file_reader.h"
++
++namespace crashpad {
++
++//! \brief An interface to a stream that can be used for an HTTP request body.
++class HTTPBodyStream {
++ public:
++  virtual ~HTTPBodyStream() {}
++
++  //! \brief Copies up to \a max_len bytes into the user-supplied buffer.
++  //!
++  //! \param[out] buffer A user-supplied buffer into which this method will copy
++  //!      bytes from the stream.
++  //! \param[in] max_len The length (or size) of \a buffer. At most this many
++  //!     bytes will be copied.
++  //!
++  //! \return On success, a positive number indicating the number of bytes
++  //!     actually copied to \a buffer. On failure, a negative number. When
++  //!     the stream has no more data, returns `0`.
++  virtual FileOperationResult GetBytesBuffer(uint8_t* buffer,
++                                             size_t max_len) = 0;
++
++ protected:
++  HTTPBodyStream() {}
++};
++
++//! \brief An implementation of HTTPBodyStream that turns a fixed string into
++//!     a stream.
++class StringHTTPBodyStream : public HTTPBodyStream {
++ public:
++  //! \brief Creates a stream with the specified string.
++  //!
++  //! \param[in] string The string to turn into a stream.
++  explicit StringHTTPBodyStream(const std::string& string);
++
++  ~StringHTTPBodyStream() override;
++
++  // HTTPBodyStream:
++  FileOperationResult GetBytesBuffer(uint8_t* buffer, size_t max_len) override;
++
++ private:
++  std::string string_;
++  size_t bytes_read_;
++};
++
++//! \brief An implementation of HTTPBodyStream that reads from a
++//!     FileReaderInterface and provides its contents for an HTTP body.
++class FileReaderHTTPBodyStream : public HTTPBodyStream {
++ public:
++  //! \brief Creates a stream for reading from a FileReaderInterface.
++  //!
++  //! \param[in] reader A FileReaderInterface from which this HTTPBodyStream
++  //!     will read.
++  explicit FileReaderHTTPBodyStream(FileReaderInterface* reader);
++
++  ~FileReaderHTTPBodyStream() override;
++
++  // HTTPBodyStream:
++  FileOperationResult GetBytesBuffer(uint8_t* buffer, size_t max_len) override;
++
++ private:
++  FileReaderInterface* reader_;  // weak
++  bool reached_eof_;
++};
++
++//! \brief An implementation of HTTPBodyStream that combines an array of
++//!     several other HTTPBodyStream objects into a single, unified stream.
++class CompositeHTTPBodyStream : public HTTPBodyStream {
++ public:
++  using PartsList = std::vector<HTTPBodyStream*>;
++
++  //! \brief Creates a stream from an array of other stream parts.
++  //!
++  //! \param[in] parts A vector of HTTPBodyStream objects, of which this object
++  //!     takes ownership, that will be represented as a single unified stream.
++  //!     Callers should not mutate the stream objects after passing them to
++  //!     an instance of this class.
++  explicit CompositeHTTPBodyStream(const PartsList& parts);
++
++  ~CompositeHTTPBodyStream() override;
++
++  // HTTPBodyStream:
++  FileOperationResult GetBytesBuffer(uint8_t* buffer, size_t max_len) override;
++
++ private:
++  PartsList parts_;
++  PartsList::iterator current_part_;
++};
++
++}  // namespace crashpad
++
++#endif  // CRASH_REPORTER_CRASHPAD_HTTP_BODY_H_
+diff --git a/crash-reporter/crashpad/http_body_gzip.cc b/crash-reporter/crashpad/http_body_gzip.cc
+new file mode 100644
+index 0000000000..5d5a7b4c35
+--- /dev/null
++++ b/crash-reporter/crashpad/http_body_gzip.cc
+@@ -0,0 +1,128 @@
++// Copyright 2017 The Crashpad Authors. All rights reserved.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++#include "crash-reporter/crashpad/http_body_gzip.h"
++
++#include <utility>
++
++#include <base/check_op.h>
++#include <base/logging.h>
++#include <base/numerics/safe_conversions.h>
++#include <zlib.h>
++
++#include "crash-reporter/crashpad/zlib.h"
++
++namespace crashpad {
++
++GzipHTTPBodyStream::GzipHTTPBodyStream(std::unique_ptr<HTTPBodyStream> source)
++    : input_(),
++      source_(std::move(source)),
++      z_stream_(new z_stream()),
++      state_(State::kUninitialized) {}
++
++GzipHTTPBodyStream::~GzipHTTPBodyStream() {
++  DCHECK(state_ == State::kUninitialized ||
++         state_ == State::kFinished ||
++         state_ == State::kError);
++}
++
++FileOperationResult GzipHTTPBodyStream::GetBytesBuffer(uint8_t* buffer,
++                                                       size_t max_len) {
++  if (state_ == State::kError) {
++    return -1;
++  }
++
++  if (state_ == State::kFinished) {
++    return 0;
++  }
++
++  if (state_ == State::kUninitialized) {
++    z_stream_->zalloc = Z_NULL;
++    z_stream_->zfree = Z_NULL;
++    z_stream_->opaque = Z_NULL;
++
++    // The default values for zlib’s internal MAX_WBITS and DEF_MEM_LEVEL. These
++    // are the values that deflateInit() would use, but they’re not exported
++    // from zlib. deflateInit2() is used instead of deflateInit() to get the
++    // gzip wrapper.
++    constexpr int kZlibMaxWindowBits = 15;
++    constexpr int kZlibDefaultMemoryLevel = 8;
++
++    int zr = deflateInit2(z_stream_.get(),
++                          Z_DEFAULT_COMPRESSION,
++                          Z_DEFLATED,
++                          ZlibWindowBitsWithGzipWrapper(kZlibMaxWindowBits),
++                          kZlibDefaultMemoryLevel,
++                          Z_DEFAULT_STRATEGY);
++    if (zr != Z_OK) {
++      LOG(ERROR) << "deflateInit2: " << ZlibErrorString(zr);
++      state_ = State::kError;
++      return -1;
++    }
++
++    state_ = State::kOperating;
++  }
++
++  z_stream_->next_out = buffer;
++  z_stream_->avail_out = base::saturated_cast<uInt>(max_len);
++
++  while (state_ != State::kFinished && z_stream_->avail_out > 0) {
++    if (state_ != State::kInputEOF && z_stream_->avail_in == 0) {
++      FileOperationResult input_bytes =
++          source_->GetBytesBuffer(input_, sizeof(input_));
++      if (input_bytes == -1) {
++        Done(State::kError);
++        return -1;
++      }
++
++      if (input_bytes == 0) {
++        state_ = State::kInputEOF;
++      }
++
++      z_stream_->next_in = input_;
++      z_stream_->avail_in = base::checked_cast<uInt>(input_bytes);
++    }
++
++    int zr = deflate(z_stream_.get(),
++                     state_ == State::kInputEOF ? Z_FINISH : Z_NO_FLUSH);
++    if (state_ == State::kInputEOF && zr == Z_STREAM_END) {
++      Done(State::kFinished);
++      if (state_ == State::kError) {
++        return -1;
++      }
++    } else if (zr != Z_OK) {
++      LOG(ERROR) << "deflate: " << ZlibErrorString(zr);
++      Done(State::kError);
++      return -1;
++    }
++  }
++
++  DCHECK_LE(z_stream_->avail_out, max_len);
++  return max_len - z_stream_->avail_out;
++}
++
++void GzipHTTPBodyStream::Done(State state) {
++  DCHECK(state_ == State::kOperating || state_ == State::kInputEOF) << state_;
++  DCHECK(state == State::kFinished || state == State::kError) << state;
++
++  int zr = deflateEnd(z_stream_.get());
++  if (zr != Z_OK) {
++    LOG(ERROR) << "deflateEnd: " << ZlibErrorString(zr);
++    state_ = State::kError;
++  } else {
++    state_ = state;
++  }
++}
++
++}  // namespace crashpad
+diff --git a/crash-reporter/crashpad/http_body_gzip.h b/crash-reporter/crashpad/http_body_gzip.h
+new file mode 100644
+index 0000000000..eb5f4ac7b5
+--- /dev/null
++++ b/crash-reporter/crashpad/http_body_gzip.h
+@@ -0,0 +1,64 @@
++// Copyright 2017 The Crashpad Authors. All rights reserved.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++#ifndef CRASH_REPORTER_CRASHPAD_HTTP_BODY_GZIP_H_
++#define CRASH_REPORTER_CRASHPAD_HTTP_BODY_GZIP_H_
++
++#include <stdint.h>
++#include <sys/types.h>
++
++#include <memory>
++
++#include "crash-reporter/crashpad/file_io.h"
++#include "crash-reporter/crashpad/http_body.h"
++
++extern "C" {
++typedef struct z_stream_s z_stream;
++}  // extern "C"
++
++namespace crashpad {
++
++//! \brief An implementation of HTTPBodyStream that `gzip`-compresses another
++//!     HTTPBodyStream.
++class GzipHTTPBodyStream : public HTTPBodyStream {
++ public:
++  explicit GzipHTTPBodyStream(std::unique_ptr<HTTPBodyStream> source);
++
++  ~GzipHTTPBodyStream() override;
++
++  // HTTPBodyStream:
++  FileOperationResult GetBytesBuffer(uint8_t* buffer, size_t max_len) override;
++
++ private:
++  enum State : int {
++    kUninitialized,
++    kOperating,
++    kInputEOF,
++    kFinished,
++    kError,
++  };
++
++  // Calls deflateEnd() and transitions state_ to state. If deflateEnd() fails,
++  // logs a message and transitions state_ to State::kError.
++  void Done(State state);
++
++  uint8_t input_[4096];
++  std::unique_ptr<HTTPBodyStream> source_;
++  std::unique_ptr<z_stream> z_stream_;
++  State state_;
++};
++
++}  // namespace crashpad
++
++#endif  // CRASH_REPORTER_CRASHPAD_HTTP_BODY_GZIP_H_
+diff --git a/crash-reporter/crashpad/http_headers.h b/crash-reporter/crashpad/http_headers.h
+new file mode 100644
+index 0000000000..efa8462a1a
+--- /dev/null
++++ b/crash-reporter/crashpad/http_headers.h
+@@ -0,0 +1,39 @@
++// Copyright 2014 The Crashpad Authors. All rights reserved.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++#ifndef CRASH_REPORTER_CRASHPAD_HTTP_HEADERS_H_
++#define CRASH_REPORTER_CRASHPAD_HTTP_HEADERS_H_
++
++#include <map>
++#include <string>
++
++namespace crashpad {
++
++//! \brief A map of HTTP header fields to their values.
++using HTTPHeaders = std::map<std::string, std::string>;
++
++//! \brief The header name `"Content-Type"`.
++constexpr char kContentType[] = "Content-Type";
++
++//! \brief The header name `"Content-Length"`.
++constexpr char kContentLength[] = "Content-Length";
++
++//! \brief The header name `"Content-Encoding"`.
++constexpr char kContentEncoding[] = "Content-Encoding";
++
++//! \brief The header name `"Host"`.
++constexpr char kHost[] = "Host";
++}  // namespace crashpad
++
++#endif  // CRASH_REPORTER_CRASHPAD_HTTP_HEADERS_H_
+diff --git a/crash-reporter/crashpad/http_nelo_builder.cc b/crash-reporter/crashpad/http_nelo_builder.cc
+new file mode 100644
+index 0000000000..0847543432
+--- /dev/null
++++ b/crash-reporter/crashpad/http_nelo_builder.cc
+@@ -0,0 +1,168 @@
++// Copyright 2021 NAVER Corp. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "crash-reporter/crashpad/http_nelo_builder.h"
++
++#include <base/base64.h>
++#include <base/files/file_util.h>
++#include <base/json/json_writer.h>
++#include <base/logging.h>
++#include <base/strings/string_util.h>
++#include <base/system/sys_info.h>
++#include <base/time/time.h>
++#include <base/values.h>
++
++#include "crash-reporter/crashpad/http_body.h"
++#include "crash-reporter/crashpad/http_body_gzip.h"
++
++// Nelo accepts only a few fixed platform keywords for uploading crash dumps.
++// https://example.com
++#if defined(OS_APPLE)
++// On MacOS, We use a special platform name for uploading a dump file so that
++// nelo server can treat it as a windows symbols. See
++// https://example.com for details.
++#define PLATFORM_NAME "windows osx"
++#elif defined(OS_WIN)
++#define PLATFORM_NAME "windows"
++#elif defined(OS_LINUX) || defined(OS_CHROMEOS)
++#define PLATFORM_NAME "linux"
++#elif
++#define PLATFORM_NAME "unknown"
++#endif
++
++namespace crashpad {
++
++namespace {
++std::string ToString(HTTPNeloBuilder::FileFormat file_format) {
++  std::string str;
++  switch (file_format) {
++    case HTTPNeloBuilder::FileFormat::Text:
++      str = "txt";
++      break;
++    case HTTPNeloBuilder::FileFormat::Bin:
++      str = "bin";
++      break;
++  }
++  return str;
++}
++}  // namespace
++
++HTTPNeloBuilder::HTTPNeloBuilder(const std::string& nelo_project_name,
++                                 const std::string& product_version)
++    : nelo_project_name_(nelo_project_name),
++      product_version_(product_version) {}
++
++HTTPNeloBuilder::~HTTPNeloBuilder() {}
++
++void HTTPNeloBuilder::SetField(const std::string& key,
++                               const std::string& value) {
++  fields_.Set(key, base::Value(value));
++}
++
++void HTTPNeloBuilder::SetAnnotation(const std::string& key,
++                                    const std::string& value) {
++  annotations_.Set(key, base::Value(value));
++}
++
++void HTTPNeloBuilder::SetExceptionType(ExceptionType type) {
++  exception_type_ = type;
++}
++
++void HTTPNeloBuilder::SetFileInfo(const base::FilePath& file_path,
++                                  FileFormat file_format,
++                                  bool is_crash_dump) {
++  file_path_ = file_path;
++  file_format_ = file_format;
++  is_crash_dump_ = is_crash_dump;
++}
++
++std::unique_ptr<HTTPBodyStream> HTTPNeloBuilder::GetBodyStream() {
++  // The objects inserted into this vector will be owned by the returned
++  // CompositeHTTPBodyStream. Take care to not early-return without deleting
++  // this memory.
++  std::vector<HTTPBodyStream*> streams;
++  base::DictValue dict;
++
++  // Mandatory fields.
++  dict.Set("Platform", base::Value(PLATFORM_NAME));
++  dict.Set("DmpData", base::Value(ReadFile()));
++  dict.Set("DmpFormat", base::Value(ToString(file_format_)));
++  dict.Set("DmpSymbol",
++              base::Value(is_crash_dump_ ? "Required" : "NotRequired"));
++  dict.Set("projectName", base::Value(nelo_project_name_));
++  dict.Set("projectVersion", base::Value(product_version_));
++
++  // Optional fields.
++  dict.Set("PlatformDetail", base::Value(base::JoinString(
++                                    {base::SysInfo::OperatingSystemName(),
++                                     base::SysInfo::OperatingSystemVersion()},
++                                    " ")));
++  dict.Set("logLevel", base::Value("FATAL"));
++  dict.Set("FileName", base::Value(file_path_.value()));
++
++  if (exception_type_ == ExceptionType::KernelCrash) {
++    dict.Set("ExceptionType", base::Value("KernelCrash"));
++  } else if (exception_type_ == ExceptionType::UpdateFailure) {
++    dict.Set("ExceptionType", base::Value("UpdateFailure"));
++  } else if (exception_type_ == ExceptionType::FirmwareError) {
++    dict.Set("ExceptionType", base::Value("FirmwareError"));
++  } else if (exception_type_ == ExceptionType::GpuError) {
++    dict.Set("ExceptionType", base::Value("GpuError"));
++  }
++
++  if (!annotations_.empty()) {
++    dict.Set("CustomMessage", base::Value(GetAnnotationsInJson()));
++  }
++  // Promote important fields from an annotation to a nelo field so that it can
++  // be indexed on nelo page.
++  if (auto* value = annotations_.FindString("ptype"))
++    dict.Set("ptype", base::Value(*value));
++  if (auto* value = annotations_.FindString("channel"))
++    dict.Set("channel", base::Value(*value));
++
++  // Merge |fields_| dictionary into |dict|.
++  for (const auto& field : fields_) {
++    // There should be no key conflicts.
++    DCHECK(dict.Find(field.first) == nullptr);
++    dict.Set(field.first, base::Value(field.second.Clone()));
++  }
++
++  std::string json;
++  bool result = base::JSONWriter::Write(dict, &json);
++  DCHECK(result);
++  streams.push_back(new StringHTTPBodyStream(json));
++
++  auto composite =
++      std::unique_ptr<HTTPBodyStream>(new CompositeHTTPBodyStream(streams));
++  return std::unique_ptr<HTTPBodyStream>(
++      new GzipHTTPBodyStream(std::move(composite)));
++}
++
++std::string HTTPNeloBuilder::GetAnnotationsInJson() const {
++  std::string json;
++  bool result = base::JSONWriter::Write(annotations_, &json);
++  DCHECK(result);
++  return json;
++}
++
++std::string HTTPNeloBuilder::ReadFile() const {
++  std::string contents;
++  // File max size is 32MB from nelo sdk.
++  // https://example.com
++  if (!base::ReadFileToStringWithMaxSize(file_path_, &contents, 32 << 20)) {
++    LOG(ERROR) << "File exceeds max size";
++    return std::string();
++  }
++  if (file_format_ == FileFormat::Text) {
++    return contents;
++  }
++  DCHECK(file_format_ == FileFormat::Bin);
++  std::string encoded = base::Base64Encode(contents);
++  return encoded;
++}
++
++void HTTPNeloBuilder::PopulateContentHeaders(HTTPHeaders* http_headers) const {
++  (*http_headers)[kContentEncoding] = "gzip";
++}
++}  // namespace util
+diff --git a/crash-reporter/crashpad/http_nelo_builder.h b/crash-reporter/crashpad/http_nelo_builder.h
+new file mode 100644
+index 0000000000..86489243e8
+--- /dev/null
++++ b/crash-reporter/crashpad/http_nelo_builder.h
+@@ -0,0 +1,88 @@
++// Copyright 2021 NAVER Corp. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CRASH_REPORTER_CRASHPAD_HTTP_NELO_BUILDER_H_
++#define CRASH_REPORTER_CRASHPAD_HTTP_NELO_BUILDER_H_
++
++#include <base/files/file_path.h>
++#include <base/values.h>
++#include <memory>
++#include <string>
++
++#include "crash-reporter/crashpad/http_body.h"
++#include "crash-reporter/crashpad/http_headers.h"
++
++// Copied from whale browser
++// src/whale/third_party/crashpad/crashpad/util/net/http_nelo_builder.h
++
++namespace crashpad {
++
++class HTTPBodyStream;
++
++//! \brief This class is used to build a JSON message for use as a HTTP request
++//! body for NELO server.
++class HTTPNeloBuilder {
++ public:
++  // A format of file. Text or binary.
++  enum class FileFormat {
++    Text,
++    Bin,
++  };
++
++  enum class ExceptionType {
++    None,
++    KernelCrash,
++    UpdateFailure,
++    FirmwareError,
++    GpuError,
++  };
++
++  HTTPNeloBuilder(const std::string& nelo_project_name,
++                  const std::string& product_version);
++  ~HTTPNeloBuilder();
++
++  //! \brief Sets a nelo field, which will be shown on nelo web page as an
++  //! individual field.
++  void SetField(const std::string& key, const std::string& value);
++
++  //! \brief Sets a nelo annotation, which will be shown in "CustomMessage"
++  //! field on nelo web page.
++  void SetAnnotation(const std::string& key, const std::string& value);
++
++  void SetExceptionType(ExceptionType type);
++
++  // Sets an information about the file to upload.
++  void SetFileInfo(const base::FilePath& file_path,
++                   FileFormat file_format,
++                   bool is_crash_dump);
++
++  //! \brief Generates the HTTPBodyStream for the data currently supplied to
++  //!     the builder.
++  //!
++  //! \return A caller-owned HTTPBodyStream object.
++  std::unique_ptr<HTTPBodyStream> GetBodyStream();
++
++  //! \brief Adds the appropriate content headers to \a http_headers.
++  //!
++  //! Any headers that this method adds will replace existing headers by the
++  //! same name in \a http_headers.
++  void PopulateContentHeaders(HTTPHeaders* http_headers) const;
++
++ private:
++  std::string GetAnnotationsInJson() const;
++  std::string ReadFile() const;
++
++  const std::string nelo_project_name_;
++  const std::string product_version_;
++  base::DictValue fields_;
++  base::DictValue annotations_;
++  base::FilePath file_path_;
++  FileFormat file_format_ = FileFormat::Bin;
++  bool is_crash_dump_ = true;
++  ExceptionType exception_type_ = ExceptionType::None;
++};
++
++}  // namespace util
++
++#endif  // CRASH_REPORTER_CRASHPAD_HTTP_NELO_BUILDER_H_
+diff --git a/crash-reporter/crashpad/http_transport.cc b/crash-reporter/crashpad/http_transport.cc
+new file mode 100644
+index 0000000000..e049b657e7
+--- /dev/null
++++ b/crash-reporter/crashpad/http_transport.cc
+@@ -0,0 +1,59 @@
++// Copyright 2014 The Crashpad Authors. All rights reserved.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++#include "crash-reporter/crashpad/http_transport.h"
++
++#include <utility>
++
++#include "crash-reporter/crashpad/http_body.h"
++
++namespace crashpad {
++
++HTTPTransport::HTTPTransport()
++    : url_(),
++      method_("POST"),
++      headers_(),
++      body_stream_(),
++      timeout_(15.0) {
++}
++
++HTTPTransport::~HTTPTransport() {
++}
++
++void HTTPTransport::SetURL(const std::string& url) {
++  url_ = url;
++}
++
++void HTTPTransport::SetMethod(const std::string& method) {
++  method_ = method;
++}
++
++void HTTPTransport::SetHeader(const std::string& header,
++                              const std::string& value) {
++  headers_[header] = value;
++}
++
++void HTTPTransport::SetBodyStream(std::unique_ptr<HTTPBodyStream> stream) {
++  body_stream_ = std::move(stream);
++}
++
++void HTTPTransport::SetTimeout(double timeout) {
++  timeout_ = timeout;
++}
++
++void HTTPTransport::SetRootCACertificatePath(const base::FilePath& cert) {
++  root_ca_certificate_path_ = cert;
++}
++
++}  // namespace crashpad
+diff --git a/crash-reporter/crashpad/http_transport.h b/crash-reporter/crashpad/http_transport.h
+new file mode 100644
+index 0000000000..3057bd082b
+--- /dev/null
++++ b/crash-reporter/crashpad/http_transport.h
+@@ -0,0 +1,119 @@
++// Copyright 2014 The Crashpad Authors. All rights reserved.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++#ifndef CRASH_REPORTER_CRASHPAD_HTTP_TRANSPORT_H_
++#define CRASH_REPORTER_CRASHPAD_HTTP_TRANSPORT_H_
++
++#include <memory>
++#include <string>
++
++#include <base/files/file_path.h>
++
++#include "crash-reporter/crashpad/http_headers.h"
++
++namespace crashpad {
++
++class HTTPBodyStream;
++
++//! \brief HTTPTransport executes a HTTP request using the specified URL, HTTP
++//!     method, headers, and body. This class can only issue a synchronous
++//!     HTTP request.
++//!
++//! This class cannot be instantiated directly. A concrete subclass must be
++//! instantiated instead, which provides an implementation to execute the
++//! request that is appropriate for the host operating system.
++class HTTPTransport {
++ public:
++  virtual ~HTTPTransport();
++
++  //! \brief Instantiates a concrete HTTPTransport class for the current
++  //!     operating system.
++  //!
++  //! \return A new caller-owned HTTPTransport object.
++  static std::unique_ptr<HTTPTransport> Create();
++
++  //! \brief Sets URL to which the request will be made.
++  //!
++  //! \param[in] url The request URL.
++  void SetURL(const std::string& url);
++
++  //! \brief Sets the HTTP method to execute. E.g., GET, POST, etc. The default
++  //!     method is `"POST"`.
++  //!
++  //! \param[in] http_method The HTTP method.
++  void SetMethod(const std::string& http_method);
++
++  //! \brief Sets a HTTP header-value pair.
++  //!
++  //! \param[in] header The HTTP header name. Any previous value set at this
++  //!     name will be overwritten.
++  //! \param[in] value The value to set for the header.
++  void SetHeader(const std::string& header, const std::string& value);
++
++  //! \brief Sets the stream object from which to generate the HTTP body.
++  //!
++  //! \param[in] stream A HTTPBodyStream, of which this class will take
++  //!     ownership.
++  void SetBodyStream(std::unique_ptr<HTTPBodyStream> stream);
++
++  //! \brief Sets the timeout for the HTTP request. The default is 15 seconds.
++  //!
++  //! \param[in] timeout The request timeout, in seconds.
++  void SetTimeout(double timeout);
++
++  //! \brief Sets a certificate file to be used in lieu of the system CA cert
++  //!     bundle.
++  //!
++  //! This is exposed primarily for testing with a self-signed certificate, and
++  //! it isn't necessary to set it in normal use.
++  //!
++  //! \param[in] cert The filename of a file in PEM format containing the CA
++  //!     cert to be used for TLS connections.
++  void SetRootCACertificatePath(const base::FilePath& cert);
++
++  //! \brief Performs the HTTP request with the configured parameters and waits
++  //!     for the execution to complete.
++  //!
++  //! \param[out] response_body On success, this will be set to the HTTP
++  //!     response body. This parameter is optional and may be set to `nullptr`
++  //!     if the response body is not required.
++  //!
++  //! \return Whether or not the request was successful, defined as returning
++  //!     a HTTP status code in the range 200-203 (inclusive).
++  virtual bool ExecuteSynchronously(std::string* response_body) = 0;
++
++ protected:
++  HTTPTransport();
++
++  const std::string& url() const { return url_; }
++  const std::string& method() const { return method_; }
++  const HTTPHeaders& headers() const { return headers_; }
++  HTTPBodyStream* body_stream() const { return body_stream_.get(); }
++  double timeout() const { return timeout_; }
++  const base::FilePath& root_ca_certificate_path() const {
++    return root_ca_certificate_path_;
++  }
++
++ private:
++  std::string url_;
++  std::string method_;
++  base::FilePath root_ca_certificate_path_;
++  HTTPHeaders headers_;
++  std::unique_ptr<HTTPBodyStream> body_stream_;
++  double timeout_;
++};
++
++}  // namespace crashpad
++
++#endif  // CRASH_REPORTER_CRASHPAD_HTTP_TRANSPORT_H_
+diff --git a/crash-reporter/crashpad/http_transport_socket.cc b/crash-reporter/crashpad/http_transport_socket.cc
+new file mode 100644
+index 0000000000..e785cedc40
+--- /dev/null
++++ b/crash-reporter/crashpad/http_transport_socket.cc
+@@ -0,0 +1,579 @@
++// Copyright 2018 The Crashpad Authors. All rights reserved.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++#include "crash-reporter/crashpad/http_transport.h"
++
++#include <fcntl.h>
++#include <netdb.h>
++#include <poll.h>
++#include <string.h>
++#include <sys/socket.h>
++
++#include <base/check_op.h>
++#include <base/logging.h>
++#include <base/numerics/safe_conversions.h>
++#include <base/posix/eintr_wrapper.h>
++#include <base/scoped_generic.h>
++#include <base/stl_util.h>
++#include <base/strings/string_number_conversions.h>
++#include <base/strings/stringprintf.h>
++
++#include "crash-reporter/crashpad/file_io.h"
++#include "crash-reporter/crashpad/http_body.h"
++#include "crash-reporter/crashpad/split_string.h"
++#include "crash-reporter/crashpad/string_number_conversion.h"
++#include "crash-reporter/crashpad/url.h"
++
++#include <openssl/ssl.h>
++
++namespace crashpad {
++
++namespace {
++
++constexpr const char kCRLFTerminator[] = "\r\n";
++
++class HTTPTransportSocket final : public HTTPTransport {
++ public:
++  HTTPTransportSocket() = default;
++  ~HTTPTransportSocket() override = default;
++
++  bool ExecuteSynchronously(std::string* response_body) override;
++};
++
++struct ScopedAddrinfoTraits {
++  static addrinfo* InvalidValue() { return nullptr; }
++  static void Free(addrinfo* ai) { freeaddrinfo(ai); }
++};
++using ScopedAddrinfo = base::ScopedGeneric<addrinfo*, ScopedAddrinfoTraits>;
++
++class Stream {
++ public:
++  virtual ~Stream() = default;
++
++  virtual bool LoggingWrite(const void* data, size_t size) = 0;
++  virtual bool LoggingRead(void* data, size_t size) = 0;
++  virtual bool LoggingReadToEOF(std::string* contents) = 0;
++};
++
++class FdStream : public Stream {
++ public:
++  explicit FdStream(int fd) : fd_(fd) { CHECK(fd_ >= 0); }
++
++  bool LoggingWrite(const void* data, size_t size) override {
++    return LoggingWriteFile(fd_, data, size);
++  }
++
++  bool LoggingRead(void* data, size_t size) override {
++    return LoggingReadFileExactly(fd_, data, size);
++  }
++
++  bool LoggingReadToEOF(std::string* result) override {
++    return crashpad::LoggingReadToEOF(fd_, result);
++  }
++
++ private:
++  int fd_;
++};
++
++class SSLStream : public Stream {
++ public:
++  SSLStream() = default;
++
++  bool Initialize(const base::FilePath& root_cert_path,
++                  int sock,
++                  const std::string& hostname) {
++    SSL_library_init();
++
++    ctx_.reset(SSL_CTX_new(TLS_method()));
++    if (!ctx_.is_valid()) {
++      LOG(ERROR) << "SSL_CTX_new";
++      return false;
++    }
++
++    if (SSL_CTX_set_min_proto_version(ctx_.get(), TLS1_2_VERSION) <= 0) {
++      LOG(ERROR) << "SSL_CTX_set_min_proto_version";
++      return false;
++    }
++
++    SSL_CTX_set_verify(ctx_.get(), SSL_VERIFY_PEER, nullptr);
++    SSL_CTX_set_verify_depth(ctx_.get(), 5);
++
++    if (!root_cert_path.empty()) {
++      if (SSL_CTX_load_verify_locations(
++              ctx_.get(), root_cert_path.value().c_str(), nullptr) <= 0) {
++        LOG(ERROR) << "SSL_CTX_load_verify_locations";
++        return false;
++      }
++    } else {
++#if defined(OS_LINUX) || defined(OS_CHROMEOS)
++      if (SSL_CTX_load_verify_locations(
++              ctx_.get(), nullptr, "/etc/ssl/certs") <= 0) {
++        LOG(ERROR) << "SSL_CTX_load_verify_locations";
++        return false;
++      }
++#elif defined(OS_FUCHSIA)
++      if (SSL_CTX_load_verify_locations(
++              ctx_.get(), "/config/ssl/cert.pem", nullptr) <= 0) {
++        LOG(ERROR) << "SSL_CTX_load_verify_locations";
++        return false;
++      }
++#else
++#error cert store location
++#endif
++    }
++
++    ssl_.reset(SSL_new(ctx_.get()));
++    if (!ssl_.is_valid()) {
++      LOG(ERROR) << "SSL_new";
++      return false;
++    }
++
++    BIO* bio = BIO_new_socket(sock, BIO_NOCLOSE);
++    if (!bio) {
++      LOG(ERROR) << "BIO_new_socket";
++      return false;
++    }
++
++    // SSL_set_bio() takes ownership of |bio|.
++    SSL_set_bio(ssl_.get(), bio, bio);
++
++    if (SSL_set_tlsext_host_name(ssl_.get(), hostname.c_str()) == 0) {
++      LOG(ERROR) << "SSL_set_tlsext_host_name";
++      return false;
++    }
++
++    if (SSL_connect(ssl_.get()) <= 0) {
++      LOG(ERROR) << "SSL_connect";
++      return false;
++    }
++
++    return true;
++  }
++
++  bool LoggingWrite(const void* data, size_t size) override {
++    return SSL_write(ssl_.get(), data, size) != 0;
++  }
++
++  bool LoggingRead(void* data, size_t size) override {
++    return SSL_read(ssl_.get(), data, size) != 0;
++  }
++
++  bool LoggingReadToEOF(std::string* contents) override {
++    contents->clear();
++    char buffer[4096];
++    FileOperationResult rv;
++    while ((rv = SSL_read(ssl_.get(), buffer, sizeof(buffer))) > 0) {
++      DCHECK_LE(static_cast<size_t>(rv), sizeof(buffer));
++      contents->append(buffer, rv);
++    }
++    if (rv < 0) {
++      LOG(ERROR) << "SSL_read";
++      contents->clear();
++      return false;
++    }
++    return true;
++  }
++
++ private:
++  struct ScopedSSLCTXTraits {
++    static SSL_CTX* InvalidValue() { return nullptr; }
++    static void Free(SSL_CTX* ctx) { SSL_CTX_free(ctx); }
++  };
++  using ScopedSSLCTX = base::ScopedGeneric<SSL_CTX*, ScopedSSLCTXTraits>;
++
++  struct ScopedSSLTraits {
++    static SSL* InvalidValue() { return nullptr; }
++    static void Free(SSL* ssl) {
++      SSL_shutdown(ssl);
++      SSL_free(ssl);
++    }
++  };
++  using ScopedSSL = base::ScopedGeneric<SSL*, ScopedSSLTraits>;
++
++  ScopedSSLCTX ctx_;
++  ScopedSSL ssl_;
++};
++
++bool WaitUntilSocketIsReady(int sock) {
++  pollfd pollfds;
++  pollfds.fd = sock;
++  pollfds.events = POLLIN | POLLPRI | POLLOUT;
++  constexpr int kTimeoutMS = 1000;
++  int ret = HANDLE_EINTR(poll(&pollfds, 1, kTimeoutMS));
++  if (ret < 0) {
++    PLOG(ERROR) << "poll";
++    return false;
++  } else if (ret == 1) {
++    if (pollfds.revents & POLLERR) {
++      int err;
++      socklen_t err_len = sizeof(err);
++      if (getsockopt(sock, SOL_SOCKET, SO_ERROR, &err, &err_len) != 0) {
++        PLOG(ERROR) << "getsockopt";
++      } else {
++        errno = err;
++        PLOG(ERROR) << "POLLERR";
++      }
++      return false;
++    }
++    if (pollfds.revents & POLLHUP) {
++      return false;
++    }
++    return (pollfds.revents & POLLIN) != 0 || (pollfds.revents & POLLOUT) != 0;
++  }
++
++  // Timeout.
++  return false;
++}
++
++class ScopedSetNonblocking {
++ public:
++  explicit ScopedSetNonblocking(int sock) : sock_(sock) {
++    int flags = fcntl(sock, F_GETFL, 0);
++    if (flags < 0) {
++      PLOG(ERROR) << "fcntl";
++      sock_ = -1;
++      return;
++    }
++
++    if (fcntl(sock_, F_SETFL, flags | O_NONBLOCK) < 0) {
++      PLOG(ERROR) << "fcntl";
++      sock_ = -1;
++    }
++  }
++
++  ~ScopedSetNonblocking() {
++    if (sock_ >= 0) {
++      int flags = fcntl(sock_, F_GETFL, 0);
++      if (flags < 0) {
++        PLOG(ERROR) << "fcntl";
++        return;
++      }
++
++      if (fcntl(sock_, F_SETFL, flags & (~O_NONBLOCK)) < 0) {
++        PLOG(ERROR) << "fcntl";
++      }
++    }
++  }
++
++ private:
++  int sock_;
++};
++
++base::ScopedFD CreateSocket(const std::string& hostname,
++                            const std::string& port) {
++  addrinfo hints = {};
++  hints.ai_family = AF_UNSPEC;
++  hints.ai_socktype = SOCK_STREAM;
++  hints.ai_protocol = 0;
++  hints.ai_flags = 0;
++
++  addrinfo* addrinfo_raw;
++  if (getaddrinfo(hostname.c_str(), port.c_str(), &hints, &addrinfo_raw) < 0) {
++    PLOG(ERROR) << "getaddrinfo";
++    return base::ScopedFD();
++  }
++  ScopedAddrinfo addrinfo(addrinfo_raw);
++
++  for (const auto* ap = addrinfo.get(); ap; ap = ap->ai_next) {
++    base::ScopedFD result(
++        socket(ap->ai_family, ap->ai_socktype, ap->ai_protocol));
++    if (!result.is_valid()) {
++      continue;
++    }
++
++    {
++      // Set socket to non-blocking to avoid hanging for a long time if the
++      // network is down.
++      ScopedSetNonblocking nonblocking(result.get());
++
++      if (HANDLE_EINTR(connect(result.get(), ap->ai_addr, ap->ai_addrlen)) <
++          0) {
++        if (errno != EINPROGRESS) {
++          PLOG(ERROR) << "connect";
++        } else if (WaitUntilSocketIsReady(result.get())) {
++          return result;
++        }
++        return base::ScopedFD();
++      }
++
++      return result;
++    }
++  }
++
++  return base::ScopedFD();
++}
++
++bool WriteRequest(Stream* stream,
++                  const std::string& method,
++                  const std::string& resource,
++                  const HTTPHeaders& headers,
++                  HTTPBodyStream* body_stream) {
++  std::string request_line = base::StringPrintf(
++      // Better to set to 1.1 as Nelo's standard.
++      "%s %s HTTP/1.1\r\n", method.c_str(), resource.c_str());
++  if (!stream->LoggingWrite(request_line.data(), request_line.size()))
++    return false;
++
++  // Write headers, and determine if Content-Length has been specified.
++  bool chunked = true;
++  size_t content_length = 0;
++  for (const auto& header : headers) {
++    std::string header_str = base::StringPrintf(
++        "%s: %s\r\n", header.first.c_str(), header.second.c_str());
++    if (header.first == kContentLength) {
++      chunked = !base::StringToSizeT(header.second, &content_length);
++      DCHECK(!chunked);
++    }
++
++    if (!stream->LoggingWrite(header_str.data(), header_str.size()))
++      return false;
++  }
++
++  // If no Content-Length, then encode as chunked, so add that header too.
++  if (chunked) {
++    static constexpr const char kTransferEncodingChunked[] =
++        "Transfer-Encoding: chunked\r\n";
++    if (!stream->LoggingWrite(kTransferEncodingChunked,
++                              strlen(kTransferEncodingChunked))) {
++      return false;
++    }
++  }
++
++  if (!stream->LoggingWrite(kCRLFTerminator, strlen(kCRLFTerminator))) {
++    return false;
++  }
++
++  FileOperationResult data_bytes;
++  do {
++    constexpr size_t kCRLFSize = std::size(kCRLFTerminator) - 1;
++    struct __attribute__((packed)) {
++      char size[8];
++      char crlf[2];
++      uint8_t data[32 * 1024 + kCRLFSize];
++    } buf;
++    static_assert(
++        sizeof(buf) == sizeof(buf.size) + sizeof(buf.crlf) + sizeof(buf.data),
++        "buf should not have padding");
++
++    // Read a block of data.
++    data_bytes =
++        body_stream->GetBytesBuffer(buf.data, sizeof(buf.data) - kCRLFSize);
++    if (data_bytes == -1) {
++      return false;
++    }
++    DCHECK_GE(data_bytes, 0);
++    DCHECK_LE(static_cast<size_t>(data_bytes), sizeof(buf.data) - kCRLFSize);
++
++    void* write_start;
++    size_t write_size;
++
++    if (chunked) {
++      // Chunked encoding uses the entirety of buf. buf.size is presented in
++      // hexadecimal without any leading "0x". The terminating CR and LF will be
++      // placed immediately following the used portion of buf.data, even if
++      // buf.data is not full.
++
++      char tmp[9];
++      int rv = snprintf(tmp,
++                        sizeof(tmp),
++                        "%08x",
++                        base::checked_cast<unsigned int>(data_bytes));
++      DCHECK_EQ(static_cast<size_t>(rv), sizeof(buf.size));
++      strncpy(buf.size, tmp, sizeof(buf.size));
++      DCHECK_NE(buf.size[sizeof(buf.size) - 1], '\0');
++
++      memcpy(&buf.crlf[0], kCRLFTerminator, kCRLFSize);
++      memcpy(&buf.data[data_bytes], kCRLFTerminator, kCRLFSize);
++
++      // Skip leading zeroes in the chunk size.
++      size_t size_len;
++      for (size_len = sizeof(buf.size); size_len > 1; --size_len) {
++        if (buf.size[sizeof(buf.size) - size_len] != '0') {
++          break;
++        }
++      }
++
++      write_start = buf.crlf - size_len;
++      write_size = size_len + sizeof(buf.crlf) + data_bytes + kCRLFSize;
++    } else {
++      // When not using chunked encoding, only use buf.data.
++      write_start = buf.data;
++      write_size = data_bytes;
++    }
++
++    // write_size will be 0 at EOF in non-chunked mode. Skip the write in that
++    // case. In contrast, at EOF in chunked mode, a zero-length chunk must be
++    // sent to signal EOF. This will happen when processing the EOF indicated by
++    // a 0 return from body_stream()->GetBytesBuffer() above.
++    if (write_size != 0) {
++      if (!stream->LoggingWrite(write_start, write_size))
++        return false;
++    }
++  } while (data_bytes > 0);
++
++  return true;
++}
++
++bool ReadLine(Stream* stream, std::string* line) {
++  line->clear();
++  for (;;) {
++    char byte;
++    if (!stream->LoggingRead(&byte, 1)) {
++      return false;
++    }
++
++    line->append(&byte, 1);
++    if (byte == '\n')
++      return true;
++  }
++}
++
++bool StartsWith(const std::string& str, const char* with, size_t len) {
++  return str.compare(0, len, with) == 0;
++}
++
++bool ReadResponseLine(Stream* stream) {
++  std::string response_line;
++  if (!ReadLine(stream, &response_line)) {
++    LOG(ERROR) << "ReadLine";
++    return false;
++  }
++  static constexpr const char kHttp10[] = "HTTP/1.0 ";
++  static constexpr const char kHttp11[] = "HTTP/1.1 ";
++  if (!(StartsWith(response_line, kHttp10, strlen(kHttp10)) ||
++        StartsWith(response_line, kHttp11, strlen(kHttp11))) ||
++      response_line.size() < strlen(kHttp10) + 3 ||
++      response_line.at(strlen(kHttp10) + 3) != ' ') {
++    return false;
++  }
++  unsigned int http_status = 0;
++  return base::StringToUint(response_line.substr(strlen(kHttp10), 3),
++                            &http_status) &&
++         http_status >= 200 && http_status <= 203;
++}
++
++bool ReadResponseHeaders(Stream* stream, HTTPHeaders* headers) {
++  for (;;) {
++    std::string line;
++    if (!ReadLine(stream, &line)) {
++      return false;
++    }
++
++    if (line == kCRLFTerminator) {
++      return true;
++    }
++
++    std::string left, right;
++    if (!SplitStringFirst(line, ':', &left, &right)) {
++      LOG(ERROR) << "SplitStringFirst";
++      return false;
++    }
++    DCHECK_EQ(right[right.size() - 1], '\n');
++    DCHECK_EQ(right[right.size() - 2], '\r');
++    DCHECK_EQ(right[0], ' ');
++    DCHECK_NE(right[1], ' ');
++    right = right.substr(1, right.size() - 3);
++    (*headers)[left] = right;
++  }
++}
++
++bool ReadContentChunked(Stream* stream, std::string* body) {
++  // TODO(scottmg): https://crashpad.chromium.org/bug/196.
++  LOG(ERROR) << "TODO(scottmg): chunked response read";
++  return false;
++}
++
++bool ReadResponse(Stream* stream, std::string* response_body) {
++  response_body->clear();
++
++  if (!ReadResponseLine(stream)) {
++    return false;
++  }
++
++  HTTPHeaders response_headers;
++  if (!ReadResponseHeaders(stream, &response_headers)) {
++    return false;
++  }
++
++  auto it = response_headers.find("Content-Length");
++  size_t len = 0;
++  if (it != response_headers.end()) {
++    if (!base::StringToSizeT(it->second, &len)) {
++      LOG(ERROR) << "invalid Content-Length";
++      return false;
++    }
++  }
++
++  if (len) {
++    response_body->resize(len, 0);
++    return stream->LoggingRead(&(*response_body)[0], len);
++  }
++
++  it = response_headers.find("Transfer-Encoding");
++  bool chunked = false;
++  if (it != response_headers.end() && it->second == "chunked") {
++    chunked = true;
++  }
++
++  return chunked ? ReadContentChunked(stream, response_body)
++                 : stream->LoggingReadToEOF(response_body);
++}
++
++bool HTTPTransportSocket::ExecuteSynchronously(std::string* response_body) {
++  std::string scheme, hostname, port, resource;
++  if (!CrackURL(url(), &scheme, &hostname, &port, &resource)) {
++    return false;
++  }
++
++
++  base::ScopedFD sock(CreateSocket(hostname, port));
++  if (!sock.is_valid()) {
++    return false;
++  }
++
++  std::unique_ptr<Stream> stream;
++  if (scheme == "https") {
++    auto ssl_stream = std::make_unique<SSLStream>();
++    if (!ssl_stream->Initialize(
++            root_ca_certificate_path(), sock.get(), hostname)) {
++      return false;
++    }
++    stream = std::move(ssl_stream);
++  } else {
++    stream = std::make_unique<FdStream>(sock.get());
++  }
++
++  // "HTTP 1.1" requires "Host" in header.
++  SetHeader(kHost, hostname);
++
++  if (!WriteRequest(
++          stream.get(), method(), resource, headers(), body_stream())) {
++    return false;
++  }
++
++  if (!ReadResponse(stream.get(), response_body)) {
++    return false;
++  }
++
++  return true;
++}
++
++}  // namespace
++
++// static
++std::unique_ptr<HTTPTransport> HTTPTransport::Create() {
++  return std::unique_ptr<HTTPTransportSocket>(new HTTPTransportSocket);
++}
++
++}  // namespace crashpad
+diff --git a/crash-reporter/crashpad/implicit_cast.h b/crash-reporter/crashpad/implicit_cast.h
+new file mode 100644
+index 0000000000..66f9ef9538
+--- /dev/null
++++ b/crash-reporter/crashpad/implicit_cast.h
+@@ -0,0 +1,44 @@
++// Copyright 2015 The Crashpad Authors. All rights reserved.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++#ifndef CRASH_REPORTER_CRASHPAD_IMPLICIT_CAST_H_
++#define CRASH_REPORTER_CRASHPAD_IMPLICIT_CAST_H_
++
++namespace crashpad {
++
++// Use implicit_cast as a safe version of static_cast or const_cast
++// for upcasting in the type hierarchy (i.e. casting a pointer to Foo
++// to a pointer to SuperclassOfFoo or casting a pointer to Foo to
++// a const pointer to Foo).
++// When you use implicit_cast, the compiler checks that the cast is safe.
++// Such explicit implicit_casts are necessary in surprisingly many
++// situations where C++ demands an exact type match instead of an
++// argument type convertible to a target type.
++//
++// The From type can be inferred, so the preferred syntax for using
++// implicit_cast is the same as for static_cast etc.:
++//
++//   implicit_cast<ToType>(expr)
++//
++// implicit_cast would have been part of the C++ standard library,
++// but the proposal was submitted too late.  It will probably make
++// its way into the language in the future.
++template <typename To, typename From>
++constexpr To implicit_cast(From const& f) {
++  return f;
++}
++
++}  // namespace crashpad
++
++#endif  // CRASH_REPORTER_CRASHPAD_IMPLICIT_CAST_H_
+diff --git a/crash-reporter/crashpad/random_string.cc b/crash-reporter/crashpad/random_string.cc
+new file mode 100644
+index 0000000000..09eec4b37d
+--- /dev/null
++++ b/crash-reporter/crashpad/random_string.cc
+@@ -0,0 +1,30 @@
++// Copyright 2015 The Crashpad Authors. All rights reserved.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++#include "crash-reporter/crashpad/random_string.h"
++
++#include <base/rand_util.h>
++
++namespace crashpad {
++
++std::string RandomString() {
++  std::string random_string;
++  for (int index = 0; index < 16; ++index) {
++    random_string.append(1,
++                          static_cast<char>(base::RandIntInclusive('A', 'Z')));
++  }
++  return random_string;
++}
++
++}  // namespace crashpad
+diff --git a/crash-reporter/crashpad/random_string.h b/crash-reporter/crashpad/random_string.h
+new file mode 100644
+index 0000000000..a6fb99f7ea
+--- /dev/null
++++ b/crash-reporter/crashpad/random_string.h
+@@ -0,0 +1,31 @@
++// Copyright 2015 The Crashpad Authors. All rights reserved.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++#ifndef CRASH_REPORTER_CRASHPAD_RANDOM_STRING_H_
++#define CRASH_REPORTER_CRASHPAD_RANDOM_STRING_H_
++
++#include <string>
++
++namespace crashpad {
++
++//! \brief Returns a random string.
++//!
++//! The string consists of 16 uppercase characters chosen at random. The
++//! returned string has over 75 bits of randomness (26<sup>16</sup> &gt;
++//! 2<sup>75</sup>).
++std::string RandomString();
++
++}  // namespace crashpad
++
++#endif  // CRASH_REPORTER_CRASHPAD_RANDOM_STRING_H_
+diff --git a/crash-reporter/crashpad/split_string.cc b/crash-reporter/crashpad/split_string.cc
+new file mode 100644
+index 0000000000..146ce4de2a
+--- /dev/null
++++ b/crash-reporter/crashpad/split_string.cc
+@@ -0,0 +1,59 @@
++// Copyright 2015 The Crashpad Authors. All rights reserved.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++#include "crash-reporter/crashpad/split_string.h"
++
++#include <sys/types.h>
++
++namespace crashpad {
++
++bool SplitStringFirst(const std::string& string,
++                      char delimiter,
++                      std::string* left,
++                      std::string* right) {
++  size_t delimiter_pos = string.find(delimiter);
++  if (delimiter_pos == 0 || delimiter_pos == std::string::npos) {
++    return false;
++  }
++
++  left->assign(string, 0, delimiter_pos);
++  right->assign(string, delimiter_pos + 1, std::string::npos);
++  return true;
++}
++
++std::vector<std::string> SplitString(const std::string& string,
++                                     char delimiter) {
++  std::vector<std::string> result;
++  if (string.empty())
++    return result;
++
++  size_t start = 0;
++  while (start != std::string::npos) {
++    size_t end = string.find_first_of(delimiter, start);
++
++    std::string part;
++    if (end == std::string::npos) {
++      part = string.substr(start);
++      start = std::string::npos;
++    } else {
++      part = string.substr(start, end - start);
++      start = end + 1;
++    }
++
++    result.push_back(part);
++  }
++  return result;
++}
++
++}  // namespace crashpad
+diff --git a/crash-reporter/crashpad/split_string.h b/crash-reporter/crashpad/split_string.h
+new file mode 100644
+index 0000000000..0e4df25397
+--- /dev/null
++++ b/crash-reporter/crashpad/split_string.h
+@@ -0,0 +1,50 @@
++// Copyright 2015 The Crashpad Authors. All rights reserved.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++#ifndef CRASH_REPORTER_CRASHPAD_SPLIT_STRING_H_
++#define CRASH_REPORTER_CRASHPAD_SPLIT_STRING_H_
++
++#include <string>
++#include <vector>
++
++namespace crashpad {
++
++//! \brief Splits a string into two parts at the first delimiter found.
++//!
++//! \param[in] string The string to split.
++//! \param[in] delimiter The delimiter to split at.
++//! \param[out] left The portion of \a string up to, but not including, the
++//!     first \a delimiter character.
++//! \param[out] right The portion of \a string after the first \a delimiter
++//!     character.
++//!
++//! \return `true` if \a string was split successfully. `false` if \a string
++//!     did not contain a \a delimiter character or began with a \a delimiter
++//!     character.
++bool SplitStringFirst(const std::string& string,
++                      char delimiter,
++                      std::string* left,
++                      std::string* right);
++
++//! \brief Splits a string into multiple parts on the given delimiter.
++//!
++//! \param[in] string The string to split.
++//! \param[in] delimiter The delimiter to split at.
++//!
++//! \return The individual parts of the string.
++std::vector<std::string> SplitString(const std::string& string, char delimiter);
++
++}  // namespace crashpad
++
++#endif  // CRASH_REPORTER_CRASHPAD_SPLIT_STRING_H_
+diff --git a/crash-reporter/crashpad/string_number_conversion.cc b/crash-reporter/crashpad/string_number_conversion.cc
+new file mode 100644
+index 0000000000..adcc9c4a85
+--- /dev/null
++++ b/crash-reporter/crashpad/string_number_conversion.cc
+@@ -0,0 +1,189 @@
++// Copyright 2014 The Crashpad Authors. All rights reserved.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++#include "crash-reporter/crashpad/string_number_conversion.h"
++
++#include <ctype.h>
++#include <errno.h>
++#include <inttypes.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include <limits>
++
++namespace {
++
++template <typename TIntType, typename TLongType>
++struct StringToIntegerTraits {
++  using IntType = TIntType;
++  using LongType = TLongType;
++  static void TypeCheck() {
++    static_assert(std::numeric_limits<TIntType>::is_integer &&
++                      std::numeric_limits<TLongType>::is_integer,
++                  "IntType and LongType must be integer");
++    static_assert(std::numeric_limits<TIntType>::is_signed ==
++                      std::numeric_limits<TLongType>::is_signed,
++                  "IntType and LongType signedness must agree");
++    static_assert(std::numeric_limits<TIntType>::min() >=
++                          std::numeric_limits<TLongType>::min() &&
++                      std::numeric_limits<TIntType>::min() <
++                          std::numeric_limits<TLongType>::max(),
++                  "IntType min must be in LongType range");
++    static_assert(std::numeric_limits<TIntType>::max() >
++                          std::numeric_limits<TLongType>::min() &&
++                      std::numeric_limits<TIntType>::max() <=
++                          std::numeric_limits<TLongType>::max(),
++                  "IntType max must be in LongType range");
++  }
++};
++
++template <typename TIntType, typename TLongType>
++struct StringToSignedIntegerTraits
++    : public StringToIntegerTraits<TIntType, TLongType> {
++  static void TypeCheck() {
++    static_assert(std::numeric_limits<TIntType>::is_signed,
++                  "StringToSignedTraits IntType must be signed");
++    return super::TypeCheck();
++  }
++  static bool IsNegativeOverflow(TLongType value) {
++    return value < std::numeric_limits<TIntType>::min();
++  }
++
++ private:
++  using super = StringToIntegerTraits<TIntType, TLongType>;
++};
++
++template <typename TIntType, typename TLongType>
++struct StringToUnsignedIntegerTraits
++    : public StringToIntegerTraits<TIntType, TLongType> {
++  static void TypeCheck() {
++    static_assert(!std::numeric_limits<TIntType>::is_signed,
++                  "StringToUnsignedTraits IntType must be unsigned");
++    return super::TypeCheck();
++  }
++  static bool IsNegativeOverflow(TLongType value) { return false; }
++
++ private:
++  using super = StringToIntegerTraits<TIntType, TLongType>;
++};
++
++struct StringToIntTraits : public StringToSignedIntegerTraits<int, long> {
++  static LongType Convert(const char* str, char** end, int base) {
++    return strtol(str, end, base);
++  }
++};
++
++struct StringToUnsignedIntTraits
++    : public StringToUnsignedIntegerTraits<unsigned int, unsigned long> {
++  static LongType Convert(const char* str, char** end, int base) {
++    if (str[0] == '-') {
++      *end = const_cast<char*>(str);
++      return 0;
++    }
++    return strtoul(str, end, base);
++  }
++};
++
++struct StringToLongTraits
++    : public StringToSignedIntegerTraits<long, long long> {
++  static LongType Convert(const char* str, char** end, int base) {
++    return strtoll(str, end, base);
++  }
++};
++
++struct StringToUnsignedLongTraits
++    : public StringToUnsignedIntegerTraits<unsigned long, unsigned long long> {
++  static LongType Convert(const char* str, char** end, int base) {
++    if (str[0] == '-') {
++      *end = const_cast<char*>(str);
++      return 0;
++    }
++    return strtoull(str, end, base);
++  }
++};
++
++struct StringToLongLongTraits
++    : public StringToSignedIntegerTraits<long long, long long> {
++  static LongType Convert(const char* str, char** end, int base) {
++    return strtoll(str, end, base);
++  }
++};
++
++struct StringToUnsignedLongLongTraits
++    : public StringToUnsignedIntegerTraits<unsigned long long,
++                                           unsigned long long> {
++  static LongType Convert(const char* str, char** end, int base) {
++    if (str[0] == '-') {
++      *end = const_cast<char*>(str);
++      return 0;
++    }
++    return strtoull(str, end, base);
++  }
++};
++
++template <typename Traits>
++bool StringToIntegerInternal(const std::string& string,
++                             typename Traits::IntType* number) {
++  using IntType = typename Traits::IntType;
++  using LongType = typename Traits::LongType;
++
++  Traits::TypeCheck();
++
++  if (string.empty() || isspace(string[0])) {
++    return false;
++  }
++
++  errno = 0;
++  char* end;
++  LongType result = Traits::Convert(string.data(), &end, 0);
++  if (Traits::IsNegativeOverflow(result) ||
++      result > std::numeric_limits<IntType>::max() ||
++      errno == ERANGE ||
++      end != string.data() + string.length()) {
++    return false;
++  }
++  *number = static_cast<IntType>(result);
++  return true;
++}
++
++}  // namespace
++
++namespace crashpad {
++
++bool StringToNumber(const std::string& string, int* number) {
++  return StringToIntegerInternal<StringToIntTraits>(string, number);
++}
++
++bool StringToNumber(const std::string& string, unsigned int* number) {
++  return StringToIntegerInternal<StringToUnsignedIntTraits>(string, number);
++}
++
++bool StringToNumber(const std::string& string, long* number) {
++  return StringToIntegerInternal<StringToLongTraits>(string, number);
++}
++
++bool StringToNumber(const std::string& string, unsigned long* number) {
++  return StringToIntegerInternal<StringToUnsignedLongTraits>(string, number);
++}
++
++bool StringToNumber(const std::string& string, long long* number) {
++  return StringToIntegerInternal<StringToLongLongTraits>(string, number);
++}
++
++bool StringToNumber(const std::string& string, unsigned long long* number) {
++  return StringToIntegerInternal<StringToUnsignedLongLongTraits>(string,
++                                                                 number);
++}
++
++}  // namespace crashpad
+diff --git a/crash-reporter/crashpad/string_number_conversion.h b/crash-reporter/crashpad/string_number_conversion.h
+new file mode 100644
+index 0000000000..3fda30a337
+--- /dev/null
++++ b/crash-reporter/crashpad/string_number_conversion.h
+@@ -0,0 +1,67 @@
++// Copyright 2014 The Crashpad Authors. All rights reserved.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++#ifndef CRASH_REPORTER_CRASHPAD_STRING_NUMBER_CONVERSION_H_
++#define CRASH_REPORTER_CRASHPAD_STRING_NUMBER_CONVERSION_H_
++
++#include <string>
++
++namespace crashpad {
++
++// Convert between strings and numbers.
++//
++// These functions will only set *number if a perfect conversion can be
++// performed. A perfect conversion contains no leading or trailing characters
++// (including whitespace) other than the number to convert, and does not
++// overflow the targeted data type. If a perfect conversion is possible, *number
++// is set and these functions return true. Otherwise, they return false.
++//
++// The interface in base/strings/string_number_conversions.h doesn’t allow
++// arbitrary bases based on whether the string begins with prefixes such as "0x"
++// as strtol does with base = 0. The functions here are implemented on the
++// strtol family with base = 0, and thus do accept such input.
++
++//! \{
++//! \brief Convert a string to a number.
++//!
++//! A conversion will only be performed if it can be done perfectly: if \a
++//! string contains no leading or trailing characters (including whitespace)
++//! other than the number to convert, and does not overflow the targeted data
++//! type.
++//!
++//! \param[in] string The string to convert to a number. As in `strtol()` with a
++//!     `base` parameter of `0`, the string is treated as decimal unless it
++//!     begins with a `"0x"` or `"0X"` prefix, in which case it is treated as
++//!     hexadecimal, or a `"0"` prefix, in which case it is treated as octal.
++//! \param[out] number The converted number. This will only be set if a perfect
++//!     conversion can be performed.
++//!
++//! \return `true` if a perfect conversion could be performed, with \a number
++//!     set appropriately. `false` if a perfect conversion was not possible.
++//!
++//! \note The interface in `base/strings/string_number_conversions.h` doesn’t
++//!     allow arbitrary bases based on whether the string begins with a prefix
++//!     indicating its base. The functions here are provided for situations
++//!     where such prefix recognition is desirable.
++bool StringToNumber(const std::string& string, int* number);
++bool StringToNumber(const std::string& string, unsigned int* number);
++bool StringToNumber(const std::string& string, long* number);
++bool StringToNumber(const std::string& string, unsigned long* number);
++bool StringToNumber(const std::string& string, long long* number);
++bool StringToNumber(const std::string& string, unsigned long long* number);
++//! \}
++
++}  // namespace crashpad
++
++#endif  // CRASH_REPORTER_CRASHPAD_STRING_NUMBER_CONVERSION_H_
+diff --git a/crash-reporter/crashpad/url.cc b/crash-reporter/crashpad/url.cc
+new file mode 100644
+index 0000000000..71d3062e25
+--- /dev/null
++++ b/crash-reporter/crashpad/url.cc
+@@ -0,0 +1,91 @@
++// Copyright 2017 The Crashpad Authors. All rights reserved.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++#include "crash-reporter/crashpad/url.h"
++
++#include <string.h>
++
++#include <base/logging.h>
++#include <base/strings/stringprintf.h>
++
++namespace crashpad {
++
++std::string URLEncode(const std::string& url) {
++  const char kSafeCharacters[] = "-_.~";
++  std::string encoded;
++  encoded.reserve(url.length());
++
++  for (unsigned char character : url) {
++    if (((character >= 'A') && (character <= 'Z')) ||
++        ((character >= 'a') && (character <= 'z')) ||
++        ((character >= '0') && (character <= '9')) ||
++        (strchr(kSafeCharacters, character) != nullptr)) {
++      // Copy unreserved character.
++      encoded += character;
++    } else {
++      // Escape character.
++      encoded += base::StringPrintf("%%%02X", character);
++    }
++  }
++
++  return encoded;
++}
++
++bool CrackURL(const std::string& url,
++              std::string* scheme,
++              std::string* host,
++              std::string* port,
++              std::string* rest) {
++  std::string result_scheme;
++  std::string result_port;
++
++  size_t host_start;
++  static constexpr const char kHttp[] = "http://";
++  static constexpr const char kHttps[] = "https://";
++  if (url.compare(0, strlen(kHttp), kHttp) == 0) {
++    result_scheme = "http";
++    result_port = "80";
++    host_start = strlen(kHttp);
++  } else if (url.compare(0, strlen(kHttps), kHttps) == 0) {
++    result_scheme = "https";
++    result_port = "443";
++    host_start = strlen(kHttps);
++  } else {
++    return false;
++  }
++
++  // Find the start of the resource.
++  size_t resource_start = url.find('/', host_start);
++  if (resource_start == std::string::npos) {
++    return false;
++  }
++
++  scheme->swap(result_scheme);
++  port->swap(result_port);
++  std::string host_and_possible_port =
++      url.substr(host_start, resource_start - host_start);
++  size_t colon = host_and_possible_port.find(':');
++  if (colon == std::string::npos) {
++    *host = host_and_possible_port;
++  } else {
++    *host = host_and_possible_port.substr(0, colon);
++    *port = host_and_possible_port.substr(colon + 1);
++  }
++
++  *rest = url.substr(resource_start);
++
++  return true;
++}
++
++}  // namespace crashpad
+diff --git a/crash-reporter/crashpad/url.h b/crash-reporter/crashpad/url.h
+new file mode 100644
+index 0000000000..46792bd5ca
+--- /dev/null
++++ b/crash-reporter/crashpad/url.h
+@@ -0,0 +1,50 @@
++// Copyright 2017 The Crashpad Authors. All rights reserved.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++#ifndef CRASH_REPORTER_CRASHPAD_URL_H_
++#define CRASH_REPORTER_CRASHPAD_URL_H_
++
++#include <string>
++
++namespace crashpad {
++
++//! \brief Performs percent-encoding (URL encoding) on the input string,
++//!     following RFC 3986 paragraph 2.
++//!
++//! \param[in] url The string to be encoded.
++//! \return The encoded string.
++std::string URLEncode(const std::string& url);
++
++//! \brief Crack a URL into component parts.
++//!
++//! This is not a general function, and works only on the limited style of URLs
++//! that are expected to be used by HTTPTransport::SetURL().
++//!
++//! \param[in] url The URL to crack.
++//! \param[out] scheme The request scheme, either http or https.
++//! \param[out] host The hostname.
++//! \param[out] port The port.
++//! \param[out] rest The remainder of the URL (both resource and URL params).
++//! \return `true` on success in which case all output parameters will be filled
++//!     out, or `false` on failure, in which case the output parameters will be
++//!     unmodified and an error will be logged.
++bool CrackURL(const std::string& url,
++              std::string* scheme,
++              std::string* host,
++              std::string* port,
++              std::string* rest);
++
++}  // namespace crashpad
++
++#endif  // CRASH_REPORTER_CRASHPAD_URL_H_
+diff --git a/crash-reporter/crashpad/zlib.cc b/crash-reporter/crashpad/zlib.cc
+new file mode 100644
+index 0000000000..8aec282c72
+--- /dev/null
++++ b/crash-reporter/crashpad/zlib.cc
+@@ -0,0 +1,39 @@
++// Copyright 2017 The Crashpad Authors. All rights reserved.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++#include "crash-reporter/crashpad/zlib.h"
++
++#include <ostream>
++
++#include <base/strings/stringprintf.h>
++#include <zlib.h>
++
++namespace crashpad {
++
++int ZlibWindowBitsWithGzipWrapper(int window_bits) {
++  // See the documentation for deflateInit2() and inflateInit2() in <zlib.h>. 0
++  // is only valid during decompression.
++
++//  DCHECK(window_bits == 0 || (window_bits >= 8 && window_bits <= 15))
++//      << window_bits;
++
++  return 16 + window_bits;
++}
++
++std::string ZlibErrorString(int zr) {
++  //return base::StringPrintf("%s (%d)", zError(zr), zr);
++	return base::StringPrintf("%d", zr);
++}
++
++}  // namespace crashpad
+diff --git a/crash-reporter/crashpad/zlib.h b/crash-reporter/crashpad/zlib.h
+new file mode 100644
+index 0000000000..f1b48566ae
+--- /dev/null
++++ b/crash-reporter/crashpad/zlib.h
+@@ -0,0 +1,42 @@
++// Copyright 2017 The Crashpad Authors. All rights reserved.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++#ifndef CRASH_REPORTER_CRASHPAD_ZLIB_H_
++#define CRASH_REPORTER_CRASHPAD_ZLIB_H_
++
++#include <string>
++
++namespace crashpad {
++
++//! \brief Obtain a \a window_bits parameter to pass to `deflateInit2()` or
++//!     `inflateInit2()` that specifies a `gzip` wrapper instead of the default
++//!     zlib wrapper.
++//!
++//! \param[in] window_bits A \a window_bits value that only specifies the base-2
++//!     logarithm of the deflate sliding window size.
++//!
++//! \return \a window_bits adjusted to specify a `gzip` wrapper, to be passed to
++//!     `deflateInit2()` or `inflateInit2()`.
++int ZlibWindowBitsWithGzipWrapper(int window_bits);
++
++//! \brief Formats a string for an error received from the zlib library.
++//!
++//! \param[in] zr A zlib result code, such as `Z_STREAM_ERROR`.
++//!
++//! \return A formatted string.
++std::string ZlibErrorString(int zr);
++
++}  // namespace crashpad
++
++#endif  // CRASH_REPORTER_CRASHPAD_ZLIB_H_
+diff --git a/crash-reporter/update_failure_collector.cc b/crash-reporter/update_failure_collector.cc
+new file mode 100644
+index 0000000000..1f87672df9
+--- /dev/null
++++ b/crash-reporter/update_failure_collector.cc
+@@ -0,0 +1,129 @@
++// Copyright 2026 NAVER Corp. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "crash-reporter/update_failure_collector.h"
++
++#include <memory>
++#include <string>
++
++#include <base/files/file_path.h>
++#include <base/files/file_util.h>
++#include <base/functional/bind.h>
++#include <base/logging.h>
++#include <base/memory/ref_counted.h>
++#include <base/memory/scoped_refptr.h>
++#include <base/strings/stringprintf.h>
++#include <metrics/metrics_library.h>
++
++#include "crash-reporter/constants.h"
++#include "crash-reporter/crash_collection_status.h"
++#include "crash-reporter/crash_collector_names.h"
++#include "crash-reporter/util.h"
++
++namespace {
++const char kSignatureKey[] = "sig";
++const char kErrorTypeKey[] = "error_type";
++}  // namespace
++
++using base::FilePath;
++using base::StringPrintf;
++
++const char* const UpdateFailureCollector::kUpdateFailure = "update-failure";
++
++UpdateFailureCollector::UpdateFailureCollector(
++    const scoped_refptr<
++        base::RefCountedData<std::unique_ptr<MetricsLibraryInterface>>>&
++        metrics_lib)
++    : CrashCollector(CrashReporterCollector::kUpdateFailure, metrics_lib) {}
++
++UpdateFailureCollector::~UpdateFailureCollector() {}
++
++CrashCollectionStatus UpdateFailureCollector::Collect(
++    const std::string& module,
++    const std::string& error_type) {
++  LOG(INFO) << "Processing update failure: module=" << module
++            << " error_type=" << error_type;
++
++  // Build the exec_name: update_failure_module_error_type (e.g.,
++  // "update_failure_update_engine_PostinstallRunnerError")
++  std::string exec_name = StringPrintf("update_failure_%s_%s", module.c_str(),
++                                       error_type.c_str());
++
++  // Build the signature for NELO.
++  std::string signature = StringPrintf("update-failure-%s-%s",
++                                       module.c_str(), error_type.c_str());
++
++  FilePath crash_directory;
++  CrashCollectionStatus status = GetCreatedCrashDirectoryByEuid(
++      constants::kRootUid, &crash_directory, nullptr);
++  if (!IsSuccessCode(status)) {
++    return status;
++  }
++
++  std::string dump_basename = FormatDumpBasename(exec_name, time(nullptr), 0);
++  FilePath log_path = GetCrashPath(crash_directory, dump_basename, "log");
++  FilePath meta_path = GetCrashPath(crash_directory, dump_basename, "meta");
++
++  AddCrashMetaData(kSignatureKey, signature);
++  AddCrashMetaData(kErrorTypeKey, error_type);
++
++  // Use the log key based on the module name to pick up module-specific log
++  // capture commands from crash_reporter_logs.conf.
++  std::string log_key = StringPrintf("update-failure-%s", module.c_str());
++  status = GetLogContents(log_config_path_, log_key, log_path);
++
++  if (!IsSuccessCode(status)) {
++    // Fall back to the generic update-failure log key.
++    LOG(WARNING) << "Module-specific log key '" << log_key
++                 << "' not found, falling back to generic 'update-failure'";
++    status = GetLogContents(log_config_path_, kUpdateFailure, log_path);
++  }
++
++  if (!IsSuccessCode(status)) {
++    // Log collection failed, but we still want to report the failure to NELO.
++    // Write a placeholder log with basic error information.
++    LOG(WARNING) << "Failed to gather update failure logs, "
++                 << "creating placeholder report";
++    std::string placeholder = StringPrintf(
++        "update failure: module=%s error_type=%s\n"
++        "(log collection failed)\n",
++        module.c_str(), error_type.c_str());
++    if (WriteNewFile(log_path, placeholder) < 0) {
++      LOG(ERROR) << "Failed to write placeholder log file";
++      return CrashCollectionStatus::kFailureCreatingLogCollectionTmpFile;
++    }
++  }
++
++  return FinishCrash(meta_path, exec_name, log_path.BaseName().value());
++}
++
++CrashCollector::ComputedCrashSeverity UpdateFailureCollector::ComputeSeverity(
++    const std::string& exec_name) {
++  return {
++      .crash_severity = CrashSeverity::kError,
++      .product_group = Product::kPlatform,
++  };
++}
++
++// static
++CollectorInfo UpdateFailureCollector::GetHandlerInfo(
++    const HandlerInfoOptions& options,
++    const scoped_refptr<
++        base::RefCountedData<std::unique_ptr<MetricsLibraryInterface>>>&
++        metrics_lib) {
++  auto collector = std::make_shared<UpdateFailureCollector>(metrics_lib);
++  return {
++      .collector = collector,
++      .handlers = {
++          {
++              .should_handle = !options.update_failure.empty(),
++              .cb = base::BindRepeating(
++                  &UpdateFailureCollector::Collect,
++                  collector,
++                  options.update_failure,
++                  options.update_error_type),
++          },
++      },
++  };
++}
+diff --git a/crash-reporter/update_failure_collector.h b/crash-reporter/update_failure_collector.h
+new file mode 100644
+index 0000000000..60345480ff
+--- /dev/null
++++ b/crash-reporter/update_failure_collector.h
+@@ -0,0 +1,67 @@
++// Copyright 2026 NAVER Corp. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++// The update failure collector collects OS update failure logs from
++// update_engine, installer (postinstall), and browser modules.
++// The flow looks like this:
++// 1. An update failure is detected by a module (update_engine, installer, or
++//    browser)
++// 2. The module invokes crash_reporter with --update_failure=<module>
++//    --update_error_type=<error_type>
++// 3. crash_reporter invokes UpdateFailureCollector to capture relevant logs
++//    and create a crash report for NELO upload.
++
++#ifndef CRASH_REPORTER_UPDATE_FAILURE_COLLECTOR_H_
++#define CRASH_REPORTER_UPDATE_FAILURE_COLLECTOR_H_
++
++#include <memory>
++#include <string>
++
++#include <base/memory/ref_counted.h>
++#include <base/memory/scoped_refptr.h>
++#include <metrics/metrics_library.h>
++
++#include "crash-reporter/crash_collector.h"
++
++enum class CrashCollectionStatus;
++
++// Collector for OS update failures from update_engine, installer, and browser.
++class UpdateFailureCollector : public CrashCollector {
++ public:
++  explicit UpdateFailureCollector(
++      const scoped_refptr<
++          base::RefCountedData<std::unique_ptr<MetricsLibraryInterface>>>&
++          metrics_lib);
++  UpdateFailureCollector(const UpdateFailureCollector&) = delete;
++  UpdateFailureCollector& operator=(const UpdateFailureCollector&) = delete;
++
++  ~UpdateFailureCollector() override;
++
++  // Collects the update failure report.
++  // |module| is the source module: "update_engine", "installer", or "browser".
++  // |error_type| is the specific error type string (e.g.,
++  // "kPostinstallRunnerError").
++  CrashCollectionStatus Collect(const std::string& module,
++                                const std::string& error_type);
++
++  // Returns the severity level and product group of the crash.
++  CrashCollector::ComputedCrashSeverity ComputeSeverity(
++      const std::string& exec_name) override;
++
++  struct HandlerInfoOptions {
++    std::string update_failure;
++    std::string update_error_type;
++  };
++
++  static CollectorInfo GetHandlerInfo(
++      const HandlerInfoOptions& options,
++      const scoped_refptr<
++          base::RefCountedData<std::unique_ptr<MetricsLibraryInterface>>>&
++          metrics_lib);
++
++ private:
++  static const char* const kUpdateFailure;
++};
++
++#endif  // CRASH_REPORTER_UPDATE_FAILURE_COLLECTOR_H_
+diff --git a/crash-reporter/util.cc b/crash-reporter/util.cc
+index 88aa159f3f..0bd285e040 100644
+--- a/crash-reporter/util.cc
++++ b/crash-reporter/util.cc
+@@ -104,32 +104,20 @@ bool IsDeveloperImage() {
+ // Use sparingly, and only if you're really sure you want to have different
+ // behavior during crash tests than on real devices.
+ bool IsReallyTestImage() {
+-  std::string channel;
+-  if (!GetCachedKeyValueDefault(base::FilePath(paths::kLsbRelease),
+-                                "CHROMEOS_RELEASE_TRACK", &channel)) {
+-    return false;
+-  }
+-  return base::StartsWith(channel, "test", base::CompareCase::SENSITIVE);
++  // TODO(deejay-kim) : Needs to map with CHROMEOS_RELEASE_TRACK in /etc/lsb-release
++  LOG(INFO) << "IsReallyTestImage() : return false temporary";
++  return false;
+ }
+ 
+ bool IsTestImage() {
+-  // If we're testing crash reporter itself, we don't want to special-case
+-  // for test images.
+-  if (IsCrashTestInProgress()) {
+-    return false;
+-  }
+-
+-  return IsReallyTestImage();
++  // TODO(deejay-kim) : Needs to map with CHROMEOS_RELEASE_TRACK in /etc/lsb-release
++  return false;
+ }
+ 
+ bool IsOfficialImage() {
+-  std::string description;
+-  if (!GetCachedKeyValueDefault(base::FilePath(paths::kLsbRelease),
+-                                "CHROMEOS_RELEASE_DESCRIPTION", &description)) {
+-    return false;
+-  }
+-
+-  return description.find("Official") != std::string::npos;
++  // TODO(deejay-kim) : Needs to map with CHROMEOS_RELEASE_DESCRIPTION in /etc/lsb-release
++  LOG(INFO) << "IsOfficialImage() : return true temporary";
++  return true;
+ }
+ 
+ bool HasMockConsent() {

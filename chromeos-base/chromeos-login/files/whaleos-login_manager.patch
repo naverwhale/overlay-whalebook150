@@ -1,0 +1,125 @@
+diff --git a/login_manager/BUILD.gn b/login_manager/BUILD.gn
+index 54b6638262..a01fb79bb8 100644
+--- a/login_manager/BUILD.gn
++++ b/login_manager/BUILD.gn
+@@ -220,6 +220,7 @@ install_config("install_init_scripts") {
+     "init/scripts/ui-pre-start",
+     "init/scripts/ui-respawn",
+     "init/scripts/write-machine-info",
++    "init/scripts/whale-util",
+   ]
+   install_path = "/usr/share/cros/init"
+   type = "executable"
+diff --git a/login_manager/arc_sideload_status.cc b/login_manager/arc_sideload_status.cc
+index c3975b12c5..a8ec1df0e3 100644
+--- a/login_manager/arc_sideload_status.cc
++++ b/login_manager/arc_sideload_status.cc
+@@ -40,6 +40,7 @@ ArcSideloadStatus::ArcSideloadStatus(dbus::ObjectProxy* boot_lockbox_proxy)
+ ArcSideloadStatus::~ArcSideloadStatus() {}
+ 
+ void ArcSideloadStatus::Initialize() {
++
+   boot_lockbox_proxy_->WaitForServiceToBeAvailable(
+       base::BindOnce(&ArcSideloadStatus::OnBootLockboxServiceAvailable,
+                      weak_ptr_factory_.GetWeakPtr()));
+@@ -189,7 +190,6 @@ void ArcSideloadStatus::OnEnableAdbSideloadSet(
+                             "result is null");
+     return;
+   }
+-
+   dbus::MessageReader reader(result);
+   bootlockbox::StoreBootLockboxReply reply;
+   if (!reader.PopArrayOfBytesAsProto(&reply)) {
+diff --git a/login_manager/device_identifier_generator.cc b/login_manager/device_identifier_generator.cc
+index dc78de94ac..cb9591b582 100644
+--- a/login_manager/device_identifier_generator.cc
++++ b/login_manager/device_identifier_generator.cc
+@@ -237,7 +237,6 @@ DeviceIdentifierGenerator::ComputeKeys() {
+     for (int i = 0; i < kDeviceStateKeyFutureQuanta; ++i) {
+       state_keys.push_back(StateKey(crypto::kSHA256Length));
+       crypto::SHA256HashString(
+-          crypto::SHA256HashString(group_code_key_) +
+               crypto::SHA256HashString(disk_serial_number_) +
+               crypto::SHA256HashString(machine_serial_number_) +
+               crypto::SHA256HashString(base::NumberToString(quantized_time)),
+diff --git a/login_manager/init/scripts/ui-collect-machine-info b/login_manager/init/scripts/ui-collect-machine-info
+index a4b5b475ef..2fbd1333f8 100755
+--- a/login_manager/init/scripts/ui-collect-machine-info
++++ b/login_manager/init/scripts/ui-collect-machine-info
+@@ -17,6 +17,12 @@ if command -v flex_id_tool >/dev/null; then
+   echo "\"re_enrollment_key\"=\"$(flex_id_tool --type=state_key)\"" \
+   >> "${UI_MACHINE_INFO_FILE}"
+ fi
++. "$(dirname "$0")/whale-util"
++
++serial_number="$(dmidecode -s system-serial-number)"
++serial_number=$(whale_serial_number_fallback "${serial_number}")
++echo "\"serial_number\"=\"${serial_number}\"" >> "${UI_MACHINE_INFO_FILE}"
++#endif
+ 
+ ROOTDEV=$(rootdev -s -d || true)
+ udevadm info --query=property --name="${ROOTDEV}" |
+diff --git a/login_manager/init/scripts/whale-util b/login_manager/init/scripts/whale-util
+new file mode 100644
+index 0000000000..ddf058e638
+--- /dev/null
++++ b/login_manager/init/scripts/whale-util
+@@ -0,0 +1,21 @@
++#!/bin/sh
++
++# Copyright 2022 NAVER Authors. All rights reserved.
++# Use of this source code is governed by a BSD-style license that can be
++# found in the LICENSE file.
++
++whale_serial_number_fallback() {
++  serial_number="$1"
++  if [ -z "${serial_number}" ] || [ "${serial_number}" = "Default string" ]; then
++    eth0_addr='/sys/class/net/eth0/address'
++    wlan0_addr='/sys/class/net/wlan0/address'
++    if [ -r "${eth0_addr}" ]; then
++      serial_number=$(cat ${eth0_addr} | md5sum | awk '{print $1}')
++    elif [ -r "${wlan0_addr}" ]; then
++      serial_number=$(cat ${wlan0_addr} | md5sum | awk '{print $1}')
++    fi
++  fi
++
++  echo "${serial_number}"
++}
++
+diff --git a/login_manager/init/scripts/write-machine-info b/login_manager/init/scripts/write-machine-info
+index 91e75f7d25..0f501da4cf 100755
+--- a/login_manager/init/scripts/write-machine-info
++++ b/login_manager/init/scripts/write-machine-info
+@@ -5,6 +5,7 @@
+ # found in the LICENSE file.
+ 
+ set -e
++. "$(dirname "$0")/whale-util"
+ 
+ # Determines the device serial number. On Chrome OS hardware, it's stored in VPD
+ # and can be read from there.
+@@ -27,6 +28,7 @@ serial_number() {
+     if [ -r "${smbios_pserial}" ]; then
+       serial_number="$(cat "${smbios_pserial}" 2>/dev/null)" || :
+     fi
++    serial_number=$(whale_serial_number_fallback "${serial_number}")
+ 
+     if [ -z "${serial_number}" ]; then
+       # Try the SMBIOS UUID if available.  QEMU can set this via -uuid.
+diff --git a/login_manager/init/upstart/ui.conf b/login_manager/init/upstart/ui.conf
+index d289aa98e4..6f73ec5328 100644
+--- a/login_manager/init/upstart/ui.conf
++++ b/login_manager/init/upstart/ui.conf
+@@ -80,6 +80,12 @@ exec minijail0 -i --no-default-runtime-environment \
+ post-start script
+   echo $(status | cut -f 4 -d ' ') > "${UI_CPU_CGROUP_DIR}/tasks"
+   echo $(status | cut -f 4 -d ' ') > "${UI_FREEZER_CGROUP_DIR}/cgroup.procs"
++
++  # core shell
++  if [ -e "/opt/naver/whale/core_shell" ]
++  then
++      exec /opt/naver/whale/core_shell > /var/log/chrome/core_shell.log 2>&1
++  fi
+ end script
+ 
+ post-stop exec /usr/share/cros/init/ui-post-stop

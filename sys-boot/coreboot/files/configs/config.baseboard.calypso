@@ -1,0 +1,3 @@
+CONFIG_QC_BLOBS_UPSTREAM=y
+CONFIG_ARM64_BL31_EXTERNAL_FILE="3rdparty/qc_blobs/calypso/bl31.elf"
+CONFIG_ARM64_SECURE_OS_FILE="3rdparty/qc_blobs/calypso/qtee/tz.mbn"

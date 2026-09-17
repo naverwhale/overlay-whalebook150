@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE pkgmetadata SYSTEM "http://www.gentoo.org/dtd/metadata.dtd">
+<pkgmetadata>
+  <longdescription>
+    Prebuilt Android system and vendor images for Waydroid on WhaleOS.
+    Images are installed to /usr/share/waydroid-extra/images/ so that
+    waydroid init can pick them up without downloading from the internet.
+  </longdescription>
+</pkgmetadata>

@@ -1,0 +1,25 @@
+diff --git a/init/tlsdated.conf b/init/tlsdated.conf
+index 594fb93..bb586c2 100644
+--- a/init/tlsdated.conf
++++ b/init/tlsdated.conf
+@@ -83,6 +83,7 @@ script
+     -b /run/dbus,,1 -b /run/shill -b /run/dns-proxy \
+     -k '/var,/var,tmpfs,MS_NODEV|MS_NOEXEC|MS_NOSUID,mode=755,size=10M' \
+     -b /var/cache/tlsdated,,1 \
++    -b /etc -b /var/lib/timezone -b /usr/share/zoneinfo \
+     /usr/bin/tlsdated -- /usr/bin/tlsdate -v -C "${GOOGLE_CERTS}" -l
+ end script
+ 
+diff --git a/src/tlsdate-setter.c b/src/tlsdate-setter.c
+index 4788e90..a4ccf95 100644
+--- a/src/tlsdate-setter.c
++++ b/src/tlsdate-setter.c
+@@ -54,7 +54,7 @@ sync_hwclock (int fd, time_t sec)
+ {
+   struct tm tm;
+   struct rtc_time rtctm;
+-  gmtime_r (&sec, &tm);
++  localtime_r (&sec, &tm);
+   /* these structs are identical, but separately defined */
+   rtctm.tm_sec = tm.tm_sec;
+   rtctm.tm_min = tm.tm_min;

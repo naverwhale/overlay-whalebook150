@@ -1,0 +1,11 @@
+diff --git a/tpm_manager/client/BUILD.gn b/tpm_manager/client/BUILD.gn
+index c934095b97..416ec440e8 100644
+--- a/tpm_manager/client/BUILD.gn
++++ b/tpm_manager/client/BUILD.gn
+@@ -111,4 +111,6 @@ executable("tpm_manager_client") {
+     "system_api",
+     "protobuf",
+   ]
++  # TODO(changwan.hong): Define flag kinda is_whaleos.
++  # FIXME(changwan.hong): Check if this is necessary.
+ }

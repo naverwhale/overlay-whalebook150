@@ -1,0 +1,26 @@
+diff --git a/attestation/server/main.cc b/attestation/server/main.cc
+index 73ea0d68c0..ac1271e564 100644
+--- a/attestation/server/main.cc
++++ b/attestation/server/main.cc
+@@ -10,6 +10,8 @@
+ #include <optional>
+ #include <string>
+ 
++#include <brillo/whaleos_util.h>
++
+ #include <attestation/proto_bindings/google_key.pb.h>
+ #include <base/check.h>
+ #include <base/check_op.h>
+@@ -205,6 +207,12 @@ int main(int argc, char* argv[]) {
+ #endif
+   }
+ 
++  // For devices without TPM, attestationd should not run
++  if (brillo::IsNoTpmModel()) {
++    LOG(INFO) << "Known non-TPM model detected, attestationd not needed";
++    return EX_OK;
++  }
++
+   AttestationDaemon daemon(abe_data, attested_device_id.value_or(""),
+                            ReadGoogleKeysIfExists());
+   LOG(INFO) << "Attestation Daemon Started.";

@@ -1,0 +1,18 @@
+diff --git a/shill/device_info.cc b/shill/device_info.cc
+index 78a3ebe48f..30df90cc01 100644
+--- a/shill/device_info.cc
++++ b/shill/device_info.cc
+@@ -152,6 +152,13 @@ const char* const kIgnoredDeviceNamePrefixes[] = {
+     // for now.
+     "arc_",
+     "veth",
++    // WhaleOS: Waydroid LXC bridge ('waydroid0') and any sibling bridges.
++    // Without this, shill enumerates the bridge as an Ethernet device and
++    // the UI shows a phantom "Ethernet trying to connect" entry whenever
++    // the Waydroid container is up.  The dbus ClaimInterface approach in
++    // waydroid-container.conf is racy and not persistent across shill
++    // restarts; the prefix block is unconditional.
++    "waydroid",
+ };
+ 
+ // As of Linux v5.4, these "kinds" are not part of a UAPI header definition, so

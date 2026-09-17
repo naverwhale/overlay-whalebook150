@@ -1,0 +1,60 @@
+CONFIG_VENDOR_GOOGLE=y
+CONFIG_BOARD_GOOGLE_REX64=y
+
+CONFIG_PAYLOAD_NONE=y
+CONFIG_USE_BLOBS=y
+
+# Chrome OS
+CONFIG_CHROMEOS=y
+
+# SPI Descriptor
+CONFIG_HAVE_IFD_BIN=y
+
+# FSP Blobs
+CONFIG_ADD_FSP_BINARIES=y
+CONFIG_FSP_M_FILE="3rdparty/blobs/mainboard/google/rex/fsp_64/fspm.bin"
+CONFIG_FSP_S_FILE="3rdparty/blobs/mainboard/google/rex/fsp_64/fsps.bin"
+CONFIG_RUN_FSP_GOP=y
+
+# Management Engine
+CONFIG_HAVE_ME_BIN=y
+
+# Microcode
+CONFIG_CPU_INTEL_MICROCODE_CBFS_SPLIT_BINS=y
+
+# Video Blob
+CONFIG_INTEL_GMA_ADD_VBT=y
+
+# Enable Early Splash Screen
+CONFIG_CHROMEOS_FW_SPLASH_SCREEN=y
+CONFIG_CHROMEOS_LOGO_PATH="bootsplash_assets/chromeos_100_percent.bmp"
+CONFIG_CHROMEBOOK_PLUS_LOGO_PATH="bootsplash_assets/chromebook_plus_100_percent.bmp"
+
+# Serial console disabled by default (do not remove)
+# CONFIG_CONSOLE_SERIAL is not set
+
+# Event Logging
+CONFIG_ELOG_GSMI=y
+CONFIG_ELOG_BOOT_COUNT=y
+CONFIG_ELOG_BOOT_COUNT_CMOS_OFFSET=144
+CONFIG_SPI_FLASH_SMM=y
+
+# Management Engine FW update
+CONFIG_SOC_INTEL_CSE_RW_UPDATE=y
+
+# FILEPATH is set to blank to prevent any default SAR file from getting added.
+CONFIG_WIFI_SAR_CBFS_FILEPATH=""
+
+# SPI Descriptor
+CONFIG_IFD_BIN_PATH="3rdparty/blobs/mainboard/google/rex/descriptor-rex0.bin"
+
+# CSE data
+# CONFIG_CSE_DATA_FILE="cse_data/cse_data-rex0.bin"
+CONFIG_ME_BIN_PATH="3rdparty/blobs/mainboard/google/rex/csme-rex0.bin"
+CONFIG_SOC_INTEL_CSE_RW_FILE="3rdparty/blobs/mainboard/google/rex/me_rw-rex0.bin"
+
+# Video Blob
+CONFIG_INTEL_GMA_VBT_FILE="3rdparty/blobs/mainboard/google/rex/vbt-rex0.bin"
+
+# Microcode
+CONFIG_CPU_INTEL_UCODE_SPLIT_BINARIES="3rdparty/blobs/mainboard/google/rex/microcode_inputs/rex64"

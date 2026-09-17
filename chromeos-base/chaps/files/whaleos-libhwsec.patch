@@ -1,0 +1,1127 @@
+diff --git a/libhwsec/BUILD.gn b/libhwsec/BUILD.gn
+index c05da6102f..e5c5249c1c 100644
+--- a/libhwsec/BUILD.gn
++++ b/libhwsec/BUILD.gn
+@@ -312,6 +312,10 @@ source_set("hardware_abstraction_internal_library") {
+     "proxy/proxy.cc",
+     "proxy/proxy_impl.cc",
+   ]
++  sources += [
++    "frontend/pinweaver_manager/frontend_whale.cc",
++    "frontend/recovery_crypto/frontend_whale.cc",
++  ]
+ 
+   libs = []
+ 
+@@ -592,4 +596,5 @@ proto_library("pinweaver_manager_proto") {
+   proto_in_dir = "backend/pinweaver_manager"
+   proto_out_dir = "include/libhwsec"
+   sources = [ "${proto_in_dir}/pinweaver_leaf_label_data.proto" ]
++  sources += [ "${proto_in_dir}/label_data.proto" ]
+ }
+diff --git a/libhwsec/backend/pinweaver_manager/label_data.proto b/libhwsec/backend/pinweaver_manager/label_data.proto
+new file mode 100644
+index 0000000000..921e642075
+--- /dev/null
++++ b/libhwsec/backend/pinweaver_manager/label_data.proto
+@@ -0,0 +1,18 @@
++// Copyright (c) 2023 NAVER Corp. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++syntax = "proto2";
++
++option optimize_for = LITE_RUNTIME;
++
++package hwsec;
++
++message LabelData {
++    optional bytes le_secret = 1;
++    optional bytes le_iv = 2;
++    optional bytes he_secret = 3;
++    optional bytes he_iv = 4;
++    optional bytes reset_secret = 5;
++    optional uint32 attempts = 6;
++}
+diff --git a/libhwsec/backend/storage.h b/libhwsec/backend/storage.h
+index 5c0a2933e1..beda2f9a68 100644
+--- a/libhwsec/backend/storage.h
++++ b/libhwsec/backend/storage.h
+@@ -19,6 +19,7 @@ namespace hwsec {
+ class Storage {
+  public:
+   struct ReadyState {
++    bool support = true;
+     // Can be prepared or not.
+     NoDefault<bool> preparable;
+     // Can be read or not.
+diff --git a/libhwsec/backend/tpm2/storage.cc b/libhwsec/backend/tpm2/storage.cc
+index 0eaa780595..172f774613 100644
+--- a/libhwsec/backend/tpm2/storage.cc
++++ b/libhwsec/backend/tpm2/storage.cc
+@@ -108,19 +108,6 @@ constexpr Attributes kEnterpriseRollbackRequireAttributes =
+     (1ULL << tpm_manager::NVRAM_READ_AUTHORIZATION) |
+     (1ULL << tpm_manager::NVRAM_WRITE_AUTHORIZATION);
+ 
+-bool CheckAttributes(const Attributes& require_attributes,
+-                     const Attributes& deny_attributes,
+-                     const Attributes& attributes) {
+-  if ((attributes & require_attributes) != require_attributes) {
+-    return false;
+-  }
+-
+-  if ((attributes & deny_attributes).any()) {
+-    return false;
+-  }
+-
+-  return true;
+-}
+ 
+ StatusOr<SpaceInfo> GetSpaceInfo(Space space) {
+   switch (space) {
+@@ -222,29 +209,6 @@ Status CheckAndRemoveDependency(
+   return OkStatus();
+ }
+ 
+-StatusOr<bool> HasOwnerPassword(
+-    org::chromium::TpmManagerProxyInterface& tpm_manager) {
+-  tpm_manager::GetTpmNonsensitiveStatusRequest status_request;
+-  tpm_manager::GetTpmNonsensitiveStatusReply status_reply;
+-
+-  if (brillo::ErrorPtr err; !tpm_manager.GetTpmNonsensitiveStatus(
+-          status_request, &status_reply, &err, Proxy::kDefaultDBusTimeoutMs)) {
+-    return MakeStatus<TPMError>(TPMRetryAction::kCommunication)
+-        .Wrap(std::move(err));
+-  }
+-
+-  RETURN_IF_ERROR(MakeStatus<TPMManagerError>(status_reply.status()));
+-
+-  if (!status_reply.is_owned()) {
+-    return MakeStatus<TPMError>("TPM is not owned", TPMRetryAction::kLater);
+-  }
+-
+-  if (!status_reply.is_owner_password_present()) {
+-    return false;
+-  }
+-
+-  return true;
+-}
+ 
+ struct DetailSpaceInfo {
+   uint32_t size = 0;
+@@ -280,118 +244,27 @@ StatusOr<DetailSpaceInfo> GetDetailSpaceInfo(
+   return result;
+ }
+ 
+-bool IsFWMP(Space space) {
+-  return space == Space::kFirmwareManagementParameters ||
+-         space == Space::kPlatformFirmwareManagementParameters;
+-}
+ 
+ }  // namespace
+ 
+ StatusOr<StorageTpm2::ReadyState> StorageTpm2::IsReadyInternal(Space space) {
+-  ASSIGN_OR_RETURN(const absl::flat_hash_set<uint32_t>& space_list,
+-                   List(tpm_nvram_),
+-                   _.WithStatus<TPMError>("Failed to list space"));
+-
+-  ASSIGN_OR_RETURN(const SpaceInfo& space_info, GetSpaceInfo(space));
+-
+-  DetailSpaceInfo detail_info;
+-  bool ready = false;
+-  bool space_exists = space_list.count(space_info.index);
+-  if (space_exists) {
+-    ASSIGN_OR_RETURN(detail_info, GetDetailSpaceInfo(tpm_nvram_, space_info),
+-                     _.WithStatus<TPMError>("Failed to get detail space info"));
+-
+-    ready = CheckAttributes(space_info.require_attributes,
+-                            space_info.deny_attributes, detail_info.attributes);
+-  }
+-
+-  ASSIGN_OR_RETURN(
+-      bool has_owner_pass, HasOwnerPassword(tpm_manager_),
+-      _.WithStatus<TPMError>("Failed to get owner password status"));
+-
+-  if (!ready) {
+-    if (!space_info.init_attributes.has_value()) {
+-      return MakeStatus<TPMError>("This space is not preparable",
+-                                  space_exists
+-                                      ? TPMRetryAction::kNoRetry
+-                                      : TPMRetryAction::kSpaceNotFound);
+-    }
+-
+-    if (!has_owner_pass) {
+-      // Nothing we can do under this kind of case.
+-      return MakeStatus<TPMError>(
+-          "No owner password", space_exists ? TPMRetryAction::kNoRetry
+-                                            : TPMRetryAction::kSpaceNotFound);
+-    }
+-
+-    return ReadyState{
+-        .preparable = true,
+-        .readable = false,
+-        .writable = false,
+-        .destroyable = true,
+-    };
+-  }
+-
+-  bool preparable = false;
+-  bool readable = !detail_info.is_read_locked;
+-  bool writable = !detail_info.is_write_locked;
+-  bool destroyable = has_owner_pass;
+-
+-  if (space_info.read_with_owner_auth && !has_owner_pass) {
+-    readable = false;
+-  }
+-
+-  if (space_info.write_with_owner_auth && !has_owner_pass) {
+-    writable = false;
+-  }
+-
+-  if (!writable && space_info.preparable_if_not_writable) {
+-    preparable = has_owner_pass;
+-  }
+-
+-  // Note: For platform FWMP, the correct timing to remove the owner dependency
+-  // is after finishing the first write command.
+-  // But currently there is no owner dependency for FWMP.
+-  if (!preparable && has_owner_pass) {
+-    RETURN_IF_ERROR(CheckAndRemoveDependency(tpm_manager_, space_info))
+-        .WithStatus<TPMError>("Failed to check and remove dependency");
+-  }
+-
+   return ReadyState{
+-      .preparable = preparable,
+-      .readable = readable,
+-      .writable = writable,
+-      .destroyable = destroyable,
++      .support = false,
++      .preparable = false,
++      .readable = false,
++      .writable = false,
++      .destroyable = false,
+   };
+ }
+ 
+ StatusOr<StorageTpm2::ReadyState> StorageTpm2::IsReady(Space space) {
+-  auto cache_it = state_cache_.find(space);
+-
+-  ReadyState state{
++  return ReadyState{
++      .support = false,
+       .preparable = false,
+       .readable = false,
+       .writable = false,
+       .destroyable = false,
+   };
+-
+-  if (cache_it != state_cache_.end()) {
+-    state = cache_it->second;
+-  } else {
+-    ASSIGN_OR_RETURN(state, IsReadyInternal(space));
+-  }
+-
+-  if (IsFWMP(space) &&
+-      (state.preparable || state.writable || state.destroyable) &&
+-      !CanModifyFWMP().value_or(false)) {
+-    state.preparable = false;
+-    state.writable = false;
+-    state.destroyable = false;
+-  }
+-
+-  state_cache_.insert_or_assign(space, state);
+-
+-  return state;
+ }
+ 
+ Status StorageTpm2::Prepare(Space space, uint32_t size) {
+diff --git a/libhwsec/factory/factory_impl.cc b/libhwsec/factory/factory_impl.cc
+index 90aea3cd9f..77853c65d8 100644
+--- a/libhwsec/factory/factory_impl.cc
++++ b/libhwsec/factory/factory_impl.cc
+@@ -7,6 +7,9 @@
+ #include <memory>
+ #include <utility>
+ 
++#include "libhwsec/frontend/pinweaver_manager/frontend_whale.h"
++#include "libhwsec/frontend/recovery_crypto/frontend_whale.h"
++
+ #include "libhwsec/backend/backend.h"
+ #include "libhwsec/factory/instr_profiling.h"
+ #include "libhwsec/frontend/arc_attestation/frontend_impl.h"
+@@ -48,12 +51,12 @@ std::unique_ptr<const CryptohomeFrontend> FactoryImpl::GetCryptohomeFrontend() {
+ 
+ std::unique_ptr<const PinWeaverManagerFrontend>
+ FactoryImpl::GetPinWeaverManagerFrontend() {
+-  return std::make_unique<PinWeaverManagerFrontendImpl>(middleware_.Derive());
++  return std::make_unique<PinWeaverManagerFrontendWhale>(middleware_.Derive());
+ }
+ 
+ std::unique_ptr<const RecoveryCryptoFrontend>
+ FactoryImpl::GetRecoveryCryptoFrontend() {
+-  return std::make_unique<RecoveryCryptoFrontendImpl>(middleware_.Derive());
++  return std::make_unique<RecoveryCryptoFrontendWhale>(middleware_.Derive());
+ }
+ 
+ std::unique_ptr<const ClientFrontend> FactoryImpl::GetClientFrontend() {
+diff --git a/libhwsec/frontend/cryptohome/frontend_impl.cc b/libhwsec/frontend/cryptohome/frontend_impl.cc
+index b2f82fe282..03fbb21814 100644
+--- a/libhwsec/frontend/cryptohome/frontend_impl.cc
++++ b/libhwsec/frontend/cryptohome/frontend_impl.cc
+@@ -8,6 +8,7 @@
+ #include <utility>
+ #include <vector>
+ 
++#include <brillo/whaleos_util.h>
+ #include <brillo/secure_blob.h>
+ #include <libhwsec-foundation/status/status_chain_macros.h>
+ 
+@@ -32,6 +33,9 @@ void CryptohomeFrontendImpl::RegisterOnReadyCallback(
+ }
+ 
+ StatusOr<bool> CryptohomeFrontendImpl::IsEnabled() const {
++  if (!brillo::IsWhalebook2Model()) {
++    return false;
++  }
+   return middleware_.CallSync<&Backend::State::IsEnabled>();
+ }
+ 
+@@ -191,7 +195,7 @@ StatusOr<uint32_t> CryptohomeFrontendImpl::GetManufacturer() const {
+ }
+ 
+ StatusOr<bool> CryptohomeFrontendImpl::IsPinWeaverEnabled() const {
+-  return middleware_.CallSync<&Backend::PinWeaver::IsEnabled>();
++  return true;
+ }
+ 
+ StatusOr<bool> CryptohomeFrontendImpl::IsBiometricsPinWeaverEnabled() const {
+diff --git a/libhwsec/frontend/pinweaver_manager/frontend_impl.cc b/libhwsec/frontend/pinweaver_manager/frontend_impl.cc
+index 08ccb20035..a24390c3e8 100644
+--- a/libhwsec/frontend/pinweaver_manager/frontend_impl.cc
++++ b/libhwsec/frontend/pinweaver_manager/frontend_impl.cc
+@@ -28,7 +28,10 @@ using StartBiometricsAuthReply = PinWeaverManager::StartBiometricsAuthReply;
+ using ResetType = PinWeaverManager::ResetType;
+ 
+ StatusOr<bool> PinWeaverManagerFrontendImpl::IsEnabled() const {
++//  return true;
++//#else
+   return middleware_.CallSync<&Backend::PinWeaver::IsEnabled>();
++//#endif
+ }
+ 
+ StatusOr<uint8_t> PinWeaverManagerFrontendImpl::GetVersion() const {
+diff --git a/libhwsec/frontend/pinweaver_manager/frontend_whale.cc b/libhwsec/frontend/pinweaver_manager/frontend_whale.cc
+new file mode 100644
+index 0000000000..853655b526
+--- /dev/null
++++ b/libhwsec/frontend/pinweaver_manager/frontend_whale.cc
+@@ -0,0 +1,481 @@
++// Copyright (c) 2024 NAVER Corp. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "libhwsec/frontend/pinweaver_manager/frontend_whale.h"
++
++#include <fcntl.h>
++
++#include <string>
++#include <optional>
++#include <utility>
++
++#include <base/check.h>
++#include <base/files/file_util.h>
++#include <base/logging.h>
++#include <libhwsec-foundation/crypto/aes.h>
++#include <libhwsec-foundation/crypto/scrypt.h>
++#include <libhwsec-foundation/crypto/secure_blob_util.h>
++#include <libhwsec-foundation/status/status_chain_macros.h>
++#include <openssl/evp.h>
++
++#include "libhwsec/backend/backend.h"
++#include "libhwsec/backend/pinweaver_manager/persistent_lookup_table.h"
++#include "libhwsec/error/pinweaver_error.h"
++#include "libhwsec/label_data.pb.h"
++#include "libhwsec/status.h"
++
++namespace {
++
++constexpr uint64_t kMaxLabel = 1 << 14;
++
++// Sync with cryptohome/auth_blocks/pin_weaver_auth_block.cc's
++constexpr uint32_t kAttemptsLimit = 5;
++constexpr uint32_t kInfiniteDelay = std::numeric_limits<uint32_t>::max();
++
++const char kLeCredsDir[] = "/home/.shadow/low_entropy_creds";
++
++constexpr struct {
++  uint32_t attempts;
++  uint32_t delay;
++} kDefaultDelaySchedule[] = {
++    {5, kInfiniteDelay},
++};
++
++}  // namespace
++
++using ::hwsec_foundation::GetSecureRandom;
++using ::hwsec_foundation::status::MakeStatus;
++using ::hwsec_foundation::status::OkStatus;
++
++namespace hwsec {
++
++using CheckCredentialReply = PinWeaverManager::CheckCredentialReply;
++using CredentialTreeResult = PinWeaverManagerFrontend::CredentialTreeResult;
++using DelaySchedule = PinWeaverManagerFrontend::DelaySchedule;
++using ErrorCode = PinWeaverError::PinWeaverErrorCode;
++using PinWeaverEccPoint = Backend::PinWeaver::PinWeaverEccPoint;
++using StartBiometricsAuthReply = PinWeaverManager::StartBiometricsAuthReply;
++
++PinWeaverManagerFrontendWhale::PinWeaverManagerFrontendWhale(
++    MiddlewareDerivative middleware_derivative)
++        : FrontendImpl(middleware_derivative),
++          plt_(base::FilePath(kLeCredsDir)) {
++  plt_.Init();
++}
++
++StatusOr<bool> PinWeaverManagerFrontendWhale::IsEnabled() const {
++  return true;
++}
++
++StatusOr<uint8_t> PinWeaverManagerFrontendWhale::GetVersion() const {
++  // It's fake TPM2 based.
++  return 2;
++}
++
++Status PinWeaverManagerFrontendWhale::Initialize() const {
++  return OkStatus();
++}
++
++Status PinWeaverManagerFrontendWhale::SyncHashTree() const {
++  return OkStatus();
++}
++
++StatusOr<bool> PinWeaverManagerFrontendWhale::HasAnyCredential() const {
++  std::vector<uint64_t> key_list;
++  plt_.GetUsedKeys(key_list);
++  return !key_list.empty();
++}
++
++StatusOr<uint64_t> PinWeaverManagerFrontendWhale::InsertCredential(
++    const std::vector<hwsec::OperationPolicySetting>& policies,
++    const brillo::SecureBlob& le_secret,
++    const brillo::SecureBlob& he_secret,
++    const brillo::SecureBlob& reset_secret,
++    const DelaySchedule& delay_sched,
++    std::optional<uint32_t> expiration_delay) const {
++  LOG(INFO) << "PWMFWhale::" <<  __func__;
++  std::optional<uint64_t> new_label = GetFreeLabel();
++  if (!new_label.has_value()) {
++    LOG(ERROR) << "Failed to get free label";
++    Status status = MakeStatus<PinWeaverError>(ErrorCode::kOther);
++    return status;
++  }
++
++  // Encrypt le_secret and he_secret.
++  brillo::Blob salt(
++      PKCS5_SALT_LEN, new_label.value() % std::numeric_limits<uint8_t>::max());
++  brillo::SecureBlob aes_key(hwsec_foundation::kDefaultAesKeySize);
++  if (!hwsec_foundation::PasskeyToAesKey(
++        le_secret, salt, hwsec_foundation::kDefaultPasswordRounds, &aes_key,
++        /* iv */ nullptr)) {
++    LOG(ERROR) << "Failed to encrypt secrets";
++    Status status = MakeStatus<PinWeaverError>(ErrorCode::kOther);
++    return status;
++  }
++  const auto le_iv = hwsec_foundation::CreateSecureRandomBlob(
++      hwsec_foundation::kAesBlockSize);
++  brillo::Blob encrypted_le_secret;
++  if (!hwsec_foundation::AesEncryptDeprecated(
++        le_secret, aes_key,
++        brillo::Blob(le_iv.begin(), le_iv.end()), &encrypted_le_secret)) {
++    LOG(ERROR) << "Failed to wrap le secret.";
++    Status status = MakeStatus<PinWeaverError>(ErrorCode::kOther);
++    return status;
++  }
++  const auto he_iv = hwsec_foundation::CreateSecureRandomBlob(
++      hwsec_foundation::kAesBlockSize);
++  brillo::Blob encrypted_he_secret;
++  if (!hwsec_foundation::AesEncryptDeprecated(
++        he_secret, aes_key,
++        brillo::Blob(he_iv.begin(), he_iv.end()), &encrypted_he_secret)) {
++    LOG(ERROR) << "Failed to wrap he secret.";
++    Status status = MakeStatus<PinWeaverError>(ErrorCode::kOther);
++    return status;
++  }
++
++  LabelData new_data;
++  new_data.set_le_secret(brillo::BlobToString(encrypted_le_secret));
++  new_data.set_le_iv(le_iv.to_string());
++  new_data.set_he_secret(brillo::BlobToString(encrypted_he_secret));
++  new_data.set_he_iv(he_iv.to_string());
++  new_data.set_reset_secret(reset_secret.to_string());
++  new_data.set_attempts(0);
++  if (!StoreToStorage(new_label.value(), new_data)) {
++    LOG(ERROR) << "Failed to store secrets.";
++    Status status = MakeStatus<PinWeaverError>(ErrorCode::kOther);
++    return status;
++  }
++
++  return new_label.value();
++}
++
++void PinWeaverManagerFrontendWhale::InsertCredentialAsync(
++    const std::vector<OperationPolicySetting>& policies,
++    const brillo::SecureBlob& le_secret,
++    const brillo::SecureBlob& he_secret,
++    const brillo::SecureBlob& reset_secret,
++    const DelaySchedule& delay_schedule,
++    std::optional<uint32_t> expiration_delay,
++    InsertCredentialCallback callback) const {
++  // FIXME(changwan.hong): Not async.
++  StatusOr<uint64_t> new_label = InsertCredential(policies,
++      le_secret, he_secret, reset_secret, delay_schedule, expiration_delay);
++  std::move(callback).Run(std::move(new_label));
++}
++
++StatusOr<CheckCredentialReply>
++PinWeaverManagerFrontendWhale::CheckCredential(
++    uint64_t label,
++    const brillo::SecureBlob& le_secret) const {
++  LOG(INFO) <<  "PWMFWhale::" << __func__;
++  std::vector<uint8_t> merged_blob;
++  PLTError ret_val = plt_.GetValue(label, merged_blob);
++  if (ret_val == PLT_KEY_NOT_FOUND) {
++    LOG(ERROR) << "Not found key: " << label << " in PLT.";
++    Status status = MakeStatus<PinWeaverError>(ErrorCode::kOther);
++    return status;
++  }
++  if (ret_val != PLT_SUCCESS) {
++    LOG(ERROR) << "Couldn't get key: " << label << " in PLT.";
++    Status status = MakeStatus<PinWeaverError>(ErrorCode::kOther);
++    return status;
++  }
++
++  LabelData data;
++  if (!data.ParseFromArray(merged_blob.data(), merged_blob.size())) {
++    LOG(ERROR) << "Couldn't deserialize data for label " << label;
++    Status status = MakeStatus<PinWeaverError>(ErrorCode::kOther);
++    return status;
++  }
++
++  // Decrypt le_secret.
++  brillo::Blob salt(PKCS5_SALT_LEN,
++                    label % std::numeric_limits<uint8_t>::max());
++  brillo::SecureBlob aes_key(hwsec_foundation::kDefaultAesKeySize);
++  if (!hwsec_foundation::PasskeyToAesKey(
++        le_secret, salt, hwsec_foundation::kDefaultPasswordRounds, &aes_key,
++        /* iv */ nullptr)) {
++    LOG(ERROR) << "Failed to get aes key.";
++    Status status = MakeStatus<PinWeaverError>(ErrorCode::kOther);
++    return status;
++  }
++  brillo::Blob le_secret_saved(data.le_secret().begin(),
++                               data.le_secret().end());
++  brillo::Blob le_iv(data.le_iv().begin(),
++                     data.le_iv().end());
++  brillo::SecureBlob decrypted_le_secret;
++  if (!hwsec_foundation::AesDecryptDeprecated(le_secret_saved, aes_key, le_iv,
++                                              &decrypted_le_secret)) {
++    LOG(ERROR) << "Failed to unwrap le secret.";
++    Status status = MakeStatus<PinWeaverError>(ErrorCode::kOther);
++    return status;
++  }
++
++  if (le_secret != decrypted_le_secret) {
++    LOG(ERROR) << " Incorrect le secret.";
++    // Increase wrong attempts.
++    if (RemoveCredential(label).ok()) {
++      LOG(ERROR) << " Increase wrong attempts "
++          << " current attempts: " << data.attempts();
++      data.set_attempts(data.attempts() + 1);
++      StoreToStorage(label, data);
++    }
++    Status status = MakeStatus<PinWeaverError>(ErrorCode::kInvalidLeSecret);
++    return status;
++  }
++
++  // Decrypt he_secret.
++  brillo::Blob he_secret_saved(data.he_secret().begin(),
++                               data.he_secret().end());
++  brillo::Blob he_iv(data.he_iv().begin(),
++                     data.he_iv().end());
++  brillo::SecureBlob decrypted_he_secret;
++  if (!hwsec_foundation::AesDecryptDeprecated(he_secret_saved, aes_key, he_iv,
++                                            &decrypted_he_secret)) {
++    LOG(ERROR) << "Failed to unwrap he secret.";
++    Status status = MakeStatus<PinWeaverError>(ErrorCode::kOther);
++    return status;
++  }
++
++  brillo::SecureBlob reset_secret(data.reset_secret().begin(),
++                                  data.reset_secret().end());
++
++  return CheckCredentialReply{
++      .he_secret = decrypted_he_secret,
++      .reset_secret = reset_secret,
++  };
++}
++
++void PinWeaverManagerFrontendWhale::CheckCredentialAsync(
++    const uint64_t label,
++    const brillo::SecureBlob& le_secret,
++    CheckCredentialCallback callback) const {
++  // FIXME(changwan.hong): Not async.
++  StatusOr<CheckCredentialReply> reply = CheckCredential(label, le_secret);
++  std::move(callback).Run(std::move(reply));
++}
++
++Status PinWeaverManagerFrontendWhale::RemoveCredential(
++    const uint64_t label) const {
++  LOG(INFO) <<  "PWMFWhale::" << __func__;
++  if (plt_.RemoveKey(label) != PLT_SUCCESS) {
++    LOG(ERROR) << "Couldn't remove label: " << label << " in PLT.";
++    Status status = MakeStatus<PinWeaverError>(ErrorCode::kOther);
++    return status;
++  }
++
++  return OkStatus();
++}
++
++void PinWeaverManagerFrontendWhale::RemoveCredentialAsync(
++    const uint64_t label, RemoveCredentialCallback callback) const {
++  // FIXME(changwan.hong): Not async.
++  Status status = RemoveCredential(label);
++  std::move(callback).Run(std::move(status));
++}
++
++Status PinWeaverManagerFrontendWhale::ResetCredential(
++    uint64_t label,
++    const brillo::SecureBlob& reset_secret,
++    ResetType reset_type /* unused */) const {
++  LOG(INFO) <<  "PWMFWhale::" << __func__;
++  std::vector<uint8_t> merged_blob;
++  PLTError ret_val = plt_.GetValue(label, merged_blob);
++  if (ret_val == PLT_KEY_NOT_FOUND) {
++    LOG(ERROR) << "Not found key: " << label << " in PLT.";
++    Status status = MakeStatus<PinWeaverError>(ErrorCode::kOther);
++    return status;
++  }
++  if (ret_val != PLT_SUCCESS) {
++    LOG(ERROR) << "Couldn't get key: " << label << " in PLT.";
++    Status status = MakeStatus<PinWeaverError>(ErrorCode::kOther);
++    return status;
++  }
++  LabelData data;
++  if (!data.ParseFromArray(merged_blob.data(), merged_blob.size())) {
++    LOG(ERROR) << "Couldn't deserialize data for label " << label;
++    Status status = MakeStatus<PinWeaverError>(ErrorCode::kOther);
++    return status;
++  }
++  brillo::SecureBlob reset_secret_saved(data.reset_secret().begin(),
++                                        data.reset_secret().end());
++  if (reset_secret != reset_secret_saved) {
++    LOG(ERROR) << " Incorrect reset secret.";
++    Status status = MakeStatus<PinWeaverError>(ErrorCode::kInvalidResetSecret);
++    return status;
++  }
++  return OkStatus();
++}
++
++void PinWeaverManagerFrontendWhale::ResetCredentialAsync(
++    const uint64_t label,
++    const brillo::SecureBlob& reset_secret,
++    ResetType reset_type,
++    ResetCredentialCallback callback) const {
++  // FIXME(changwan.hong): Not async.
++  Status status = ResetCredential(label, reset_secret, reset_type);
++  std::move(callback).Run(std::move(status));
++}
++
++StatusOr<uint32_t> PinWeaverManagerFrontendWhale::GetWrongAuthAttempts(
++    const uint64_t label) const {
++  LOG(INFO) <<  "PWMFWhale::" << __func__;
++  std::vector<uint8_t> merged_blob;
++  PLTError ret_val = plt_.GetValue(label, merged_blob);
++  if (ret_val == PLT_KEY_NOT_FOUND) {
++    LOG(ERROR) << "Not found key: " << label << " in PLT.";
++    return 0;
++  }
++  if (ret_val != PLT_SUCCESS) {
++    LOG(ERROR) << "Couldn't get key: " << label << " in PLT.";
++    return 0;
++  }
++
++  LabelData data;
++  if (!data.ParseFromArray(merged_blob.data(), merged_blob.size())) {
++    LOG(ERROR) << "Couldn't deserialize data for label " << label;
++    return 0;
++  }
++
++  return data.attempts();
++}
++
++StatusOr<DelaySchedule> PinWeaverManagerFrontendWhale::GetDelaySchedule(
++    const uint64_t label) const {
++  std::map<uint32_t, uint32_t> delay_sched;
++  for (const auto& entry : kDefaultDelaySchedule) {
++    delay_sched[entry.attempts] = entry.delay;
++  }
++
++  hwsec::StatusOr<DelaySchedule> result = delay_sched;
++  if (!result.ok()) {
++    LOG(INFO) <<  "PWMFWhale::" << __func__ << " not reached.";
++    Status status = MakeStatus<PinWeaverError>(ErrorCode::kOther);
++    return status;
++  }
++
++  return result.value();
++}
++
++
++StatusOr<uint32_t> PinWeaverManagerFrontendWhale::GetDelayInSeconds(
++    const uint64_t label) const {
++  ASSIGN_OR_RETURN(uint64_t wrong_attempts, GetWrongAuthAttempts(label));
++  if (wrong_attempts > kAttemptsLimit) {
++    return kInfiniteDelay;
++  }
++
++  return 0;
++}
++
++StatusOr<std::optional<uint32_t>>
++PinWeaverManagerFrontendWhale::GetExpirationInSeconds(
++    const uint64_t label) const {
++  LOG(ERROR) << "PWMFWhale::" <<  __func__ << " not supported.";
++  return std::nullopt;
++}
++
++StatusOr<PinWeaverEccPoint> PinWeaverManagerFrontendWhale::GeneratePk(
++    AuthChannel auth_channel, const PinWeaverEccPoint& client_public_key) const {
++  // Something biometrics.
++  LOG(ERROR) << "PWMFWhale::" <<  __func__ << " not supported.";
++  Status status = MakeStatus<PinWeaverError>(ErrorCode::kOther);
++  return status;
++}
++
++StatusOr<uint64_t> PinWeaverManagerFrontendWhale::InsertRateLimiter(
++    AuthChannel auth_channel,
++    const std::vector<hwsec::OperationPolicySetting>& policies,
++    const brillo::SecureBlob& reset_secret,
++    const DelaySchedule& delay_sched,
++    std::optional<uint32_t> expiration_delay) const {
++  LOG(ERROR) << "PWMFWhale::" <<  __func__ << " not supported.";
++  Status status = MakeStatus<PinWeaverError>(ErrorCode::kOther);
++  return status;
++}
++
++void PinWeaverManagerFrontendWhale::InsertRateLimiterAsync(
++    AuthChannel auth_channel,
++    const std::vector<OperationPolicySetting>& policies,
++    const brillo::SecureBlob& reset_secret,
++    const DelaySchedule& delay_schedule,
++    std::optional<uint32_t> expiration_delay,
++    InsertRateLimiterCallback callback) const {
++  // FIXME(changwan.hong): Not async.
++  StatusOr<uint64_t> ret = InsertRateLimiter(auth_channel,
++      policies, reset_secret, delay_schedule, expiration_delay);
++  std::move(callback).Run(std::move(ret));
++}
++
++StatusOr<StartBiometricsAuthReply>
++PinWeaverManagerFrontendWhale::StartBiometricsAuth(
++    AuthChannel auth_channel,
++    uint64_t label,
++    const brillo::Blob& client_nonce) const {
++  // Something biometrics.
++  LOG(ERROR) << "PWMFWhale::" <<  __func__ << " not supported.";
++  Status status = MakeStatus<PinWeaverError>(ErrorCode::kOther);
++  return status;
++}
++
++void PinWeaverManagerFrontendWhale::StartBiometricsAuthAsync(
++    AuthChannel auth_channel,
++    const uint64_t label,
++    const brillo::Blob& client_nonce,
++    StartBiometricsAuthCallback callback) const {
++  // FIXME(changwan.hong): Not async.
++  StatusOr<StartBiometricsAuthReply> reply = StartBiometricsAuth(
++      auth_channel, label, client_nonce);
++  std::move(callback).Run(std::move(reply));
++}
++
++Status PinWeaverManagerFrontendWhale::BlockGeneratePk() const {
++  // Something biometrics.
++  LOG(ERROR) << "PWMFWhale::" <<  __func__ << " not supported.";
++  Status status = MakeStatus<PinWeaverError>(ErrorCode::kOther);
++  return status;
++}
++
++std::optional<uint64_t> PinWeaverManagerFrontendWhale::GetFreeLabel() const {
++  std::vector<uint64_t> used_keys;
++  plt_.GetUsedKeys(used_keys);
++  uint64_t num_free_keys = kMaxLabel - used_keys.size();
++  if (num_free_keys <= 0) {
++    // No more labels.
++    return std::nullopt;
++  }
++
++  uint64_t new_label;
++  GetSecureRandom(reinterpret_cast<unsigned char*>(&new_label),
++                  sizeof(new_label));
++  new_label %= num_free_keys;
++  std::sort(used_keys.begin(), used_keys.end());
++  for (uint64_t used_key : used_keys) {
++    if (used_key > new_label) {
++      break;
++    }
++    new_label++;
++  }
++  CHECK_LT(new_label, kMaxLabel);
++  CHECK(!plt_.KeyExists(new_label));
++
++  return new_label;
++}
++
++bool PinWeaverManagerFrontendWhale::StoreToStorage(
++    uint64_t label, LabelData& label_data) const {
++  std::vector<uint8_t> merged_blob(label_data.ByteSizeLong());
++  if (!label_data.SerializeToArray(merged_blob.data(), merged_blob.size())) {
++    LOG(ERROR) << "Couldn't serialize leaf data, label: " << label;
++    return false;
++  }
++  if (plt_.StoreValue(label, merged_blob) != PLT_SUCCESS) {
++    LOG(ERROR) << "Couldn't store label: " << label << " in PLT.";
++    return false;
++  }
++
++  return true;
++}
++
++}  // namespace hwsec
+diff --git a/libhwsec/frontend/pinweaver_manager/frontend_whale.h b/libhwsec/frontend/pinweaver_manager/frontend_whale.h
+new file mode 100644
+index 0000000000..a1f32097f2
+--- /dev/null
++++ b/libhwsec/frontend/pinweaver_manager/frontend_whale.h
+@@ -0,0 +1,110 @@
++// Copyright (c) 2024 NAVER Corp. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef LIBHWSEC_FRONTEND_PINWEAVER_MANAGER_FRONTEND_IMPL_H_
++#define LIBHWSEC_FRONTEND_PINWEAVER_MANAGER_FRONTEND_IMPL_H_
++
++#include <cstdint>
++#include <optional>
++#include <vector>
++
++#include <brillo/secure_blob.h>
++
++#include "libhwsec/backend/pinweaver_manager/persistent_lookup_table.h"
++#include "libhwsec/frontend/frontend_impl.h"
++#include "libhwsec/frontend/pinweaver_manager/frontend.h"
++#include "libhwsec/label_data.pb.h"
++#include "libhwsec/status.h"
++#include "libhwsec/structures/operation_policy.h"
++
++namespace hwsec {
++
++class PinWeaverManagerFrontendWhale : public PinWeaverManagerFrontend,
++                                      public FrontendImpl {
++ public:
++  explicit PinWeaverManagerFrontendWhale(
++      MiddlewareDerivative middleware_derivative);
++  ~PinWeaverManagerFrontendWhale() override = default;
++
++  StatusOr<bool> IsEnabled() const override;
++  StatusOr<uint8_t> GetVersion() const override;
++  Status Initialize() const override;
++  Status SyncHashTree() const override;
++  StatusOr<bool> HasAnyCredential() const override;
++  StatusOr<uint64_t> InsertCredential(
++      const std::vector<OperationPolicySetting>& policies,
++      const brillo::SecureBlob& le_secret,
++      const brillo::SecureBlob& he_secret,
++      const brillo::SecureBlob& reset_secret,
++      const DelaySchedule& delay_schedule,
++      std::optional<uint32_t> expiration_delay) const override;
++  void InsertCredentialAsync(
++      const std::vector<OperationPolicySetting>& policies,
++      const brillo::SecureBlob& le_secret,
++      const brillo::SecureBlob& he_secret,
++      const brillo::SecureBlob& reset_secret,
++      const DelaySchedule& delay_schedule,
++      std::optional<uint32_t> expiration_delay,
++      InsertCredentialCallback callback) const override;
++  StatusOr<CheckCredentialReply> CheckCredential(
++      const uint64_t label, const brillo::SecureBlob& le_secret) const override;
++  void CheckCredentialAsync(const uint64_t label,
++                            const brillo::SecureBlob& le_secret,
++                            CheckCredentialCallback callback) const override;
++  Status RemoveCredential(const uint64_t label) const override;
++  void RemoveCredentialAsync(const uint64_t label,
++                             RemoveCredentialCallback callback) const override;
++  Status ResetCredential(const uint64_t label,
++                         const brillo::SecureBlob& reset_secret,
++                         ResetType reset_type) const override;
++  void ResetCredentialAsync(const uint64_t label,
++                            const brillo::SecureBlob& reset_secret,
++                            ResetType reset_type,
++                            ResetCredentialCallback callback) const override;
++  StatusOr<uint32_t> GetWrongAuthAttempts(const uint64_t label) const override;
++  StatusOr<DelaySchedule> GetDelaySchedule(const uint64_t label) const override;
++  StatusOr<uint32_t> GetDelayInSeconds(const uint64_t label) const override;
++  StatusOr<std::optional<uint32_t>> GetExpirationInSeconds(
++      const uint64_t label) const override;
++  StatusOr<PinWeaverEccPoint> GeneratePk(
++      AuthChannel auth_channel,
++      const PinWeaverEccPoint& client_public_key) const override;
++  StatusOr<uint64_t> InsertRateLimiter(
++      AuthChannel auth_channel,
++      const std::vector<OperationPolicySetting>& policies,
++      const brillo::SecureBlob& reset_secret,
++      const DelaySchedule& delay_schedule,
++      std::optional<uint32_t> expiration_delay) const override;
++  void InsertRateLimiterAsync(
++      AuthChannel auth_channel,
++      const std::vector<OperationPolicySetting>& policies,
++      const brillo::SecureBlob& reset_secret,
++      const DelaySchedule& delay_schedule,
++      std::optional<uint32_t> expiration_delay,
++      InsertRateLimiterCallback callback) const override;
++  StatusOr<StartBiometricsAuthReply> StartBiometricsAuth(
++      AuthChannel auth_channel,
++      const uint64_t label,
++      const brillo::Blob& client_nonce) const override;
++  void StartBiometricsAuthAsync(
++      AuthChannel auth_channel,
++      const uint64_t label,
++      const brillo::Blob& client_nonce,
++      StartBiometricsAuthCallback callback) const override;
++  Status BlockGeneratePk() const override;
++
++ private:
++  std::optional<uint64_t> GetFreeLabel() const;
++  bool StoreToStorage(uint64_t label, LabelData& label_data) const;
++
++  // This is used to actually store and retrieve data from the backing disk
++  // storage.
++  // Hack for const method.
++  mutable PersistentLookupTable plt_;
++
++};
++
++}  // namespace hwsec
++
++#endif  // LIBHWSEC_FRONTEND_PINWEAVER_MANAGER_FRONTEND_IMPL_H_
+diff --git a/libhwsec/frontend/recovery_crypto/frontend_whale.cc b/libhwsec/frontend/recovery_crypto/frontend_whale.cc
+new file mode 100644
+index 0000000000..f0406b7e59
+--- /dev/null
++++ b/libhwsec/frontend/recovery_crypto/frontend_whale.cc
+@@ -0,0 +1,129 @@
++// Copyright (c) 2024 NAVER Corp. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "libhwsec/frontend/recovery_crypto/frontend_whale.h"
++
++#include <optional>
++#include <utility>
++#include <vector>
++
++#include <brillo/secure_blob.h>
++
++#include "libhwsec/backend/backend.h"
++#include "libhwsec/middleware/middleware.h"
++#include "libhwsec/status.h"
++
++#include <libhwsec-foundation/crypto/big_num_util.h>
++#include <libhwsec-foundation/crypto/ecdh_hkdf.h>
++#include <libhwsec-foundation/crypto/secure_blob_util.h>
++#include <libhwsec-foundation/crypto/sha.h>
++#include <libhwsec-foundation/status/status_chain_macros.h>
++#include <openssl/bn.h>
++#include <openssl/ec.h>
++#include <openssl/rsa.h>
++#include <openssl/x509.h>
++
++using hwsec_foundation::BigNumToSecureBlob;
++using hwsec_foundation::ComputeEcdhSharedSecretPoint;
++using hwsec_foundation::CreateBigNumContext;
++using hwsec_foundation::CreateSecureRandomBlob;
++using hwsec_foundation::ScopedBN_CTX;
++using hwsec_foundation::SecureBlobToBigNum;
++using hwsec_foundation::Sha256;
++using hwsec_foundation::status::MakeStatus;
++
++namespace hwsec {
++
++StatusOr<std::optional<brillo::SecureBlob>>
++RecoveryCryptoFrontendWhale::GenerateKeyAuthValue() const {
++  LOG(INFO) << "RecoveryCryptoFrontendWhale::" << __func__ << " " << __LINE__;
++  return std::nullopt;
++}
++
++StatusOr<EncryptEccPrivateKeyResponse> RecoveryCryptoFrontendWhale::EncryptEccPrivateKey(
++    EncryptEccPrivateKeyRequest request) const {
++  LOG(INFO) << "RecoveryCryptoFrontendWhale::" << __func__ << " " << __LINE__;
++  if (request.own_key_pair == nullptr) {
++    return MakeStatus<TPMError>("The key pair cannot be null",
++                                TPMRetryAction::kNoRetry);
++  }
++
++  const BIGNUM* own_priv_key_bn =
++      EC_KEY_get0_private_key(request.own_key_pair.get());
++  if (!own_priv_key_bn || !request.ec.IsScalarValid(*own_priv_key_bn)) {
++    return MakeStatus<TPMError>("Scalar is not valid",
++                                TPMRetryAction::kNoRetry);
++  }
++  // Convert one's own private key to blob.
++  brillo::SecureBlob own_priv_key;
++  if (!BigNumToSecureBlob(*own_priv_key_bn, request.ec.ScalarSizeInBytes(),
++                          &own_priv_key)) {
++    return MakeStatus<TPMError>("Failed to convert BIGNUM to SecureBlob",
++                                TPMRetryAction::kNoRetry);
++  }
++
++  return EncryptEccPrivateKeyResponse{
++      .encrypted_own_priv_key =
++          brillo::Blob(own_priv_key.begin(), own_priv_key.end()),
++  };
++}
++
++StatusOr<crypto::ScopedEC_POINT>
++RecoveryCryptoFrontendWhale::GenerateDiffieHellmanSharedSecret(
++    GenerateDhSharedSecretRequest request) const {
++  LOG(INFO) << "RecoveryCryptoFrontendWhale::" << __func__ << " " << __LINE__;
++  if (request.others_pub_point == nullptr) {
++    return MakeStatus<TPMError>("The public point cannot be null",
++                                TPMRetryAction::kNoRetry);
++  }
++
++  ScopedBN_CTX context = CreateBigNumContext();
++  if (!context.get()) {
++    return MakeStatus<TPMError>("Failed to allocate BN_CTX structure",
++                                TPMRetryAction::kNoRetry);
++  }
++
++  // changwan.hong: It never be sealed. See original code:
++  // libhwsec/backend/tpm1/recovery_crypto.cc
++  brillo::SecureBlob unencrypted_own_priv_key;
++  unencrypted_own_priv_key =
++      brillo::SecureBlob(request.encrypted_own_priv_key);
++
++  crypto::ScopedBIGNUM unencrypted_own_priv_key_bn =
++      SecureBlobToBigNum(unencrypted_own_priv_key);
++  if (!unencrypted_own_priv_key_bn) {
++    return MakeStatus<TPMError>(
++        "Failed to convert unencrypted_own_priv_key to BIGNUM",
++        TPMRetryAction::kNoRetry);
++  }
++
++  // Calculate the shared secret from one's own private key and the other
++  // party's public key
++  crypto::ScopedEC_POINT point_dh = ComputeEcdhSharedSecretPoint(
++      request.ec, *request.others_pub_point, *unencrypted_own_priv_key_bn);
++  if (!point_dh) {
++    return MakeStatus<TPMError>(
++        "Failed to compute shared point from others_pub_point and "
++        "unencrypted_own_priv_key_bn",
++        TPMRetryAction::kNoRetry);
++  }
++
++  return point_dh;
++}
++
++StatusOr<std::optional<RecoveryCryptoRsaKeyPair>>
++RecoveryCryptoFrontendWhale::GenerateRsaKeyPair() const {
++  LOG(INFO) << "RecoveryCryptoFrontendWhale::" << __func__ << " " << __LINE__;
++  return std::nullopt;
++}
++
++StatusOr<std::optional<brillo::Blob>> RecoveryCryptoFrontendWhale::SignRequestPayload(
++    const brillo::Blob& encrypted_rsa_private_key,
++    const brillo::Blob& request_payload) const {
++  LOG(INFO) << "RecoveryCryptoFrontendWhale::" << __func__ << " " << __LINE__;
++  return std::nullopt;
++}
++
++}  // namespace hwsec
++
+diff --git a/libhwsec/frontend/recovery_crypto/frontend_whale.h b/libhwsec/frontend/recovery_crypto/frontend_whale.h
+new file mode 100644
+index 0000000000..8908be03a2
+--- /dev/null
++++ b/libhwsec/frontend/recovery_crypto/frontend_whale.h
+@@ -0,0 +1,42 @@
++// Copyright (c) 2024 NAVER Corp. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef LIBHWSEC_FRONTEND_RECOVERY_CRYPTO_FRONTEND_WHALE_H_
++#define LIBHWSEC_FRONTEND_RECOVERY_CRYPTO_FRONTEND_WHALE_H_
++
++#include <optional>
++#include <vector>
++
++#include <brillo/secure_blob.h>
++
++#include "libhwsec/frontend/frontend_impl.h"
++#include "libhwsec/frontend/recovery_crypto/frontend.h"
++#include "libhwsec/status.h"
++#include "libhwsec/structures/operation_policy.h"
++
++namespace hwsec {
++
++// Mimic libhwsec/backend/tpm1/recovery_crypto.cc
++class RecoveryCryptoFrontendWhale : public RecoveryCryptoFrontend,
++                                    public FrontendImpl {
++ public:
++  using FrontendImpl::FrontendImpl;
++  ~RecoveryCryptoFrontendWhale() override = default;
++
++  StatusOr<std::optional<brillo::SecureBlob>> GenerateKeyAuthValue()
++      const override;
++  StatusOr<EncryptEccPrivateKeyResponse> EncryptEccPrivateKey(
++      EncryptEccPrivateKeyRequest request) const override;
++  StatusOr<crypto::ScopedEC_POINT> GenerateDiffieHellmanSharedSecret(
++      GenerateDhSharedSecretRequest request) const override;
++  StatusOr<std::optional<RecoveryCryptoRsaKeyPair>> GenerateRsaKeyPair()
++      const override;
++  StatusOr<std::optional<brillo::Blob>> SignRequestPayload(
++      const brillo::Blob& encrypted_rsa_private_key,
++      const brillo::Blob& request_payload) const override;
++};
++
++}  // namespace hwsec
++
++#endif  // LIBHWSEC_FRONTEND_RECOVERY_CRYPTO_FRONTEND_WHALE_H_
+diff --git a/libhwsec/middleware/middleware_owner.cc b/libhwsec/middleware/middleware_owner.cc
+index 36240b6cdc..4e172e911f 100644
+--- a/libhwsec/middleware/middleware_owner.cc
++++ b/libhwsec/middleware/middleware_owner.cc
+@@ -8,6 +8,8 @@
+ #include <optional>
+ #include <utility>
+ 
++#include <brillo/whaleos_util.h>
++
+ #include <base/functional/callback.h>
+ #include <base/functional/callback_helpers.h>
+ #include <base/logging.h>
+@@ -111,6 +113,15 @@ void MiddlewareOwner::InitBackend() {
+ 
+   metrics_ = std::make_unique<Metrics>();
+ 
++  // For devices without TPM, skip proxy initialization
++  // This avoids the 30-second timeout waiting for TPM services
++  if (brillo::IsNoTpmModel()) {
++    LOG(INFO) << "Known non-TPM model detected, skipping hwsec backend initialization";
++    // Don't initialize proxy or backend for non-TPM devices
++    // The frontend will handle the missing backend gracefully
++    return;
++  }
++
+   TPM_SELECT_BEGIN;
+   TPM1_SECTION({
+     auto proxy = std::make_unique<ProxyImpl>();

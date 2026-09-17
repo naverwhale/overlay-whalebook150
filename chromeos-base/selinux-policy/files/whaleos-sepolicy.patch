@@ -1,0 +1,97 @@
+diff --git a/sepolicy/file_contexts/chromeos_file_contexts b/sepolicy/file_contexts/chromeos_file_contexts
+index 5ab73540de..4255e3dd08 100644
+--- a/sepolicy/file_contexts/chromeos_file_contexts
++++ b/sepolicy/file_contexts/chromeos_file_contexts
+@@ -174,6 +174,13 @@ include(sepolicy/file_contexts/sysfs_contexts)
+ /usr/bin/ureadahead-diff        u:object_r:cros_ureadahead_diff_exec:s0
+ # USR_BIN_END_HERE
+ 
++# WhaleOS Waydroid lxc-start wrapper: see policy/chromeos/whaleos_waydroid.te.
++# We label this Waydroid-only wrapper instead of /usr/bin/lxc-start so the
++# domain transition into whaleos_waydroid only fires for Waydroid invocations
++# (other LXC users on the host keep their original domain).
++/usr/lib/waydroid/bin/lxc-start u:object_r:whaleos_waydroid_exec:s0
++/usr/lib/waydroid/bin/waydroid_lxc_start u:object_r:whaleos_waydroid_exec:s0
++
+ # USR_SBIN_START_HERE
+ /usr/sbin/ModemManager          u:object_r:cros_modem_manager_exec:s0
+ /usr/sbin/accelerator-logs      u:object_r:cros_accelerator_logs_exec:s0
+diff --git a/sepolicy/policy/chromeos/cros_cryptohomed.te b/sepolicy/policy/chromeos/cros_cryptohomed.te
+index 2c5107bd00..6460b49d40 100644
+--- a/sepolicy/policy/chromeos/cros_cryptohomed.te
++++ b/sepolicy/policy/chromeos/cros_cryptohomed.te
+@@ -20,7 +20,11 @@ allow cros_cryptohomed cros_cryptohome_namespace_mounter:process {
+ allow cros_cryptohomed cros_cryptohomed:fifo_file w_file_perms;
+ 
+ #Access rule for devices without ARC (e.g. Flex)
+-allow cros_cryptohomed cros_downloads_file:dir relabelfrom;
++# Transition-only (ARC++ removal): stale ARC labels on ~/Downloads files need
++# file-class relabel at mount-time restorecon. Remove this and restore the
++# original line below once migration is done and no stale labels remain.
++#allow cros_cryptohomed cros_downloads_file:dir relabelfrom;
++allow cros_cryptohomed cros_downloads_file:{ dir file } { relabelfrom relabelto };
+ allow cros_cryptohomed cros_home_shadow_uid_root_android:dir relabelto;
+ 
+ allow cros_cryptohomed {
+diff --git a/sepolicy/policy/chromeos/file.te b/sepolicy/policy/chromeos/file.te
+index afae155a82..4a7be99bca 100644
+--- a/sepolicy/policy/chromeos/file.te
++++ b/sepolicy/policy/chromeos/file.te
+@@ -233,6 +233,8 @@ type cros_vmlog_forwarder_exec, exec_type, file_type, cros_file_type, cros_syste
+ type cros_vshd_exec, exec_type, file_type, cros_file_type, cros_system_file_type;
+ type cros_vtpmd_exec, exec_type, file_type, cros_file_type, cros_system_file_type;
+ type cros_wpa_supplicant_exec, exec_type, file_type, cros_file_type, cros_system_file_type;
++# WhaleOS Waydroid LXC payload (see policy/chromeos/whaleos_waydroid.te).
++type whaleos_waydroid_exec, exec_type, file_type, cros_file_type, cros_system_file_type;
+ # SYSTEM_EXE_END_HERE
+ 
+ type cros_home, file_type, cros_file_type, cros_home_file_type;
+diff --git a/sepolicy/policy/chromeos/whaleos_waydroid.te b/sepolicy/policy/chromeos/whaleos_waydroid.te
+new file mode 100644
+index 0000000000..42e3b2f837
+--- /dev/null
++++ b/sepolicy/policy/chromeos/whaleos_waydroid.te
+@@ -0,0 +1,43 @@
++# SELinux domain for the WhaleOS-native Waydroid LXC payload.
++#
++# WhaleOS (a ChromeOS fork) integrates Waydroid directly via LXC 5.x,
++# independent of Google's ARC++/ARCVM stack.  Keep this domain in the
++# `whaleos_*` namespace to make that ownership explicit -- it does not
++# share lifecycle, code paths, or maintainership with cros_arc_*.
++#
++# /usr/lib/waydroid/bin/lxc-start (a Waydroid-only wrapper that
++# execs /usr/bin/lxc-start) is labeled whaleos_waydroid_exec.  The
++# waydroid-container / waydroid-session upstart jobs prepend the
++# wrapper directory to PATH, so Waydroid's Python helpers'
++# `subprocess.Popen(["lxc-start", ...])` resolve to the labeled
++# wrapper and only Waydroid invocations transition into this
++# domain.  /usr/bin/lxc-start itself is *not* labeled so other
++# LXC users on the host (e.g. dev-mode debugging containers) keep
++# their original domain and aren't pulled into ours.
++#
++# This gives us a single, targeted handle for granting host-resource
++# access (e.g. CRAS) instead of the previous shotgun `setenforce 0`.
++type whaleos_waydroid, domain, chromeos_domain, cros_miscdomain, mlstrustedsubject;
++
++# Start out permissive so any remaining denials surface as audit log
++# entries we can iterate on instead of breaking the container.  Drop
++# this line once we've collected and granted the full set.
++permissive whaleos_waydroid;
++
++# Transition into this domain when the waydroid-container upstart job
++# (running as cros_init / cros_init_scripts) execs lxc-start, and when
++# our root-only diagnostic / cleanup helpers exec it too.
++domain_auto_trans({cros_init cros_init_scripts chromeos}, whaleos_waydroid_exec, whaleos_waydroid)
++
++# CRAS client: container audioserver (uid 1041, inside Waydroid)
++# connects to /run/cras/.cras_socket via the LXC bind-mount that
++# 0006-cras-audio-support.patch sets up.  This grants the same
++# allow-set that any other ChromeOS CRAS client (e.g. cras_test_client)
++# already gets, scoped narrowly to this domain.
++cros_cras_client(whaleos_waydroid)
++
++# Inherited fds / log routing.  Mirrors what cros_arc_setup.te needs
++# so log messages from container init / fatal aborts surface in the
++# host's syslog instead of being silently dropped.
++allow whaleos_waydroid cros_init_scripts:fd use;
++log_writer(whaleos_waydroid)

@@ -1,0 +1,115 @@
+diff --git a/vtpm/commands/virtualizer.cc b/vtpm/commands/virtualizer.cc
+index df25a8c04c..eb42b9a016 100644
+--- a/vtpm/commands/virtualizer.cc
++++ b/vtpm/commands/virtualizer.cc
+@@ -12,6 +12,8 @@
+ 
+ #include <base/files/file_path.h>
+ #include <base/functional/callback.h>
++#include <base/threading/platform_thread.h>
++#include <base/time/time.h>
+ #include <trunks/command_parser.h>
+ #include <trunks/response_serializer.h>
+ #include <trunks/tpm_generated.h>
+@@ -44,6 +46,14 @@ constexpr char kVekCachePath[] = "/var/lib/vtpm/vek.blob";
+ constexpr char kVekCertCachePath[] = "/var/lib/vtpm/vek_cert.blob";
+ constexpr char kVirtualEndorsementPassword[] = "";
+ 
++// Safety net for residual init races (see an internal issue). The
++// primary fix is the pre-start `gdbus wait org.chromium.Trunks` in
++// vtpmd.conf; by the time we reach here trunksd should already own its D-Bus
++// name. This retry only covers rare late-acquire cases before falling back to
++// the graceful exit path in main.cc.
++constexpr int kInitRetryCount = 3;
++constexpr base::TimeDelta kInitRetryDelay = base::Milliseconds(300);
++
+ constexpr trunks::TPM_CC kSupportedForwardCommands[] = {
+     trunks::TPM_CC_ReadPublic,
+     trunks::TPM_CC_Create,
+@@ -67,8 +77,24 @@ std::unique_ptr<Virtualizer> Virtualizer::Create(Virtualizer::Profile profile) {
+   std::unique_ptr<Virtualizer> v =
+       std::unique_ptr<Virtualizer>(new Virtualizer());
+   if (profile == Virtualizer::Profile::kGLinux) {
+-    CHECK(v->trunks_factory_.Initialize())
+-        << " Failed to initialize trunks factory.";
++    // vtpmd.conf's pre-start `gdbus wait` already ensures trunksd owns
++    // org.chromium.Trunks before we get here. Keep a short retry as a safety
++    // net; on failure fall through to nullptr and let main.cc exit cleanly
++    // instead of CHECK-aborting.
++    bool trunks_initialized = false;
++    for (int i = 0; i < kInitRetryCount; ++i) {
++      if (v->trunks_factory_.Initialize()) {
++        trunks_initialized = true;
++        break;
++      }
++      LOG(WARNING) << "Failed to initialize trunks factory (attempt "
++                   << (i + 1) << "/" << kInitRetryCount << ")";
++      base::PlatformThread::Sleep(kInitRetryDelay);
++    }
++    if (!trunks_initialized) {
++      LOG(ERROR) << "Failed to initialize trunks factory; vtpmd will not run";
++      return nullptr;
++    }
+     v->command_parser_ = &v->real_command_parser_;
+     v->response_serializer_ = &v->real_response_serializer_;
+ 
+@@ -79,8 +105,20 @@ std::unique_ptr<Virtualizer> Virtualizer::Create(Virtualizer::Profile profile) {
+         std::make_unique<CacheableBlob>(&v->vsrk_, v->vsrk_cache_.get());
+ 
+     // Set up attestation client.
+-    scoped_refptr<dbus::Bus> bus = v->system_bus_connection_.Connect();
+-    CHECK(bus) << "Failed to connect to system D-Bus";
++    scoped_refptr<dbus::Bus> bus;
++    for (int i = 0; i < kInitRetryCount; ++i) {
++      bus = v->system_bus_connection_.Connect();
++      if (bus) {
++        break;
++      }
++      LOG(WARNING) << "Failed to connect to system D-Bus (attempt "
++                   << (i + 1) << "/" << kInitRetryCount << ")";
++      base::PlatformThread::Sleep(kInitRetryDelay);
++    }
++    if (!bus) {
++      LOG(ERROR) << "Failed to connect to system D-Bus; vtpmd will not run";
++      return nullptr;
++    }
+     v->attestation_proxy_ =
+         std::make_unique<org::chromium::AttestationProxy>(bus);
+ 
+diff --git a/vtpm/main.cc b/vtpm/main.cc
+index baf75d2852..594fc4ffdb 100644
+--- a/vtpm/main.cc
++++ b/vtpm/main.cc
+@@ -43,6 +43,14 @@ int main(int argc, char* argv[]) {
+   std::unique_ptr<vtpm::Command> vtpm =
+       vtpm::Virtualizer::Create(vtpm::Virtualizer::Profile::kGLinux);
+ 
++  // Creation can fail on no-TPM devices or when a boot-time dependency
++  // (trunksd / D-Bus) is not ready even after retry. Either way, exit
++  // gracefully instead of CHECK-aborting.
++  if (!vtpm) {
++    LOG(INFO) << "vtpmd failed to initialize, exiting";
++    return EX_OK;
++  }
++
+   // Start profiling.
+   hwsec_foundation::SetUpProfiling();
+ 
+diff --git a/vtpm/vtpmd.conf b/vtpm/vtpmd.conf
+index f725f68f55..93319b559b 100644
+--- a/vtpm/vtpmd.conf
++++ b/vtpm/vtpmd.conf
+@@ -18,6 +18,13 @@ respawn
+ 
+ expect fork
+ 
++# Wait for trunksd to claim its D-Bus name. Upstart's "started trunksd" only
++# signals that trunksd has forked, not that it has finished TPM init and
++# acquired org.chromium.Trunks. Without this wait, vtpmd's D-Bus calls into
++# trunks can race on boot (see an internal issue).
++pre-start exec minijail0 -u vtpm -G \
++    /usr/bin/gdbus wait --system --timeout 15 org.chromium.Trunks
++
+ script
+   # -b /mnt/stateful_partition/... are required for writing profraw files.
+   PROFILING_ARGS=""

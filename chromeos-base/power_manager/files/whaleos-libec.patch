@@ -1,0 +1,84 @@
+diff --git a/libec/BUILD.gn b/libec/BUILD.gn
+index 402537657c..b48dac2bfc 100644
+--- a/libec/BUILD.gn
++++ b/libec/BUILD.gn
+@@ -34,7 +34,7 @@ if (!use.cros_host) {
+   default_pkg_deps += [ "libpower_manager-client" ]
+ }
+ pkg_config("target_defaults_pkg_deps") {
+-  pkg_deps = default_pkg_deps
++pkg_deps = default_pkg_deps
+ }
+ 
+ source_set("libec_common") {
+diff --git a/libec/motion_sense_command_lid_angle.cc b/libec/motion_sense_command_lid_angle.cc
+index 44d32ac9d3..e9735267cc 100644
+--- a/libec/motion_sense_command_lid_angle.cc
++++ b/libec/motion_sense_command_lid_angle.cc
+@@ -4,6 +4,27 @@
+ 
+ #include "libec/motion_sense_command_lid_angle.h"
+ 
++#include "base/files/file_util.h"
++#include "base/strings/string_util.h"
++#include "base/strings/string_number_conversions.h"
++
++namespace {
++
++constexpr char kIioDevicePath[] =
++    "/sys/bus/iio/devices/";
++constexpr char kIioNamePath[][48] = {
++    "/sys/bus/iio/devices/iio:device0/name",
++    "/sys/bus/iio/devices/iio:device1/name",
++    "/sys/bus/iio/devices/iio:device2/name",
++};
++constexpr char kAnglePath[][48] = {
++    "/sys/bus/iio/devices/iio:device0/in_angl0_raw",
++    "/sys/bus/iio/devices/iio:device1/in_angl0_raw",
++    "/sys/bus/iio/devices/iio:device2/in_angl0_raw",
++};
++
++}
++
+ namespace ec {
+ 
+ MotionSenseCommandLidAngle::MotionSenseCommandLidAngle()
+@@ -14,7 +35,37 @@ MotionSenseCommandLidAngle::MotionSenseCommandLidAngle()
+ }
+ 
+ uint16_t MotionSenseCommandLidAngle::LidAngle() const {
+-  return Resp()->lid_angle.value;
++  static int angle_id = -1;
++  const std::string kAngleNameStartings[] = {
++      "angl",
++  };
++
++  if (!base::PathExists(base::FilePath(kIioDevicePath))) {
++    LOG(WARNING) << "LidAngle not initialized yet";
++    return 0;
++  }
++
++  for (size_t i = 0; i < std::size(kIioNamePath); i++) {
++    std::string iio_name;
++    base::FilePath path(kIioNamePath[i]);
++    ReadFileToString(path, &iio_name);
++    base::TrimWhitespaceASCII(iio_name, base::TRIM_TRAILING, &iio_name);
++
++    for (size_t i = 0; i < std::size(kAngleNameStartings); i++) {
++      if (base::StartsWith(iio_name, kAngleNameStartings[i])) {
++        angle_id = i;
++        break;
++      }
++    }
++  }
++
++  uint32_t ret;
++  std::string lid_angle;
++  base::FilePath path(kAnglePath[angle_id]);
++  ReadFileToString(path, &lid_angle);
++  base::TrimWhitespaceASCII(lid_angle, base::TRIM_TRAILING, &lid_angle);
++  base::StringToUint(lid_angle, &ret);
++  return ret;
+ }
+ 
+ }  // namespace ec

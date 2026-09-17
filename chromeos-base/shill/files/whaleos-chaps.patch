@@ -1,0 +1,22 @@
+diff --git a/chaps/slot_manager_impl.cc b/chaps/slot_manager_impl.cc
+index 88c9666b45..14c7f63f5a 100644
+--- a/chaps/slot_manager_impl.cc
++++ b/chaps/slot_manager_impl.cc
+@@ -28,6 +28,8 @@
+ #include <openssl/rand.h>
+ #include <openssl/sha.h>
+ 
++#include <brillo/whaleos_util.h>
++
+ #include "chaps/chaps_metrics.h"
+ #include "chaps/chaps_utility.h"
+ #include "chaps/isolate.h"
+@@ -613,7 +615,7 @@ bool SlotManagerImpl::LoadTokenInternal(const SecureBlob& isolate_credential,
+ bool SlotManagerImpl::MigrateTokenIfNeeded(const base::FilePath& path,
+                                            const SecureBlob& auth_data,
+                                            shared_ptr<ObjectPool> object_pool) {
+-  if (USE_TPM_INSECURE_FALLBACK) {
++  if (!brillo::IsWhalebook2Model()) {
+     SecureBlob auth_key_encrypt =
+         Sha256(SecureBlob::Combine(auth_data, SecureBlob(kKeyPurposeEncrypt)));
+     SecureBlob auth_key_mac =

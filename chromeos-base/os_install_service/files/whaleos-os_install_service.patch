@@ -1,0 +1,46 @@
+diff --git a/os_install_service/conf/os_install_service.conf b/os_install_service/conf/os_install_service.conf
+index 3b838474ed..5af16e2545 100644
+--- a/os_install_service/conf/os_install_service.conf
++++ b/os_install_service/conf/os_install_service.conf
+@@ -19,6 +19,10 @@ pre-start script
+     stop
+     exit 0
+   fi
++  # Set selinux as permissive in installer to get permission to copy
++  # startup manifest generated in user directory.
++  setenforce 0
++  #endif
+ end script
+ 
+ # See the security section of platform2/os_install_service/README.md
+diff --git a/os_install_service/src/bin/os_install_service/install.rs b/os_install_service/src/bin/os_install_service/install.rs
+index 81ecd585b2..0a8fb0fd32 100644
+--- a/os_install_service/src/bin/os_install_service/install.rs
++++ b/os_install_service/src/bin/os_install_service/install.rs
+@@ -49,7 +49,10 @@ fn gibibytes_to_bytes(num_gibibytes: u64) -> u64 {
+ fn choose_destination_device_path(mut disks: Vec<Disk>) -> Option<PathBuf> {
+     // Estimate of the minimum required disk size. This doesn't need
+     // to be especially precise.
+-    let minimum_size_in_bytes = gibibytes_to_bytes(14);
++
++    // W/A for LG Whalebook4
++    let minimum_size_in_bytes = gibibytes_to_bytes(20);
++    //let minimum_size_in_bytes = gibibytes_to_bytes(14);
+ 
+     // Start by getting all disks and then progressively filter and
+     // sort (clarity favored over efficiency here since the list
+@@ -75,6 +78,14 @@ fn choose_destination_device_path(mut disks: Vec<Disk>) -> Option<PathBuf> {
+     disks.sort_unstable_by_key(|dsk| dsk.size_in_bytes);
+     disks.reverse();
+ 
++    // Log for destination candidates
++    let disks_iter = disks.iter();
++    info!("Candidate disk lists.");
++    for d in disks_iter {
++      info!("{:?}: {} bytes",
++        d.device_path, d.size_in_bytes);
++    }
++
+     // Prefer to install to a non-removable disk. This is not a hard
+     // requirement.
+     let best_disk = match disks.iter().find(|dsk| !dsk.is_removable) {

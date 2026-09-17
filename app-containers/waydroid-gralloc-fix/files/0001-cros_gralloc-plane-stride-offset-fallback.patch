@@ -1,0 +1,67 @@
+From: WhaleOS <whaleos-dev@navercorp.com>
+Subject: [PATCH] cros_gralloc_driver::allocate: fill zero plane stride/offset
+
+Copyright (c) 2026 NAVER Corp.  All rights reserved.
+SPDX-License-Identifier: BSD-3-Clause
+See files/LICENSE.wrapper in this ebuild directory for the full text.
+
+
+After the per-plane loop that copies hnd->strides/offsets from
+bo->meta via drv_bo_get_plane_stride/offset, the gbm_mesa backend
+sometimes leaves these at zero for flexible YUV formats (NV12 et al.)
+that it allocates by spoofing them onto an R8 1D buffer.  Camera HAL
+clients reading the resulting handle then see y=cb=cr=0x0 on
+lockYCbCr.
+
+Recompute any zero stride from the resolved format + width and
+recompute the offsets as the running cumulative plane size, exactly
+the layout drv_bo_from_format() would have written.  Non-zero values
+from the backend are kept as-is so backends that fill the fields
+properly are unaffected.
+
+drv_helpers.h is brought in under extern "C" because the helpers it
+declares are plain C symbols (the file itself has no C++ guards).
+
+--- a/cros_gralloc/cros_gralloc_driver.cc
++++ b/cros_gralloc/cros_gralloc_driver.cc
+@@ -14,6 +14,9 @@
+ #include <xf86drm.h>
+ 
+ #include "../util.h"
++extern "C" {
++#include "../drv_helpers.h"
++}
+ 
+ // Constants taken from pipe_loader_drm.c in Mesa
+ 
+@@ -292,6 +295,30 @@
+ 		hnd->sizes[plane] = drv_bo_get_plane_size(bo, plane);
+ 	}
+ 
++	/*
++	 * WhaleOS fallback: some backends (notably the gbm_mesa one used by
++	 * Waydroid for flexible YUV formats spoofed onto an R8 1D allocation)
++	 * leave per-plane stride/offset at zero on bo->meta even though the
++	 * buffer is large enough to hold the planar layout.  Mapper@4.0 then
++	 * hands those zeros to lockYCbCr() callers and the camera HAL bails
++	 * out with "unsupported flexible yuv layout y 0x0 cb 0x0 ...".
++	 * If we detect a zero stride after the per-plane loop, recompute the
++	 * layout from the format + width.
++	 */
++	{
++		uint32_t cum_offset = 0;
++		for (size_t plane = 0; plane < num_planes; plane++) {
++			if (hnd->strides[plane] == 0) {
++				hnd->strides[plane] = drv_stride_from_format(
++				    resolved_format, descriptor->width, plane);
++				hnd->offsets[plane] = cum_offset;
++			}
++			cum_offset += drv_size_from_format(
++			    resolved_format, hnd->strides[plane], descriptor->height, plane);
++		}
++	}
++
++
+ 	hnd->reserved_region_size = descriptor->reserved_region_size;
+ 	if (hnd->reserved_region_size > 0) {
+ 		ret = create_reserved_region(descriptor->name, hnd->reserved_region_size);

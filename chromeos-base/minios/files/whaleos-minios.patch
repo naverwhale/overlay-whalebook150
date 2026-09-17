@@ -1,0 +1,226 @@
+diff --git a/minios/draw_utils.cc b/minios/draw_utils.cc
+index 9380a41f26..cd94096ba0 100644
+--- a/minios/draw_utils.cc
++++ b/minios/draw_utils.cc
+@@ -22,9 +22,10 @@ namespace minios {
+ 
+ // Dropdown Menu Colors.
+ const char kMenuBlack[] = "0x202124";
+-const char kMenuBlue[] = "0x8AB4F8";
++const char kMenuBlue[] = "0x386AFF"; // for Whale
+ const char kMenuGrey[] = "0x3F4042";
+-const char kMenuDropdownFrameNavy[] = "0x435066";
++const char kMenuDropdownFrameNavy[] = "0x182D6B"; // for Whale
++const char kMenuDropdownHighlightNavy[] = "0x7A9BFF"; // for Whale
+ const char kMenuDropdownBackgroundBlack[] = "0x2D2E30";
+ const char kMenuButtonFrameGrey[] = "0x9AA0A6";
+ const char kAdvancedBtnBackground[] = "0x2B2F37";
+@@ -353,11 +354,10 @@ void DrawUtils::ShowButton(const std::string& message_token,
+   }
+ 
+   if (is_selected) {
+-    ShowImage(GetScreensPath().Append("btn_bg_left_focused.png"),
++    ShowImage(screens_path_.Append("btn_bg_left_focused_whale.png"),
+               left_padding_x, offset_y);
+-    ShowImage(GetScreensPath().Append("btn_bg_right_focused.png"),
++    ShowImage(screens_path_.Append("btn_bg_right_focused_whale.png"),
+               right_padding_x, offset_y);
+-
+     ShowBox(kOffsetX, offset_y, inner_width, kButtonHeight, kMenuBlue);
+     if (is_text) {
+       ShowText(message_token, left_padding_x, offset_y, "black");
+@@ -396,12 +396,12 @@ void DrawUtils::ShowStepper(const std::vector<std::string>& steps) {
+ 
+   for (const auto& step : steps) {
+     base::FilePath stepper_image =
+-        GetScreensPath().Append("ic_" + step + ".png");
++        GetScreensPath().Append("ic_" + step + "_whale.png");
+     if (!base::PathExists(stepper_image)) {
+       // TODO(vyshu): Create a new generic icon to be used instead of done.
+       LOG(WARNING) << "Stepper icon " << stepper_image
+                    << " not found. Defaulting to the done icon.";
+-      stepper_image = GetScreensPath().Append("ic_done.png");
++      stepper_image = GetScreensPath().Append("ic_done_whale.png");
+       if (!base::PathExists(stepper_image)) {
+         LOG(ERROR) << "Could not find stepper icon done. Cannot show stepper.";
+         return;
+@@ -442,7 +442,8 @@ void DrawUtils::ShowLanguageDropdown(int current_index) {
+ 
+     // This is the currently selected language. Show in blue.
+     if (current_index == i) {
+-      ShowBox(kBackgroundX, offset_y, 720, 40, kMenuBlue);
++      ShowBox(kBackgroundX, offset_y, 720, 40, kMenuDropdownFrameNavy);
++      ShowBox(kBackgroundX, offset_y, 718, 38, kMenuDropdownHighlightNavy);
+       ShowImage(GetScreensPath()
+                     .Append(supported_locales_[i])
+                     .Append("language_focused.png"),
+@@ -492,10 +493,10 @@ void DrawUtils::ShowControlButton(const std::optional<std::string>& icon,
+   }
+ 
+   if (focused) {
+-    ShowImage(GetScreensPath().Append("adv_btn_bg_left.png"), left_padding_x,
+-              y_offset);
+-    ShowImage(GetScreensPath().Append("adv_btn_bg_right.png"), right_padding_x,
+-              y_offset);
++    ShowImage(GetScreensPath().Append("adv_btn_bg_left_whale.png"),
++              left_padding_x, y_offset);
++    ShowImage(GetScreensPath().Append("adv_btn_bg_right_whale.png"),
++              right_padding_x, y_offset);
+     // Box outline created when button is focused.
+     ShowBox(kBtnCenter - 4, y_offset, kInnerWidth + 2, kButtonHeight,
+             kMenuBlue);
+@@ -518,7 +519,7 @@ void DrawUtils::ShowControlButton(const std::optional<std::string>& icon,
+     // additional details in the next page.
+     const std::string& arrow =
+         (IsLocaleRightToLeft() ? "ic_dropleft-blue" : "ic_dropright-blue") +
+-        std::string{focused ? kFocusedSuffix : ""} + std::string{kPngExtension};
++        std::string{focused ? kFocusedSuffix : ""} + "_whale"+ std::string{kPngExtension};
+ 
+     ShowImage(GetScreensPath().Append(arrow), x_offset + 48 + button_width,
+               y_offset);
+@@ -594,7 +595,7 @@ void DrawUtils::ShowFooter() {
+   ShowImage(GetScreensPath().Append("nav-" + kNavKeyDown + ".png"), nav_btn_x,
+             kNavButtonY);
+ 
+-  ShowImage(GetScreensPath().Append("qr_code.png"), kQrCodeX, kQrCodeY);
++  ShowImage(GetScreensPath().Append("whale.png"), kQrCodeX, kQrCodeY);
+   int hwid_len = hwid_.size();
+   int hwid_x = kQrCodeX + (kQrCodeSize / 2) + 16 + 5;
+   const int kHwidY = kFooterY + kFooterLineHeight;
+@@ -793,7 +794,7 @@ void DrawUtils::ReadHardwareId() {
+   if (!process_manager_->RunCommandWithOutput({"/bin/crossystem", "hwid"},
+                                               &exit_code, &output, &error) ||
+       exit_code) {
+-    hwid_ = "CHROMEBOOK";
++    hwid_ = "WHALEBOOK";
+     PLOG(WARNING)
+         << "Could not get hwid from crossystem. Exited with exit code "
+         << exit_code << " and error " << error
+diff --git a/minios/draw_utils.h b/minios/draw_utils.h
+index 5303d3c9c8..3bcbda6b1e 100644
+--- a/minios/draw_utils.h
++++ b/minios/draw_utils.h
+@@ -28,6 +28,7 @@ extern const char kMenuBlack[];
+ extern const char kMenuBlue[];
+ extern const char kMenuGrey[];
+ extern const char kMenuDropdownFrameNavy[];
++extern const char kMenuDropdownHighlightNavy[];
+ extern const char kMenuDropdownBackgroundBlack[];
+ extern const char kMenuButtonFrameGrey[];
+ 
+diff --git a/minios/ramfs/etc/init/minios.conf b/minios/ramfs/etc/init/minios.conf
+index aa32094834..115a44005e 100644
+--- a/minios/ramfs/etc/init/minios.conf
++++ b/minios/ramfs/etc/init/minios.conf
+@@ -9,6 +9,23 @@ start on started dbus and started frecon and started shill and started udev
+ expect fork
+ respawn
+ 
++pre-start script
++  HAS_LIDSWITCH=0
++  for f in /sys/class/input/*; do
++    if [ "$(cat "${f}/name")" == "Lid Switch" ]; then
++      HAS_LIDSWITCH=1
++      cd "${f}/device"
++      break
++    fi
++  done
++
++  if [ ${HAS_LIDSWITCH} == "1" ]; then
++    PATH=$(pwd -P)
++    DEV=${PATH##*/}
++    echo ${DEV} > ${PATH}/driver/unbind
++  fi
++end script
++
+ oom score never
+ 
+ pre-start script
+diff --git a/minios/screen_controller.cc b/minios/screen_controller.cc
+index 8c64ea508d..f3ae8c8410 100644
+--- a/minios/screen_controller.cc
++++ b/minios/screen_controller.cc
+@@ -194,6 +194,7 @@ void ScreenController::OnBackward(ScreenInterface* screen) {
+       }
+       break;
+     case ScreenType::kLogScreen:
++      current_screen_->Reset();
+       // Back to debug options screen.
+       current_screen_ = CreateScreen(ScreenType::kDebugOptionsScreen);
+       break;
+diff --git a/minios/screens/screen_debug_options.cc b/minios/screens/screen_debug_options.cc
+index b6c7e94955..358243d336 100644
+--- a/minios/screens/screen_debug_options.cc
++++ b/minios/screens/screen_debug_options.cc
+@@ -107,8 +107,8 @@ void ScreenDebugOptions::UpdateStorageDevices(
+     std::unique_ptr<brillo::Udev> udev) {
+   storage_devices_.clear();
+   // Storing logs to disk is always an option.
+-  storage_devices_.emplace_back(kDiskStorageDevice, std::nullopt);
+-  button_count_ = 2;
++  // Do not support save to disk for WhaleOS
++  button_count_ = 1;
+ 
+   std::vector<base::FilePath> device_paths;
+   if (!GetRemovableDevices(device_paths, std::move(udev))) {
+diff --git a/minios/screens/screen_log.cc b/minios/screens/screen_log.cc
+index 78d6e65faa..136d763810 100644
+--- a/minios/screens/screen_log.cc
++++ b/minios/screens/screen_log.cc
+@@ -155,7 +155,22 @@ void ScreenLog::OnKeyPress(int key_changed) {
+   }
+ }
+ 
+-void ScreenLog::Reset() {}
++void ScreenLog::Reset() {
++  int frecon_size = draw_utils_->GetFreconCanvasSize();
++  bool is_small_canvas = (frecon_size < kSmallCanvasSize);
++  int lines_per_page =
++	  is_small_canvas ? kSmallLogLinesPerPage : kLogLinesPerPage;
++  int char_per_line = is_small_canvas ? kSmallLogCharPerLine : kLogCharPerLine;
++  /* This size is log_area_border image size */
++  int w = is_small_canvas ? 800 : 1220;
++  int h = is_small_canvas ? 268 : 410;
++
++  draw_utils_->ShowBox(
++		  -frecon_size / 2 + ((kMonospaceGlyphWidth * char_per_line) + 10) / 2,
++		  -frecon_size / 2 + kLogAreaY +
++		  (kMonospaceGlyphHeight * lines_per_page) / 2,
++		  w + 100, h, kMenuBlack);
++}
+ 
+ ScreenType ScreenLog::GetType() {
+   return ScreenType::kLogScreen;
+diff --git a/minios/screens/screen_network.cc b/minios/screens/screen_network.cc
+index 6699e76770..7680e3036d 100644
+--- a/minios/screens/screen_network.cc
++++ b/minios/screens/screen_network.cc
+@@ -409,7 +409,10 @@ void ScreenNetwork::ShowNetworkDropdown(int current_index) {
+   for (int i = begin_index;
+        i < (begin_index + items_per_page_) && i < networks_.size(); i++) {
+     if (current_index == i) {
+-      draw_utils_->ShowBox(kBackgroundX, offset_y, 720, 40, kMenuBlue);
++      draw_utils_->ShowBox(kBackgroundX, offset_y, 720, 40,
++                           kMenuDropdownFrameNavy);
++      draw_utils_->ShowBox(kBackgroundX, offset_y, 718, 38,
++                           kMenuDropdownHighlightNavy);
+       draw_utils_->ShowText(networks_[i].ssid, kOffsetX, offset_y, "black");
+     } else {
+       draw_utils_->ShowBox(kBackgroundX, offset_y, 720, 40,
+diff --git a/minios/utils.cc b/minios/utils.cc
+index 0f6c24a4be..2653718068 100644
+--- a/minios/utils.cc
++++ b/minios/utils.cc
+@@ -534,9 +534,10 @@ std::optional<uint64_t> GetMiniOsPriorityPartition(
+     return std::nullopt;
+   }
+   if (minios_priority == "A") {
+-    return 9;
++    // WhaleOS doesn't have minios partitions
++    return 2;
+   } else if (minios_priority == "B") {
+-    return 10;
++    return 4;
+   }
+   LOG(ERROR) << "Invalid MiniOS priority.";
+   return std::nullopt;

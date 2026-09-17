@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE pkgmetadata SYSTEM "https://www.gentoo.org/dtd/metadata.dtd">
+<pkgmetadata>
+  <longdescription>
+    Python bindings for libgbinder, enabling Python programs to use the
+    Android binder IPC protocol. Required by Waydroid to communicate with
+    Android services running in the LXC container.
+  </longdescription>
+  <!--
+    License evidence (audited 2026-08-25 against the pinned tarball,
+    SHA512 as recorded in Manifest):
+
+      LICENSE file: GNU General Public License, Version 3 (verbatim, 674
+      lines). No "or later" grant in the file itself.
+      https://github.com/waydroid/gbinder-python/blob/86b8feba4cacd0952b010d1c3af6a29a0c146ced/LICENSE
+
+      setup.py:        license="GPL3"
+      debian/copyright: Files: *        -> GPL-3+
+                        Files: debian/* -> BSD-3-clause
+                        Copyright: 2021 Erfan Abdi <erfangplus@gmail.com>
+                                   2021 NotKit <nekit1000@gmail.com>
+
+    No source file carries a license header and no SPDX-License-Identifier
+    appears anywhere in the tree, so GPL-3 is declared as the conservative
+    floor: complying with GPL-3 also satisfies GPL-3+. This matches
+    app-containers/waydroid, which declares LICENSE="GPL-3".
+
+    Nothing under debian/ is installed by this ebuild, so the BSD-3-clause
+    packaging files are not redistributed.
+  -->
+  <upstream>
+    <remote-id type="github">waydroid/gbinder-python</remote-id>
+  </upstream>
+</pkgmetadata>

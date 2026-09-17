@@ -1,0 +1,20 @@
+From: WhaleOS <whaleos-dev@navercorp.com>
+Subject: [PATCH] cras_helper_add_stream_simple: respect direction parameter
+
+cras_helper_add_stream_simple() accepts a direction argument but
+hardcodes CRAS_STREAM_OUTPUT when constructing the unified params,
+making the function unable to set up capture streams.  The Android
+audio HAL needs this to wire input devices through CRAS; pass the
+caller-supplied direction through instead.
+
+--- a/cras/src/libcras/cras_helpers.c
++++ b/cras/src/libcras/cras_helpers.c
+@@ -133,7 +133,7 @@ int cras_helper_add_stream_simple(struct cras_client* client,
+   }
+
+   params = cras_client_unified_params_create(
+-      CRAS_STREAM_OUTPUT, 2048, CRAS_STREAM_TYPE_DEFAULT, 0, user_data,
++      direction, 2048, CRAS_STREAM_TYPE_DEFAULT, 0, user_data,
+       unified_cb, err_cb, aud_format);
+   if (!params) {
+     rc = -ENOMEM;

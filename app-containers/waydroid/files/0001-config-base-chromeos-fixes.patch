@@ -1,0 +1,50 @@
+From: WhaleOS <whaleos-dev@navercorp.com>
+Subject: [PATCH 1/2] config_base/config_3/config_4: ChromeOS/WhaleOS LXC config fixes
+
+1. Remove lxc.hook.post-stop = /dev/null: ChromeOS has noexec semantics
+   on /dev/null, causing "Permission denied" when LXC tries to execute it
+   as a post-stop hook script.
+
+2. Move proc/sys mounts from lxc.mount.auto to explicit mount entries.
+   Makes the mount configuration explicit and predictable on ChromeOS.
+
+3. Remove lxc.apparmor.profile and lxc.seccomp.profile from config_3:
+   ChromeOS LXC is built without AppArmor and seccomp support; these
+   options cause a fatal parse error ("Built without AppArmor support").
+
+4. Remove lxc.seccomp.allow_nesting = 1 from config_4: same reason.
+
+--- a/data/configs/config_base
++++ b/data/configs/config_base
+@@ -7,12 +7,14 @@
+
+ lxc.cap.keep = audit_control sys_nice wake_alarm setpcap setgid setuid sys_ptrace sys_admin wake_alarm block_suspend sys_time net_admin net_raw net_bind_service kill dac_override dac_read_search fsetid mknod syslog chown sys_resource fowner ipc_lock sys_chroot
+
+-lxc.mount.auto = cgroup:ro sys:ro proc
++lxc.mount.auto = cgroup:ro
+
+ lxc.console.path = none
+
+ lxc.include = /var/lib/waydroid/lxc/waydroid/config_nodes
+ lxc.include = /var/lib/waydroid/lxc/waydroid/config_session
+
+-lxc.hook.post-stop = /dev/null
+
++
++lxc.mount.entry = proc proc proc nosuid,nodev,noexec,create=dir 0 0
++lxc.mount.entry = sysfs sys sysfs nosuid,nodev,noexec,ro,create=dir 0 0
+--- a/data/configs/config_3
++++ b/data/configs/config_3
+@@ -1,7 +1,5 @@
+ lxc.uts.name = waydroid
+ 
+-lxc.apparmor.profile = unconfined
+-lxc.seccomp.profile = /var/lib/waydroid/lxc/waydroid/waydroid.seccomp
+ 
+ lxc.no_new_privs = 1
+ 
+--- a/data/configs/config_4
++++ b/data/configs/config_4
+@@ -1,2 +0,0 @@
+-lxc.seccomp.allow_nesting = 1
+-

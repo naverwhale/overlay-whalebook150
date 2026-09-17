@@ -1,0 +1,70 @@
+{
+  "parent": "legacy_disk_layout.json",
+  "layouts":{
+    "common":[
+      {
+        "num": 9,
+        "label": "MINIOS-A"
+      },
+      {
+        "num": 10,
+        "label": "MINIOS-B"
+      },
+      {
+        "num": 2,
+        "size": "64 MiB"
+      },
+      {
+        "num": 4,
+        "size": "64 MiB"
+      },
+      {
+        "num": 12,
+        "size": "128 MiB"
+      },
+      {
+        "num": 5,
+        "size": "4096 MiB"
+      },
+      {
+        "num": 3,
+        "size": "4096 MiB",
+        "fs_size": "4000 MiB"
+      },
+      {
+        "num": 1,
+        "size": "8192 MiB"
+      }
+    ],
+    "usb":[
+      {
+        "num": 5,
+        "size": "2 MiB"
+      },
+      {
+        "num": 3,
+        "size": "4096 MiB"
+      },
+      {
+        "num": 1,
+        "size": "16384 MiB"
+      }
+    ],
+    "factory_install": [
+      {
+        "num": 2,
+        "uuid": "41D0A356-699C-7A4C-A387-9F5BE621BCFC"
+      },
+      {
+        "num": 3,
+        "size": "4096 MiB"
+      }
+    ],
+    "recovery":[
+      {
+        "num": 3,
+        "size": "4096 MiB"
+      }
+    ]
+  }
+}

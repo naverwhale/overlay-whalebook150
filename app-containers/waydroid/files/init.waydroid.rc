@@ -1,0 +1,85 @@
+on boot
+    # Allow to access WebView
+    chmod 0755 /sys/kernel/debug
+    chmod 0755 /sys/kernel/debug/tracing
+
+on property:sys.boot_completed=1
+    start adbd
+
+on post-fs-data
+    exec -- /system/bin/mount -o remount,exec /data
+    mkdir /data/icons 0775 system system
+    mkdir /data/waydroid_tmp 0755 host system
+
+service vendor.audio-hal-2-0 /vendor/bin/hw/android.hardware.audio@2.0-service
+    override
+    class hal
+    user host
+    group audioserver audio camera drmrpc inet media mediadrm net_bt net_bt_admin net_bw_acct wakelock
+    capabilities BLOCK_SUSPEND
+    ioprio rt 4
+    writepid /dev/cpuset/foreground/tasks /dev/stune/foreground/tasks
+    oneshot
+    interface android.hardware.audio@4.0::IDevicesFactory default
+    interface android.hardware.audio@2.0::IDevicesFactory default
+
+service vendor.audio-hal /vendor/bin/hw/android.hardware.audio.service
+    override
+    class hal
+    user host
+    group audioserver audio camera drmrpc inet media mediadrm net_bt net_bt_admin net_bw_acct wakelock context_hub
+    capabilities BLOCK_SUSPEND
+    rlimit rtprio 10 10
+    ioprio rt 4
+    task_profiles ProcessCapacityHigh HighPerformance
+    onrestart restart audioserver
+
+service vendor.hwcomposer-2-1 /vendor/bin/hw/android.hardware.graphics.composer@2.1-service --desktop_file_hint=Waydroid.desktop
+    override
+    class hal animation
+    user host
+    group system graphics drmrpc
+    capabilities SYS_NICE
+    onrestart restart surfaceflinger
+    task_profiles ServiceCapacityLow
+
+service vendor.camera-provider-2-4 /vendor/bin/hw/android.hardware.camera.provider@2.4-service
+    override
+    interface android.hardware.camera.provider@2.4::ICameraProvider legacy/0
+    class hal
+    user cameraserver
+    group audio camera input drmrpc
+    ioprio rt 4
+    capabilities SYS_NICE
+    task_profiles CameraServiceCapacity MaxPerformance
+
+on property:ro.vndk.version=28
+    mount none /dev/null /vendor_extra/lib/libmedia_codecserviceregistrant.so ro bind
+
+on property:persist.waydroid.multi_windows=true
+    mount none /system/etc/hidden_xml/pc.xml /system/etc/permissions/pc.xml ro bind
+
+# WhaleOS: in CRAS passthrough mode audioserver dlopens the HAL directly.
+# vendor.audio-hal would crash-loop trying to re-register the same HIDL
+# interface. Stop both HAL service variants when CRAS is active.
+on property:ro.hardware.audio.primary=waydroid
+    stop vendor.audio-hal
+    stop vendor.audio-hal-2-0
+
+# WhaleOS: apply one-shot initial defaults after first boot.
+# Runs as the shell uid so `settings put` and `cmd media_session volume`
+# both have the calling identity they expect (system uid trips AppOps
+# with "com.android.server.media from uid 1000 not allowed").  A marker
+# file in /data keeps this idempotent across reboots; once it exists the
+# script no-ops, so any later user change is preserved.
+#   show_ime_with_hard_keyboard=0  hide soft IME (host keyboard always wired)
+#   persist.sys.timezone=Asia/Seoul Korea timezone
+#   each AudioManager.STREAM_*     pinned to its per-stream max
+service waydroid_defaults /system/bin/sh -c "[ -e /data/.waydroid_initial_setup_done ] && exit 0; settings put secure show_ime_with_hard_keyboard 0; setprop persist.sys.timezone Asia/Seoul; cmd media_session volume --stream 0 --set 5; cmd media_session volume --stream 1 --set 7; cmd media_session volume --stream 2 --set 7; cmd media_session volume --stream 3 --set 15; cmd media_session volume --stream 4 --set 7; cmd media_session volume --stream 5 --set 7; cmd media_session volume --stream 6 --set 15; cmd media_session volume --stream 8 --set 15; cmd media_session volume --stream 10 --set 15; touch /data/.waydroid_initial_setup_done"
+    user shell
+    group shell audio
+    oneshot
+    disabled
+
+on property:sys.boot_completed=1
+    start waydroid_defaults

@@ -1,0 +1,13 @@
+# Copyright 2026 NAVER Authors. All rights reserved.
+# Use of this source code is governed by a BSD-style license that can be
+# found in the LICENSE file.
+# WhaleOS: patch ld.config.txt so that android.hardware.audio@4.0-impl.so
+# (HIDL passthrough wrapper loaded by audioserver from the sphal namespace)
+# can resolve libfmq.so, libmedia_helper.so, and libaudioutils.so.
+#
+# linkerconfig generates ld.config.txt on early-init; the sphal→vndk link
+# it produces only lists android.hardware.common* entries, omitting the
+# VNDK-SP audio support libs.  We patch in the missing entries here, after
+# the file exists but before class_start core brings up audioserver.
+on post-fs
+    exec -- /system/bin/sh -c "grep -q 'namespace.sphal.link.vndk.shared_libs.*libfmq' /linkerconfig/ld.config.txt 2>/dev/null || sed -i 's/link.vndk.shared_libs = android.hardware.common/link.vndk.shared_libs = libfmq.so:libmedia_helper.so:libaudioutils.so:android.hardware.common/g' /linkerconfig/ld.config.txt /linkerconfig/bootstrap/ld.config.txt 2>/dev/null"

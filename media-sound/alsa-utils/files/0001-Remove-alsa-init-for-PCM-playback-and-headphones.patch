@@ -1,0 +1,40 @@
+From d0d02292822b9045350addf4fdf091928a1c4c6f Mon Sep 17 00:00:00 2001
+From: Steven 'Steve' Kendall <skend@google.com>
+Date: Mon, 10 Feb 2025 21:49:28 +0000
+Subject: [PATCH] Remove alsa init for PCM playback and headphones
+
+---
+ alsactl/init/default | 3 ---
+ 1 file changed, 3 deletions(-)
+
+diff --git a/alsactl/init/default b/alsactl/init/default
+index 1c84f3e..418ab24 100644
+--- a/alsactl/init/default
++++ b/alsactl/init/default
+@@ -97,7 +97,6 @@ CTL{name}="Headphone Playback Volume",PROGRAM!="__ctl_search",GOTO=""
+ # if master volume control is present, turn headphone volume to max
+ ENV{has_pmaster_vol}=="true",CTL{write}=="0dB",GOTO=""
+ ENV{has_pmaster_vol}=="true",CTL{write}=="100%",GOTO=""
+-CTL{write}!="$env{pvolume}",CTL{values}="$env{ppercent}"
+ LABEL=""
+ CTL{name}="Headphone Playback Switch",CTL{do_search}=="1", \
+   CTL{values}="on"
+@@ -178,7 +177,6 @@ ENV{has_pmaster_vol}=="true",CTL{write}=="100%",GOTO=""
+ # exception - some HDA codecs have shifted dB range
+ CTL{dBmin}=="-34.50dB",CTL{dBmax}=="12.00dB",CTL{write}=="0dB",GOTO=""
+ CTL{dBmin}=="-30.00dB",CTL{dBmax}=="0dB",CTL{write}=="0dB",GOTO=""
+-CTL{write}!="$env{pvolume}",CTL{values}="75%"
+ LABEL=""
+ CTL{name}="PCM Playback Switch",CTL{do_search}=="1", CTL{values}="on"
+ CTL{name}="PCM Switch",CTL{do_search}=="1",CTL{values}="on"
+@@ -192,7 +190,6 @@ ENV{has_pmaster_vol}=="true",CTL{write}=="100%",GOTO=""
+ # exception - some HDA codecs have shifted dB range
+ CTL{dBmin}=="-34.50dB",CTL{dBmax}=="12.00dB",CTL{write}=="0dB",GOTO=""
+ CTL{dBmin}=="-30.00dB",CTL{dBmax}=="0dB",CTL{write}=="0dB",GOTO=""
+-CTL{write}!="$env{pvolume}",CTL{values}="75%"
+ LABEL=""
+ CTL{name}="PCM Playback Switch",CTL{index}="1",CTL{do_search}=="1", \
+   CTL{values}="on"
+-- 
+2.48.1.502.g6dc24dfdaf-goog
+

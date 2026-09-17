@@ -1,0 +1,26 @@
+From: WhaleOS <whaleos-dev@navercorp.com>
+Subject: [PATCH 4/4] lxc.py: enable adb without auth and debuggable
+
+On WhaleOS, we want ADB to be accessible without RSA key authentication
+so that developers can connect via SSH tunnel + adb connect without
+setting up adb key pairs. Also enable ro.debuggable=1 so standard
+Android debug tooling works.
+
+The container rootfs system/build.prop already sets ro.adb.secure=0 but
+vendor/waydroid.prop overrides it to 1 at container start. This patch
+removes that override so the system setting takes effect.
+
+--- a/tools/helpers/lxc.py
++++ b/tools/helpers/lxc.py
+@@ -250,9 +250,9 @@ def make_base_props(args):
+     if not os.path.exists("/dev/ashmem"):
+         props.append("sys.use_memfd=true")
+
+-    # Added for security reasons
+-    props.append("ro.adb.secure=1")
+-    props.append("ro.debuggable=0")
++    # WhaleOS: allow adb without auth; adbd listens on TCP 5555
++    props.append("ro.adb.secure=0")
++    props.append("ro.debuggable=1")
+
+     egl = tools.helpers.props.host_get(args, "ro.hardware.egl")

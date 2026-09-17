@@ -1,0 +1,128 @@
+diff --git a/device_management/BUILD.gn b/device_management/BUILD.gn
+index 3bc2650616..de48ebdc04 100644
+--- a/device_management/BUILD.gn
++++ b/device_management/BUILD.gn
+@@ -83,6 +83,11 @@ pkg_config("target_defaults") {
+     "PLATFORM_FWMP_INDEX=${use.generic_tpm2}",
+     "USE_TPM_INSECURE_FALLBACK=${use.tpm_insecure_fallback}",
+   ]
++
++  # TODO(changwan.hong) : Needs to change global build macro of whaleos
++  defines += [
++  ]
++
+   cflags = [ "-Wconsumed" ]
+ }
+ 
+diff --git a/device_management/fwmp/firmware_management_parameters.cc b/device_management/fwmp/firmware_management_parameters.cc
+index 9c1315be5c..f9b47f38e7 100644
+--- a/device_management/fwmp/firmware_management_parameters.cc
++++ b/device_management/fwmp/firmware_management_parameters.cc
+@@ -122,6 +122,11 @@ bool fwmp::FirmwareManagementParameters::Load(void) {
+     return false;
+   }
+ 
++  if (!state->support) {
++    LOG(INFO) << __func__ << " Whalebook can not provide storage.";
++    return true;
++  }
++
+   if (!state->readable) {
+     LOG(INFO) << "Load() called with unreadable FWMP.";
+     return false;
+@@ -181,6 +186,10 @@ bool fwmp::FirmwareManagementParameters::Store(
+     LOG(ERROR) << "Failed to get FWMP state: " << state.status();
+     return false;
+   }
++  if (!state->support) {
++    LOG(INFO) << __func__ << " Whalebook can not provide storage.";
++    return true;
++  }
+ 
+   if (!state->writable) {
+     LOG(INFO) << "Store() called with unwritable FWMP state.";
+diff --git a/device_management/install_attributes/install_attributes.cc b/device_management/install_attributes/install_attributes.cc
+index 666bb4b1d5..96b12e109c 100644
+--- a/device_management/install_attributes/install_attributes.cc
++++ b/device_management/install_attributes/install_attributes.cc
+@@ -10,6 +10,8 @@
+ #include <string>
+ #include <utility>
+ 
++#include <brillo/whaleos_util.h>
++
+ #include <base/check.h>
+ #include <base/files/file_path.h>
+ #include <base/logging.h>
+@@ -49,7 +51,7 @@ InstallAttributes::InstallAttributes(libstorage::Platform* platform,
+ InstallAttributes::~InstallAttributes() {}
+ 
+ bool InstallAttributes::IsSecure() {
+-  if (!USE_TPM_INSECURE_FALLBACK) {
++  if (brillo::IsWhalebook2Model()) {
+     // We should always enable the hardware protection if we don't enable the
+     // fallback feature.
+     return true;
+@@ -109,6 +111,11 @@ bool InstallAttributes::Init() {
+       status_ = Status::kInvalid;
+       return false;
+     }
++    if (!state->support) {
++      LOG(INFO) << __func__ << " Whalebook can not provide storage.";
++      status_ = Status::kValid;
++      return true;
++    }
+ 
+     if (state->writable) {
+       LOG(WARNING) << "Found unfinalized install attributs.";
+@@ -282,9 +289,11 @@ bool InstallAttributes::Finalize() {
+   DLOG(INFO) << "Finalizing() " << attr_bytes.size() << " bytes.";
+   if (IsSecure() && !lockbox()->Store(attr_bytes, &error)) {
+     LOG(ERROR) << "Finalize() failed with Lockbox error: " << error;
+-    // It may be possible to recover from a failed NVRAM store. So the
+-    // instance is not marked invalid.
+-    return false;
++    // OSS=https://example.com
++    // Store() may fail in current assumption.
++    if (!brillo::IsWhalebook2Model()) {
++      return false;
++    }
+   }
+ 
+   if (!platform_->WriteFileAtomicDurable(data_file_, attr_bytes,
+diff --git a/device_management/install_attributes/lockbox.cc b/device_management/install_attributes/lockbox.cc
+index cc09fe8827..cfe3795199 100644
+--- a/device_management/install_attributes/lockbox.cc
++++ b/device_management/install_attributes/lockbox.cc
+@@ -14,6 +14,8 @@
+ #include <utility>
+ #include <vector>
+ 
++#include <brillo/whaleos_util.h>
++
+ #include <base/check.h>
+ #include <base/check_op.h>
+ #include <base/files/file_path.h>
+@@ -56,7 +58,12 @@ bool Lockbox::Reset(LockboxError* error) {
+       !status.ok()) {
+     LOG(ERROR) << "Failed to prepare lockbox space: " << status;
+     *error = LockboxError::kTpmError;
+-    return false;
++    // https://example.com
++    if (!brillo::IsWhalebook2Model()) {
++      return false;
++    }
++    LOG(ERROR) << __func__ << " failed at " << __LINE__ << " line."
++        << " But ignore this error and go through fallback.";
+   }
+ 
+   return true;
+diff --git a/device_management/minijail/device_managementd.conf b/device_management/minijail/device_managementd.conf
+index 7fd05e1ae1..83e979f97c 100644
+--- a/device_management/minijail/device_managementd.conf
++++ b/device_management/minijail/device_managementd.conf
+@@ -20,3 +20,4 @@ bind-mount = /var/lib/metrics,,1
+ bind-mount = /var/lib/device_management,,1
+ mount = /mnt,/mnt,tmpfs,MS_NODEV|MS_NOEXEC|MS_NOSUID,mode=755,size=10M
+ mount = tmpfs,/sys,tmpfs,MS_NODEV|MS_NOEXEC|MS_NOSUID,mode=755,size=10M
++bind-mount = /sys/class/dmi/id

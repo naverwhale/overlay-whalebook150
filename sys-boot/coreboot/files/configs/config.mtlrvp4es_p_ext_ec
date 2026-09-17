@@ -1,0 +1,25 @@
+CONFIG_VENDOR_INTEL=y
+CONFIG_BOARD_INTEL_MTLRVP4ES_P_EXT_EC=y
+
+# Legacy Device (do not remove)
+# CONFIG_CHROMEOS_FW_SPLASH_SCREEN is not set
+CONFIG_BMP_LOGO=y
+CONFIG_BMP_LOGO_FILE_NAME="bootsplash_assets/chromeos_100_percent.bmp"
+
+# SPI Descriptor
+CONFIG_IFD_BIN_PATH="3rdparty/blobs/mainboard/google/rex/descriptor-mtlrvp4es_p_ext_ec.bin"
+
+# Management Engine
+CONFIG_ME_BIN_PATH="3rdparty/blobs/mainboard/google/rex/csme-mtlrvp4es_p_ext_ec.bin"
+
+# Management Engine FW update
+CONFIG_SOC_INTEL_CSE_RW_FILE="3rdparty/blobs/mainboard/google/rex/me_rw-mtlrvp4es_p_ext_ec.bin"
+
+# Video Blob
+CONFIG_INTEL_GMA_VBT_FILE="3rdparty/blobs/mainboard/google/rex/vbt-mtlrvp_p_ext_ec.bin"
+
+# Microcode
+CONFIG_CPU_INTEL_UCODE_SPLIT_BINARIES="3rdparty/blobs/mainboard/google/rex/microcode_inputs/mtlrvp4es_p_ext_ec"
+
+# Management Engine FW update version
+CONFIG_SOC_INTEL_CSE_RW_VERSION="18.0.5.2098"

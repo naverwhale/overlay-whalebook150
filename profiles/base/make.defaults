@@ -1,0 +1,31 @@
+USE=""
+
+CHROMEOS_KERNEL_SPLITCONFIG="chromeos-x86_64-reven"
+CHROMEOS_KERNEL_ARCH="x86_64"
+BOARD_COMPILER_FLAGS="-march=x86-64 -msse3"
+BOARD_RUSTFLAGS="-Ctarget-cpu=x86-64 -Ctarget-feature=+sse3"
+LLVM_TARGETS="AMDGPU X86"
+
+USE="${USE} march_x86-64"
+
+LINUX_FIRMWARE="iwlwifi-all ibt_9560 ibt_9260 i915_glk i915_tgl i915_jsl"
+LINUX_FIRMWARE="${LINUX_FIRMWARE} i915_adl rtl8168h-2 rtw8821c ibt-hw ibt_ax200 ibt_ax201"
+LINUX_FIRMWARE="${LINUX_FIRMWARE} ibt_ax211 -iwlwifi-all iwlwifi-lg14u390"
+
+# from overlay-reven
+USE="${USE} containers kvm_host crosvm-gpu virtio_gpu legacy_keyboard legacy_power_button"
+USE="${USE} llvm include_vmlinuz legacy_firmware_ui direncription_allow_v2 -kdump"
+# from overlay-amd64-generic
+USE="${USE} sse arc-camera3 vivid unibuild has_chromeos_config_bsp vulkan"
+USE="${USE} biod"
+# from overlay-lg14u390
+USE="${USE} -kernel-5_15 gpu_sandbox_start_early drm_atomic -kernel-4_14 -kernel-5_4 -kernel-5_10"
+USE="${USE} kernel-6_6 -kernel-6_12 lg14u390_kernel builtin_fw_guc_adln builtin_fw_huc_adln -video_cards_i965"
+USE="${USE} video_cards_iHD native_gpu_memory_buffers video_cards_iHD_g11 video_cards_iHD_g12 waydroid"
+# from baseboard-whalebook
+USE="${USE} -tpm tpm2 -tpm2_simulator -tpm2_simulator_manufacturer os_install_service -tpm_dynamic"
+USE="${USE} -tpm_insecure_fallback generic_tpm2 -pinweaver touchview internal_stylus touchscreen_wakeup"
+USE="${USE} -cros-debug -lacros_rootfs -camera_diagnostics -diagnostics-minidiag"
+
+VIDEO_CARDS="intel llvmpipe nouveau radeon iris"
+

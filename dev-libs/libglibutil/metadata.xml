@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE pkgmetadata SYSTEM "https://www.gentoo.org/dtd/metadata.dtd">
+<pkgmetadata>
+  <longdescription>
+    C utilities for glib-based programs, used as a dependency for libgbinder.
+    Required by Waydroid for Android container IPC.
+  </longdescription>
+  <!--
+    License evidence (audited 2026-08-25 against the pinned tarball,
+    SHA512 as recorded in Manifest):
+
+      LICENSE file: 3-clause BSD
+      https://github.com/sailfishos/libglibutil/blob/e2fe548f8cce21551fd59a461618ea586b5f98fb/LICENSE
+
+      Copyright (C) 2023-2025 Slava Monich <slava@monich.com>
+      Copyright (C) 2014-2022 Jolla Ltd.
+
+    50 of 79 files carry the same 3-clause BSD header; no GPL, LGPL, MIT
+    or Apache notice appears anywhere in the tree. rpm/libglibutil.spec
+    and debian/copyright both declare BSD, consistent with LICENSE.
+
+    Gentoo's "BSD" license file is the 3-clause text, so LICENSE="BSD" is
+    the correct declaration; Gentoo has no "BSD-3" alias.
+  -->
+  <upstream>
+    <remote-id type="github">sailfishos/libglibutil</remote-id>
+  </upstream>
+</pkgmetadata>

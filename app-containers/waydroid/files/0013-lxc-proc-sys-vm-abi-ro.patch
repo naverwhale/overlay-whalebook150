@@ -1,0 +1,58 @@
+From: WhaleOS <whaleos-dev@navercorp.com>
+Subject: [PATCH 13/13] config_base: bind-mount /proc/sys/{vm,abi} read-only into container
+
+Companion to PATCH 12/13.  Same isolation gap, same fix pattern --
+just for the other non-namespaced sysctl trees that the Waydroid
+Android image writes to during init.
+
+The Waydroid /system/etc/init/hw/init.rc writes (with `write
+/proc/sys/...`) to at least seven /proc/sys/vm/* paths on container
+boot.  None of /proc/sys/vm/* is network-namespace-aware -- it is
+all global, host-wide kernel memory-management state.  So the
+container inherits the privilege to retune (and weaken) the host:
+
+  vm/mmap_min_addr 32768       --> halves the host's NULL-deref
+                                   mitigation floor (typical default
+                                   is 65536); a regression for host
+                                   security baseline.
+  vm/overcommit_memory 1       --> forces host OOM policy into
+                                   "always overcommit" mode.
+  vm/drop_caches 3             --> flushes the host page cache +
+                                   dentry/inode caches every time
+                                   the container boots; observed to
+                                   correlate with post-boot host I/O
+                                   stalls (suspected contributor to
+                                   the Wi-Fi 4-way handshake timeout
+                                   symptom that mis-reports as
+                                   "wrong password" in the UI).
+  vm/watermark_boost_factor 0
+  vm/dirty_expire_centisecs 200
+  vm/dirty_background_ratio 5
+  vm/min_free_order_shift 4    --> host writeback / reclaim tuning
+                                   silently changed by the container.
+
+/proc/sys/abi/swp 1 is also written (line 423 of init.rc).  On x86
+this entry typically does not exist and the write is a no-op, but
+the same non-namespaced status applies in principle so the bind is
+included for parity.
+
+We deliberately do NOT bind /proc/sys/net read-only: that subtree
+IS network-namespace-aware, so each LXC net namespace sees its own
+view and writes there only affect the container's net ns -- exactly
+what Waydroid needs for its own networking setup.
+
+/proc/sys/fs is left writable too for now: Android init does not
+write under it, and some of its entries (binfmt_misc) are mount-ns
+aware.  If a future leak there shows up, the same pattern applies.
+
+--- a/data/configs/config_base
++++ b/data/configs/config_base
+@@ -22,3 +22,8 @@
+ # WhaleOS: block container writes to host /proc/sys/kernel/* (modprobe path,
+ # core_pattern, hotplug, ...).  See PATCH 12/12 header for full rationale.
+ lxc.mount.entry = /proc/sys/kernel proc/sys/kernel none ro,bind,optional 0 0
++
++# WhaleOS: block container writes to host /proc/sys/vm/* (mmap_min_addr,
++# overcommit_memory, drop_caches, dirty_*, ...).  See PATCH 13/13 header.
++lxc.mount.entry = /proc/sys/vm  proc/sys/vm  none ro,bind,optional 0 0
++lxc.mount.entry = /proc/sys/abi proc/sys/abi none ro,bind,optional 0 0

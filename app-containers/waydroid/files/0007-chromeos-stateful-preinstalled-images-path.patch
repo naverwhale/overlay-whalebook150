@@ -1,0 +1,20 @@
+From: WhaleOS <whaleos-dev@navercorp.com>
+Subject: [PATCH 7/7] Add stateful partition path to preinstalled_images_paths
+
+On WhaleOS/ChromeOS, Android images are pre-installed to the stateful
+partition during image build (board_finalize_base_image copies them to
+dev_image/share/waydroid-extra/images).  At runtime /usr/local is
+bind-mounted from stateful/dev_image, so the images are accessible at
+/usr/local/share/waydroid-extra/images.
+
+Add this path to preinstalled_images_paths so waydroid init finds the
+images without needing a symlink in the read-only rootfs.
+
+--- a/tools/config/__init__.py
++++ b/tools/config/__init__.py
+@@ -37,6 +37,7 @@
+     "preinstalled_images_paths": [
+         "/etc/waydroid-extra/images",
+         "/usr/share/waydroid-extra/images",
++        "/usr/local/share/waydroid-extra/images",
+     ],

@@ -1,0 +1,90 @@
+diff --git a/iioservice/daemon/BUILD.gn b/iioservice/daemon/BUILD.gn
+index cbfe7106c5..6767efb251 100644
+--- a/iioservice/daemon/BUILD.gn
++++ b/iioservice/daemon/BUILD.gn
+@@ -52,7 +52,7 @@ static_library("libiioservice") {
+     "sensor_service_impl.cc",
+   ]
+   configs += [ ":target_defaults_pkg_deps" ]
+-  public_pkg_deps = [ "libmems" ]
++public_pkg_deps = [ "libmems" ]
+ }
+ 
+ executable("iioservice") {
+diff --git a/iioservice/daemon/samples_handler_base.cc b/iioservice/daemon/samples_handler_base.cc
+index f7b05bb3c5..a0ebc3cbf5 100644
+--- a/iioservice/daemon/samples_handler_base.cc
++++ b/iioservice/daemon/samples_handler_base.cc
+@@ -11,6 +11,8 @@
+ #include <base/task/sequenced_task_runner.h>
+ #include <libmems/common_types.h>
+ 
++#include <brillo/whaleos_util.h>
++
+ #include "iioservice/daemon/sensor_metrics.h"
+ #include "iioservice/include/common.h"
+ 
+@@ -60,7 +62,15 @@ void SamplesHandlerBase::SampleData::SampleTimeout(uint64_t sample_index) {
+ 
+ SamplesHandlerBase::SamplesHandlerBase(
+     scoped_refptr<base::SequencedTaskRunner> task_runner)
+-    : task_runner_(std::move(task_runner)) {}
++    : task_runner_(std::move(task_runner)) {
++  if (brillo::IsPoin2Model()) {
++    need_invert_x_ = true;
++  } else if (brillo::IsGNEModel()) {
++    need_invert_x_ = true;
++    need_invert_y_ = true;
++    need_switch_xy_ = true;
++  }
++}
+ 
+ void SamplesHandlerBase::SetNoBatchChannels(
+     std::vector<std::string> channel_ids) {
+@@ -318,6 +328,17 @@ void SamplesHandlerBase::OnSampleAvailableOnThread(
+         }
+ 
+         client_sample[chn_index] = sample_data->chns_[chn_index] / denom;
++        if (need_invert_x_ && chn_index == 0)
++          client_sample[chn_index] = -client_sample[chn_index];
++        else if (need_invert_y_ && chn_index == 1)
++          client_sample[chn_index] = -client_sample[chn_index];
++        else if (need_invert_z_ && chn_index == 2)
++          client_sample[chn_index] = -client_sample[chn_index];
++      }
++      if (need_switch_xy_) {
++        int64_t tmp = client_sample[0];
++        client_sample[0] = client_sample[1];
++        client_sample[1] = tmp;
+       }
+ 
+       sample_data->sample_index_ = samples_cnt_ + 1;
+diff --git a/iioservice/daemon/samples_handler_base.h b/iioservice/daemon/samples_handler_base.h
+index cd100f87a6..745ff24437 100644
+--- a/iioservice/daemon/samples_handler_base.h
++++ b/iioservice/daemon/samples_handler_base.h
+@@ -100,6 +100,11 @@ class SamplesHandlerBase {
+   std::set<int32_t> no_batch_chn_indices_;
+ 
+  private:
++  bool need_invert_x_;
++  bool need_invert_y_;
++  bool need_invert_z_;
++  bool need_switch_xy_;
++
+   base::WeakPtrFactory<SamplesHandlerBase> weak_factory_{this};
+ };
+ 
+diff --git a/iioservice/daemon/sensor_device_impl.cc b/iioservice/daemon/sensor_device_impl.cc
+index 3368e0127f..e778144ab1 100644
+--- a/iioservice/daemon/sensor_device_impl.cc
++++ b/iioservice/daemon/sensor_device_impl.cc
+@@ -267,6 +267,8 @@ void SensorDeviceImpl::GetAttributes(const std::vector<std::string>& attr_names,
+             value_opt = cros::mojom::kLocationLid;
+           }
+         }
++        // sensor location is alway lid for WHALEBOOK
++        value_opt = cros::mojom::kLocationLid;
+       }
+     }
+ 

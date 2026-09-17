@@ -1,0 +1,23 @@
+CONFIG_VENDOR_GOOGLE=y
+CONFIG_BOARD_GOOGLE_BLUEY=y
+CONFIG_CHROMEOS=y
+# CONFIG_CBFS_VERIFICATION is not set
+# CONFIG_CONSOLE_SERIAL is not set
+CONFIG_USE_BLOBS=y
+CONFIG_USE_QC_BLOBS=y
+
+# Enable Firmware Splash Screen
+CONFIG_CHROMEOS_FW_SPLASH_SCREEN=y
+CONFIG_CHROMEOS_LOGO_PATH="bootsplash_assets/oem_main_logo/d3556d78/logo_100_percent.bmp"
+CONFIG_CHROMEBOOK_PLUS_LOGO_PATH="bootsplash_assets/oem_main_logo/d3556d78/logo_200_percent.bmp"
+
+# Enable Low Battery Indicator
+CONFIG_PLATFORM_HAS_LOW_BATTERY_INDICATOR=y
+CONFIG_PLATFORM_LOW_BATTERY_INDICATOR_LOGO_PATH="bootsplash_assets/battery_low_100_percent.bmp"
+
+# Enable Off-Mode Charging Indicator
+CONFIG_PLATFORM_HAS_OFF_MODE_CHARGING_INDICATOR=y
+CONFIG_PLATFORM_OFF_MODE_CHARGING_INDICATOR_LOGO_PATH="bootsplash_assets/battery_charging_100_percent.bmp"
+
+# Enable Text based splash screen
+CONFIG_FRAMEBUFFER_SPLASH_TEXT=y

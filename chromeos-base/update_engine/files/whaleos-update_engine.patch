@@ -1,0 +1,312 @@
+diff --git a/update_engine/cros/hardware_chromeos.cc b/update_engine/cros/hardware_chromeos.cc
+index 078e12938c..cf9b5a6659 100644
+--- a/update_engine/cros/hardware_chromeos.cc
++++ b/update_engine/cros/hardware_chromeos.cc
+@@ -241,6 +241,23 @@ string HardwareChromeOS::GetHardwareClass() const {
+   if (USE_HWID_OVERRIDE) {
+     return HwidOverride::Read(base::FilePath("/"));
+   }
++
++  const char* kProductNamePath = "/sys/class/dmi/id/product_name";
++  string product_name;
++  if (base::ReadFileToString(base::FilePath(kProductNamePath), &product_name)) {
++    const char* kSysVendorPath = "/sys/class/dmi/id/sys_vendor";
++    string sys_vendor;
++    if (base::ReadFileToString(base::FilePath(kSysVendorPath), &sys_vendor) &&
++        sys_vendor == "LG Electronics") {
++      const size_t index = product_name.find("-");
++      if (index != std::string::npos) {
++        product_name.resize(index);
++      }
++    }
++    return product_name;
++  }
++  LOG(ERROR) << "Failed to read product_name";
++
+   return ReadValueFromCrosSystem("hwid");
+ }
+ 
+diff --git a/update_engine/cros/omaha_request_action.cc b/update_engine/cros/omaha_request_action.cc
+index d077cf13fa..8c075d24d4 100644
+--- a/update_engine/cros/omaha_request_action.cc
++++ b/update_engine/cros/omaha_request_action.cc
+@@ -243,10 +243,14 @@ void OmahaRequestAction::PerformAction() {
+     return;
+   }
+ 
++  const std::string& next_version =
++      SystemState::Get()->update_attempter()->GetNewVersion();
+   OmahaRequestBuilderXml omaha_request(event_.get(), ping_only_,
+                                        ShouldPing(),  // include_ping
+                                        ping_active_days_, ping_roll_call_days_,
+-                                       GetInstallDate(), session_id_);
++                                       GetInstallDate(),
++                                       next_version,
++                                       session_id_);
+   string request_post = omaha_request.GetRequest();
+ 
+   // Set X-Goog-Update headers.
+@@ -772,12 +776,6 @@ void OmahaRequestAction::TransferComplete(HttpFetcher* fetcher,
+   // need to check if a=-1 has been sent because older devices have already sent
+   // their a=-1 in the past and we have to set first_active_omaha_ping_sent for
+   // future checks.
+-  if (!SystemState::Get()->hardware()->GetFirstActiveOmahaPingSent()) {
+-    if (!SystemState::Get()->hardware()->SetFirstActiveOmahaPingSent()) {
+-      SystemState::Get()->metrics_reporter()->ReportInternalErrorCode(
+-          ErrorCode::kFirstActiveOmahaPingSentPersistenceError);
+-    }
+-  }
+ 
+   // Create/update the metadata files for each DLC app received.
+   StorePingReply();
+diff --git a/update_engine/cros/omaha_request_builder_xml.cc b/update_engine/cros/omaha_request_builder_xml.cc
+index 7050f1c673..dd793248bc 100644
+--- a/update_engine/cros/omaha_request_builder_xml.cc
++++ b/update_engine/cros/omaha_request_builder_xml.cc
+@@ -25,6 +25,8 @@
+ #include "update_engine/cros/omaha_request_params.h"
+ #include "update_engine/cros/update_attempter.h"
+ 
++#include <brillo/whaleos_util.h>
++
+ using std::string;
+ 
+ namespace chromeos_update_engine {
+@@ -233,9 +235,33 @@ string OmahaRequestBuilderXml::GetAppBody(const OmahaAppData& app_data) const {
+           " errorcode=\"%d\"",
+           static_cast<int>(ErrorCode::kPackageExcludedFromUpdate));
+     }
++    string previous_version = base::StringPrintf(
++        " previousversion=\"%s\"",
++        app_data.version.c_str());
++    string next_version = base::StringPrintf(
++        " nextversion=\"%s\"",
++        next_version_.c_str());
++    string total, downloaded;
++    if (event_->type == OmahaEvent::kTypeDownloadComplete ||
++        event_->type == OmahaEvent::kTypeInstallComplete ||
++        event_->type == OmahaEvent::kTypeUpdateComplete ||
++        event_->type == OmahaEvent::kTypeUpdateDownloadFinished) {
++      downloaded = base::StringPrintf(
++          " downloaded=\"%lu\"",
++          SystemState::Get()->update_attempter()->GetDownloaded());
++      total = base::StringPrintf(
++          " total=\"%lu\"",
++          SystemState::Get()->update_attempter()->GetTotal());
++    }
+     app_body = base::StringPrintf(
+-        "        <event eventtype=\"%d\" eventresult=\"%d\"%s></event>\n",
+-        event_->type, event_result, error_code.c_str());
++        "        <event eventtype=\"%d\" eventresult=\"%d\"%s%s%s%s%s></event>\n",
++        event_->type,
++        event_result,
++        error_code.c_str(),
++        total.c_str(),
++        downloaded.c_str(),
++        previous_version.c_str(),
++        next_version.c_str());
+   }
+ 
+   return app_body;
+@@ -392,6 +418,9 @@ string OmahaRequestBuilderXml::GetApp(const OmahaAppData& app_data) const {
+     }
+   }
+ 
++  string partial_deployment_arg =
++    "tag=\"" + XmlEncodeWithDefault(brillo::GetProductUuid()) + "\" ";
++
+   // clang-format off
+   string app_xml = "    <app "
+       "appid=\"" + XmlEncodeWithDefault(app_data.id) + "\" " +
+@@ -406,6 +435,9 @@ string OmahaRequestBuilderXml::GetApp(const OmahaAppData& app_data) const {
+       "delta_okay=\"" + delta_okay_str + "\" " +
+       "extended_okay=\"" + extended_okay_str + "\" " +
+       install_date_in_days_str +
++
++      ((app_data.is_dlc || app_data.is_minios) ? "" : partial_deployment_arg) +
++
+       ">\n" +
+          app_body +
+       "    </app>\n";
+diff --git a/update_engine/cros/omaha_request_builder_xml.h b/update_engine/cros/omaha_request_builder_xml.h
+index d7a0e1d4a0..31e72b2ceb 100644
+--- a/update_engine/cros/omaha_request_builder_xml.h
++++ b/update_engine/cros/omaha_request_builder_xml.h
+@@ -115,6 +115,7 @@ class OmahaRequestBuilderXml : OmahaRequestBuilder {
+                          int ping_active_days,
+                          int ping_roll_call_days,
+                          int install_date_in_days,
++                         const std::string& next_version,
+                          const std::string& session_id)
+       : event_(event),
+         ping_only_(ping_only),
+@@ -122,6 +123,7 @@ class OmahaRequestBuilderXml : OmahaRequestBuilder {
+         ping_active_days_(ping_active_days),
+         ping_roll_call_days_(ping_roll_call_days),
+         install_date_in_days_(install_date_in_days),
++        next_version_(next_version),
+         session_id_(session_id) {}
+   OmahaRequestBuilderXml(const OmahaRequestBuilderXml&) = delete;
+   OmahaRequestBuilderXml& operator=(const OmahaRequestBuilderXml&) = delete;
+@@ -180,6 +182,7 @@ class OmahaRequestBuilderXml : OmahaRequestBuilder {
+   int ping_active_days_;
+   int ping_roll_call_days_;
+   int install_date_in_days_;
++  std::string next_version_;
+   std::string session_id_;
+ };
+ 
+diff --git a/update_engine/cros/update_attempter.cc b/update_engine/cros/update_attempter.cc
+index dddb75dc4a..5261273dd5 100644
+--- a/update_engine/cros/update_attempter.cc
++++ b/update_engine/cros/update_attempter.cc
+@@ -64,6 +64,8 @@
+ #include "update_engine/update_manager/update_manager.h"
+ #include "update_engine/update_status_utils.h"
+ 
++#include "update_engine/common/error_code_utils.h"
++
+ using base::FilePath;
+ using base::Time;
+ using base::TimeDelta;
+@@ -1443,6 +1445,8 @@ void UpdateAttempter::ProcessingDoneInternal(const ActionProcessor* processor,
+   }
+ 
+   if (code != ErrorCode::kSuccess) {
++    // Report update failure to crash_reporter for NELO logging.
++    ReportUpdateFailureToCrashReporter(code);
+     if (ScheduleErrorEventAction()) {
+       return;
+     }
+@@ -1489,6 +1493,53 @@ void UpdateAttempter::ProcessingDoneInternal(const ActionProcessor* processor,
+   }
+ }
+ 
++void UpdateAttempter::ReportUpdateFailureToCrashReporter(ErrorCode code) {
++  // Skip non-actionable error codes that don't represent real failures.
++  ErrorCode base_code = utils::GetBaseErrorCode(code);
++  if (base_code == ErrorCode::kSuccess ||
++      base_code == ErrorCode::kNoUpdate ||
++      base_code == ErrorCode::kOmahaUpdateDeferredPerPolicy ||
++      base_code == ErrorCode::kOmahaUpdateDeferredForBackoff ||
++      base_code == ErrorCode::kUserCanceled ||
++      base_code == ErrorCode::kOmahaUpdateIgnoredOverCellular ||
++      base_code == ErrorCode::kOmahaUpdateIgnoredOverMetered ||
++      base_code == ErrorCode::kUpdatedButNotActive ||
++      base_code == ErrorCode::kNonCriticalUpdateInOOBE ||
++      base_code == ErrorCode::kOmahaErrorInHTTPResponse ||
++      base_code == ErrorCode::kRepeatedFpFromOmahaError ||
++      base_code == ErrorCode::kUpdateIgnoredRollbackVersion ||
++      base_code == ErrorCode::kInvalidateLastUpdate ||
++      base_code == ErrorCode::kNonCriticalUpdateEnrollmentRecovery) {
++    return;
++  }
++
++  string error_type = chromeos_update_engine::utils::ErrorCodeToString(code);
++  // Strip "ErrorCode::k" prefix for consistent PascalCase naming across modules
++  // (e.g., "ErrorCode::kDownloadTransferError" -> "DownloadTransferError").
++  const string kErrorCodePrefix = "ErrorCode::k";
++  if (base::StartsWith(error_type, kErrorCodePrefix,
++                       base::CompareCase::SENSITIVE)) {
++    error_type = error_type.substr(kErrorCodePrefix.size());
++  }
++
++  vector<string> cmd = {
++      "/sbin/crash_reporter",
++      "--update_failure=update_engine",
++      base::StringPrintf("--update_error_type=%s", error_type.c_str()),
++  };
++
++  int exit_code = 0;
++  if (!Subprocess::SynchronousExec(cmd, &exit_code, nullptr, nullptr)) {
++    LOG(WARNING) << "Failed to invoke crash_reporter for update failure: "
++                 << error_type;
++  } else if (exit_code != 0) {
++    LOG(WARNING) << "crash_reporter exited with code " << exit_code
++                 << " for update failure: " << error_type;
++  } else {
++    LOG(INFO) << "Reported update failure to crash_reporter: " << error_type;
++  }
++}
++
+ vector<string> UpdateAttempter::GetSuccessfulDlcIds() {
+   vector<string> dlc_ids;
+   for (const auto& pr : omaha_request_params_->dlc_apps_params()) {
+@@ -1847,6 +1898,7 @@ void UpdateAttempter::ProgressUpdate(uint64_t bytes_received, uint64_t total) {
+   if (total) {
+     progress = static_cast<double>(bytes_received) / static_cast<double>(total);
+   }
++  bytes_received_ = bytes_received;
+   if (status_ != UpdateStatus::DOWNLOADING || bytes_received == total) {
+     download_progress_ = progress;
+     SetStatusAndNotify(UpdateStatus::DOWNLOADING);
+diff --git a/update_engine/cros/update_attempter.h b/update_engine/cros/update_attempter.h
+index a5aef48fb3..443e7542d0 100644
+--- a/update_engine/cros/update_attempter.h
++++ b/update_engine/cros/update_attempter.h
+@@ -246,6 +246,10 @@ class UpdateAttempter : public ActionProcessorDelegate,
+   // This will return an empty string otherwise.
+   const std::string& GetPrevVersion() const { return prev_version_; }
+ 
++  const std::string& GetNewVersion() const { return new_version_; }
++  const uint64_t GetTotal() const { return new_payload_size_; }
++  const uint64_t GetDownloaded() const { return bytes_received_; }
++
+   // Returns the number of consecutive failed update checks.
+   virtual unsigned int consecutive_failed_update_checks() const {
+     return consecutive_failed_update_checks_;
+@@ -416,6 +420,9 @@ class UpdateAttempter : public ActionProcessorDelegate,
+   // parameters used in the current update attempt.
+   uint32_t GetErrorCodeFlags();
+ 
++  // Report update failure to crash_reporter for NELO logging.
++  void ReportUpdateFailureToCrashReporter(ErrorCode code);
++
+   // ActionProcessorDelegate methods |ProcessingDone()| internal helpers.
+   void ProcessingDoneInternal(const ActionProcessor* processor, ErrorCode code);
+   void ProcessingDoneUpdate(const ActionProcessor* processor, ErrorCode code);
+@@ -652,6 +659,7 @@ class UpdateAttempter : public ActionProcessorDelegate,
+   std::string prev_version_;
+   std::string new_version_ = "0.0.0.0";
+   uint64_t new_payload_size_ = 0;
++  uint64_t bytes_received_ = 0;
+   // Flags influencing all periodic update checks
+   update_engine::UpdateFlags update_flags_;
+   // Flags influencing the currently in-progress check (cached at the start of
+diff --git a/update_engine/payload_consumer/postinstall_runner_action.cc b/update_engine/payload_consumer/postinstall_runner_action.cc
+index 9de7e42cf3..6e7cd949c1 100644
+--- a/update_engine/payload_consumer/postinstall_runner_action.cc
++++ b/update_engine/payload_consumer/postinstall_runner_action.cc
+@@ -293,7 +293,17 @@ void PostinstallRunnerAction::Cleanup() {
+ 
+ void PostinstallRunnerAction::CompletePartitionPostinstall(
+     int return_code, const string& output) {
++  // TODO(seongwon): Remove this workaround fallback when we figure out
++  // GPT attributes recovered properly on postinst failure.
++  if (return_code == 15) {
++    if (!boot_control_->MarkSlotUnbootable(install_plan_.target_slot))
++      LOG(ERROR) << "Failed to mark slot unbootable.";
++    if (!boot_control_->SetActiveBootSlot(boot_control_->GetCurrentSlot()))
++      LOG(ERROR) << "Failed to set active boot slot.";
++  }
++
+   current_command_ = 0;
++
+   Cleanup();
+ 
+   if (return_code != 0) {
+@@ -411,6 +421,14 @@ void PostinstallRunnerAction::TerminateProcessing() {
+   if (!current_command_) {
+     return;
+   }
++
++  // TODO(seongwon): Remove this workaround fallback when we figure out
++  // GPT attributes recovered properly on postinst failure.
++  if (!boot_control_->MarkSlotUnbootable(install_plan_.target_slot))
++    LOG(ERROR) << "Failed to mark slot unbootable.";
++  if (!boot_control_->SetActiveBootSlot(boot_control_->GetCurrentSlot()))
++    LOG(ERROR) << "Failed to set active boot slot.";
++
+   // Calling KillExec() will discard the callback we registered and therefore
+   // the unretained reference to this object.
+   Subprocess::Get().KillExec(current_command_);

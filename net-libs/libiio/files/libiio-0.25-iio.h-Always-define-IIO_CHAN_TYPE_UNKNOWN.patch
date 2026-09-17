@@ -1,0 +1,32 @@
+From 1294bbd44d7a1af05e6659f88b8173a687937400 Mon Sep 17 00:00:00 2001
+From: Gwendal Grignou <gwendal@chromium.org>
+Date: Fri, 6 Sep 2024 14:20:42 -0700
+Subject: [PATCH] iio.h: Always define IIO_CHAN_TYPE_UNKNOWN
+
+---
+ iio.h | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/iio.h b/iio.h
+index 135e335c..d9b93fac 100644
+--- a/iio.h
++++ b/iio.h
+@@ -134,7 +134,6 @@ enum iio_chan_type {
+ 	IIO_POSITIONRELATIVE,
+ 	IIO_PHASE,
+ 	IIO_MASSCONCENTRATION,
+-	IIO_CHAN_TYPE_UNKNOWN = INT_MAX
+ };
+ 
+ /**
+@@ -233,6 +232,7 @@ enum iio_event_direction {
+ 
+ #endif /* _IIO_TYPES_H_ */
+ 
++#define	IIO_CHAN_TYPE_UNKNOWN INT_MAX
+ /* ---------------------------------------------------------------------------*/
+ /* ------------------------- Scan functions ----------------------------------*/
+ /** @defgroup Scan Functions for scanning available contexts
+-- 
+2.46.0.469.g59c65b2a67-goog
+

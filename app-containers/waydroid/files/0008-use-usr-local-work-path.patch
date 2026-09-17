@@ -1,0 +1,41 @@
+From: WhaleOS <whaleos-dev@navercorp.com>
+Subject: [PATCH 8/8] Use /usr/local/var/lib/waydroid as work directory
+
+On ChromeOS/WhaleOS, /var is an encrypted bind-mount from the stateful
+partition.  systemd-tmpfiles fails with SELinux context errors when trying
+to create /var/lib/waydroid at early boot (no SELinux policy exists for
+this path), triggering a stateful partition clobber loop.
+
+/usr/local is a non-encrypted bind-mount from stateful/dev_image and has
+no SELinux restrictions.  The directory skeleton is pre-created by the
+ebuild's src_install so it is present from the first boot without any
+runtime or tmpfiles.d setup.
+
+--- a/tools/config/__init__.py
++++ b/tools/config/__init__.py
+@@ -31,5 +31,5 @@
+ defaults = {
+     "arch": "arm64",
+-    "work": "/var/lib/waydroid",
++    "work": "/usr/local/var/lib/waydroid",
+     "vendor_type": "MAINLINE",
+     "system_datetime": "0",
+--- a/data/configs/config_base
++++ b/data/configs/config_base
+@@ -1,5 +1,5 @@
+ # Waydroid LXC Config
+
+-lxc.rootfs.path = /var/lib/waydroid/rootfs
++lxc.rootfs.path = /usr/local/var/lib/waydroid/rootfs
+ lxc.arch = LXCARCH
+ lxc.autodev = 0
+@@ -11,7 +11,7 @@
+
+ lxc.console.path = none
+
+-lxc.include = /var/lib/waydroid/lxc/waydroid/config_nodes
+-lxc.include = /var/lib/waydroid/lxc/waydroid/config_session
++lxc.include = /usr/local/var/lib/waydroid/lxc/waydroid/config_nodes
++lxc.include = /usr/local/var/lib/waydroid/lxc/waydroid/config_session
+
+

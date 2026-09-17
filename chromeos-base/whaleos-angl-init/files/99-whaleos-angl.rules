@@ -1,0 +1,1 @@
+ACTION=="add", ATTR{name}=="angl", RUN+="/lib/udev/whaleos-angl-init.sh %k"

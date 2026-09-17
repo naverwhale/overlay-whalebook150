@@ -1,0 +1,13 @@
+diff --git a/missive/util/dynamic_flag.cc b/missive/util/dynamic_flag.cc
+index 2f0d13ea62..38bd9e5318 100644
+--- a/missive/util/dynamic_flag.cc
++++ b/missive/util/dynamic_flag.cc
+@@ -21,7 +21,7 @@ DynamicFlag::DynamicFlag(std::string_view name, bool is_enabled)
+ DynamicFlag::~DynamicFlag() = default;
+ 
+ bool DynamicFlag::is_enabled() const {
+-  return is_enabled_.load();
++  return is_enabled_.load(std::memory_order_acquire);
+ }
+ 
+ void DynamicFlag::OnValueUpdate(bool is_enabled) {

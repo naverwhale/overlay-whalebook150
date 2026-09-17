@@ -1,0 +1,25 @@
+CONFIG_VENDOR_GOOGLE=y
+CONFIG_BOARD_GOOGLE_OCELOT=y
+CONFIG_VBOOT_FWID_MODEL="Google_Ocelot"
+
+# Enable Early Splash Screen
+CONFIG_CHROMEOS_FW_SPLASH_SCREEN=y
+CONFIG_CHROMEOS_LOGO_PATH="bootsplash_assets/oem_main_logo/d3556d78/logo_200_percent.bmp"
+CONFIG_CHROMEBOOK_PLUS_LOGO_PATH="bootsplash_assets/chromebook_plus_200_percent.bmp"
+
+# Low-battery indicator
+CONFIG_PLATFORM_LOW_BATTERY_INDICATOR_LOGO_PATH="bootsplash_assets/low_battery_200_percent.bmp"
+
+# SPI Descriptor
+CONFIG_IFD_BIN_PATH="3rdparty/blobs/mainboard/google/ocelot/descriptor-ocelot.bin"
+
+# CSE data
+# CONFIG_CSE_DATA_FILE="cse_data/cse_data-ocelot.bin"
+CONFIG_ME_BIN_PATH="3rdparty/blobs/mainboard/google/ocelot/csme-ocelot.bin"
+CONFIG_SOC_INTEL_CSE_RW_FILE="3rdparty/blobs/mainboard/google/ocelot/me_rw-ocelot.bin"
+
+# Video Blob
+CONFIG_INTEL_GMA_VBT_FILE="3rdparty/blobs/mainboard/google/ocelot/vbt/vbt-ocelot.bin"
+
+# Microcode
+CONFIG_CPU_INTEL_UCODE_SPLIT_BINARIES="3rdparty/blobs/mainboard/google/ocelot/microcode_inputs/ocelot"

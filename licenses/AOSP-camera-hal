@@ -1,0 +1,83 @@
+==============================================================================
+Android external camera HAL for the Waydroid container
+  camera.device@3.4-external-impl.so
+
+  // SPDX-License-Identifier: Apache-2.0
+==============================================================================
+   =========================================================================
+   ==  NOTICE file corresponding to the section 4 d of                    ==
+   ==  the Apache License, Version 2.0,                                   ==
+   ==  in this case for the Android-specific code.                        ==
+   =========================================================================
+
+Android Code
+Copyright (C) The Android Open Source Project
+
+This product includes software developed as part of
+The Android Open Source Project (http://source.android.com).
+
+The shipped library is the build output of
+
+  hardware/interfaces/camera/device/3.4/default/
+      ExternalCameraDevice.cpp
+      ExternalCameraDeviceSession.cpp
+      ExternalCameraUtils.cpp
+
+and the matching 3.5 / 3.6 inheritance plus the generated HIDL types,
+as built for the LineageOS 20.0 (Android 13) waydroid_x86_64 vendor
+image:
+
+  https://sourceforge.net/projects/waydroid/files/images/vendor/
+      waydroid_x86_64/
+      lineage-20.0-20260428-MAINLINE-waydroid_x86_64-vendor.zip
+  path inside vendor.img: /lib/camera.device@3.4-external-impl.so
+
+LineageOS Code
+Copyright (C) The LineageOS Project
+
+This product includes software developed as part of
+The LineageOS Project (https://lineageos.org).
+
+   =========================================================================
+   ==  Notice of modification, per section 4 b of                         ==
+   ==  the Apache License, Version 2.0.                                   ==
+   =========================================================================
+
+NAVER Corporation has modified this binary.
+
+Six bytes at file offset 0x426e6 were overwritten with NOP
+instructions, neutralising a single unsigned-greater conditional branch
+in ExternalCameraDeviceSession::configureV4l2StreamLocked().  The
+branch rejected V4L2 buffer sizes larger than width * height * 2, which
+several UVC camera firmwares over-report by a constant metadata
+padding, leaving those cameras with no usable stream.
+
+  before: 0f 87 ba 01 00 00      ; ja  <error>
+  after:  90 90 90 90 90 90      ; 6 x nop
+
+No other byte of the file was changed; the GNU build-ID, .dynsym and
+every other code path are byte-identical to the upstream LineageOS
+20.0 build.  The full rationale and the disassembly of the affected
+hot path are recorded in the package's ebuild.
+
+  MD5 unmodified : 2b2b0a73e12e0083f684496f224d54b0
+  MD5 modified   : 4971b50f4e9d02b11de71637c9a2fabc
+
+The modified binary remains under the Apache License, Version 2.0; it
+is not relicensed.
+
+   =========================================================================
+   ==  Apache License, Version 2.0                                        ==
+   =========================================================================
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.

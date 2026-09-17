@@ -1,0 +1,99 @@
+From: WhaleOS <whaleos-dev@navercorp.com>
+Subject: [PATCH 5/5] Fix waydroid session commands on ChromeOS/WhaleOS
+
+ChromeOS has no session D-Bus daemon, no /root/.local directory, and
+uses /run/chrome as the Wayland runtime dir.  Three fixes to make
+"waydroid show-full-ui" and "waydroid session start" work without any
+manual environment setup.
+
+* tools/helpers/ipc.py:
+  Add _ensure_session_bus(): automatically starts dbus-daemon at a fixed
+  unix socket (/run/waydroid-session.sock) using ANONYMOUS auth
+  (/usr/share/waydroid/waydroid-session-bus.conf) so both root and the
+  chronos user can connect without needing the bus owner's dbus cookie
+  directory.  Sets DBUS_SESSION_BUS_ADDRESS.  Called before every SessionBus()
+  use.
+
+* tools/config/__init__.py:
+  - Default xdg_data_home to /var/lib (instead of ~/.local/share) when
+    /root/.local does not exist, so waydroid_data resolves to the path
+    used by "waydroid init" (/var/lib/waydroid/data).
+  - Default xdg_runtime_dir to /run/chrome and wayland_display to
+    wayland-0 when /run/chrome/wayland-0 exists (ChromeOS Wayland socket).
+
+* tools/actions/session_manager.py:
+  - Call _ensure_session_bus() in start() before registering id.waydro.Session.
+  - Treat ContainerManager.Start "Already tracking a session" as non-fatal:
+    the waydroid-container upstart job may have already started the container;
+    session services can still attach to it.
+
+--- a/tools/config/__init__.py
++++ b/tools/config/__init__.py
+@@ -55,1 +55,6 @@ defaults["container_pulse_runtime_path"] = defaults["container_xdg_runtime_dir"
+ defaults["container_pulse_runtime_path"] = defaults["container_xdg_runtime_dir"] + "/pulse"
++# WhaleOS: /root/.local does not exist on ChromeOS; fall back to /usr/local/var/lib
++_home_local = os.path.expanduser("~") + "/.local/share"
++_default_xdg_data = _home_local if os.path.exists(os.path.dirname(_home_local)) else "/usr/local/var/lib"
++# WhaleOS: ChromeOS uses /run/chrome as the Wayland runtime directory
++_has_chrome_wayland = os.path.exists("/run/chrome/wayland-0")
+@@ -61,7 +66,7 @@ session_defaults = {
+     "host_user": os.path.expanduser("~"),
+     "pid": str(os.getpid()),
+-    "xdg_data_home": str(os.environ.get('XDG_DATA_HOME', os.path.expanduser("~") + "/.local/share")),
+-    "xdg_runtime_dir": str(os.environ.get('XDG_RUNTIME_DIR')),
+-    "wayland_display": str(os.environ.get('WAYLAND_DISPLAY')),
++    "xdg_data_home": str(os.environ.get('XDG_DATA_HOME', _default_xdg_data)),
++    "xdg_runtime_dir": str(os.environ.get('XDG_RUNTIME_DIR', "/run/chrome" if _has_chrome_wayland else None)),
++    "wayland_display": str(os.environ.get('WAYLAND_DISPLAY', "wayland-0" if _has_chrome_wayland else None)),
+     "pulse_runtime_path": str(os.environ.get('PULSE_RUNTIME_PATH')),
+     "state": "STOPPED",
+--- a/tools/helpers/ipc.py
++++ b/tools/helpers/ipc.py
+@@ -5,2 +5,18 @@
+ import os
++import subprocess
+ import dbus
++
++# Bus config that uses ANONYMOUS auth so both root and chronos can connect to
++# the same socket without needing access to the owner's dbus cookie directory.
++_SESSION_BUS_CONF = "/usr/share/waydroid/waydroid-session-bus.conf"
++_SESSION_BUS_SOCK = "/run/waydroid-session.sock"
++
++def _ensure_session_bus():
++    """ChromeOS has no session bus daemon; start one at a fixed socket path."""
++    if not os.environ.get("DBUS_SESSION_BUS_ADDRESS"):
++        if not os.path.exists(_SESSION_BUS_SOCK):
++            subprocess.run(
++                ["dbus-daemon", "--config-file=" + _SESSION_BUS_CONF, "--fork"],
++                check=False)
++        os.environ["DBUS_SESSION_BUS_ADDRESS"] = "unix:path=" + _SESSION_BUS_SOCK
++
+@@ -11,2 +27,3 @@
+ def DBusSessionService(object_path="/SessionManager", intf="id.waydro.SessionManager"):
+-    return dbus.Interface(dbus.SessionBus().get_object("id.waydro.Session", object_path), intf)
++    _ensure_session_bus()
++    return dbus.Interface(dbus.SessionBus().get_object("id.waydro.Session", object_path), intf)
+--- a/tools/actions/session_manager.py
++++ b/tools/actions/session_manager.py
+@@ -40,2 +40,3 @@ def start(args, unlocked_cb=None, background=True):
+ def start(args, unlocked_cb=None, background=True):
++    tools.helpers.ipc._ensure_session_bus()
+     try:
+@@ -99,10 +100,15 @@ def start(args, unlocked_cb=None, background=True):
+     except dbus.DBusException as e:
+         logging.debug(e)
+         if e.get_dbus_name().startswith("org.freedesktop.DBus.Python"):
+-            logging.error(e.get_dbus_message().splitlines()[-1])
++            msg = e.get_dbus_message().splitlines()[-1]
++            if "Already tracking" in msg:
++                logging.info("Container already running, attaching session")
++            else:
++                logging.error(msg)
++                sys.exit(0)
+         else:
+             logging.error("WayDroid container is not listening")
+-        sys.exit(0)
++            sys.exit(0)
+
+     services.user_manager.start(args, session, unlocked_cb)
+     services.clipboard_manager.start(args)

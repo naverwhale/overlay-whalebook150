@@ -1,0 +1,52 @@
+#!/bin/sh
+# Waydroid-only entrypoint for lxc-start.
+#
+# Installed at /usr/lib/waydroid/bin/lxc-start and labeled
+# whaleos_waydroid_exec in platform2/sepolicy/file_contexts.  The
+# waydroid-container / waydroid-session upstart jobs prepend
+# /usr/lib/waydroid/bin to PATH so Waydroid's Python helpers
+# (helpers/lxc.py: `subprocess.Popen(["lxc-start", ...])`) resolve
+# `lxc-start` to this wrapper and transition into the
+# whaleos_waydroid SELinux domain.
+#
+# We deliberately do NOT label /usr/bin/lxc-start itself: other LXC
+# users on the host (e.g. dev-mode debugging containers) keep their
+# original domain so the new permissive whaleos_waydroid domain
+# doesn't pull in unrelated lxc-start invocations.
+
+# ----- Fix the wayland/pulse socket bind mount race ------------------
+#
+# Waydroid's config_session generator emits *file-level* rbind mounts
+# for the host's wayland-0 and pulse/native sockets:
+#
+#   lxc.mount.entry = tmpfs /run/xdg none create=dir 0 0
+#   lxc.mount.entry = /run/chrome/wayland-0 run/xdg/wayland-0 none rbind,create=file 0 0
+#   lxc.mount.entry = /run/chrome/pulse/native run/xdg/pulse/native none rbind,create=file 0 0
+#
+# File-bind captures the source inode at container start.  On ChromeOS
+# the wayland-0 socket inode changes across sign-in (session_manager
+# respawns chrome for the user profile, chrome unlinks + recreates
+# /run/chrome/wayland-0), leaving the container pointed at a dead
+# inode.  hwcomposer.waydroid.so then can't connect and SurfaceFlinger
+# never comes up ("black screen on launch").
+#
+# Rewrite to a *directory* rbind of /run/chrome onto /run/xdg so
+# path resolution happens live at each open() -- the container
+# always sees whatever socket is currently at the host path.
+#
+# Idempotent: uses a sentinel comment so a re-exec doesn't re-patch.
+_fix_wayland_mount_race() {
+  cfg="/usr/local/var/lib/waydroid/lxc/waydroid/config_session"
+  [ -f "${cfg}" ] || return 0
+  grep -q "# whaleos: dir-bind /run/chrome$" "${cfg}" && return 0
+  # sed script:
+  #   1) delete the file-bind lines for wayland-0 and pulse/native
+  #   2) rewrite the tmpfs line to a dir rbind of /run/chrome
+  sed -i \
+    -e '/rbind,create=file 0 0$/{/\/run\/chrome\/wayland-0/d;/\/run\/chrome\/pulse\/native/d;}' \
+    -e 's|^lxc.mount.entry = tmpfs /run/xdg none create=dir 0 0$|lxc.mount.entry = /run/chrome run/xdg none rbind,create=dir 0 0 # whaleos: dir-bind /run/chrome|' \
+    "${cfg}"
+}
+_fix_wayland_mount_race
+
+exec /usr/bin/lxc-start "$@"

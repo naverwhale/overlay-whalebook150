@@ -1,0 +1,59 @@
+From: WhaleOS <whaleos-dev@navercorp.com>
+Subject: [PATCH 15/15] hardware_manager: drop container-side suspend hook
+
+Waydroid's IHardware.suspend() Binder callback is invoked by Android's
+SystemSuspend HAL once PowerManagerService decides the device should
+sleep: typically after Doze has released all wake locks.  Upstream's
+default action is to freeze the lxc.payload.<name> cgroup via
+`lxc-freeze`, on the assumption that Waydroid is the only suspend
+driver on the system.
+
+On WhaleOS this collides with the host's suspend cycle:
+
+  1. host powerd sends SuspendImminent
+  2. waydroid_helper's SuspendCoordinator runs `cmd deviceidle force-idle
+     deep` to let Android release wake locks early (block_suspend cap
+     is required for InputManagerService, so we can't just remove the
+     wake-source path).
+  3. Android, now in Doze with no wake locks, calls IHardware.suspend()
+     -- and the hook freezes lxc.payload.waydroid.
+  4. AlarmManager (and other system_server threads) enter
+     __refrigerator() mid-epoll_wait.  Any timerfd that fires after
+     this point gets EPOLLWAKEUP -> ep_pm_stay_awake() but never
+     ep_pm_relax() because ep_send_events() can't run on a frozen
+     thread.
+  5. The frozen wakeup sources keep the kernel inpr counter > 0
+     forever.  When host powerd then reads /sys/power/wakeup_count it
+     blocks in pm_get_wakeup_count() (wait_event), wedging the whole
+     suspend cycle.  Resume never happens; the device locks up until
+     a power button hold.
+
+The host already drives the container correctly via Doze + the
+kernel's own freeze_processes() during real suspend, so the
+container-side hook is both redundant and harmful.  Make it a no-op.
+
+We deliberately keep this independent of the suspend_action config
+key so that no on-device config knob (default "freeze") can re-enable
+the broken path.
+
+--- a/tools/services/hardware_manager.py
++++ b/tools/services/hardware_manager.py
+@@ -19,11 +19,13 @@ def start(args):
+         logging.debug("Function enableBluetooth not implemented")
+
+     def suspend():
+-        cfg = tools.config.load(args)
+-        if cfg["waydroid"]["suspend_action"] == "stop":
+-            tools.actions.session_manager.stop(args)
+-        else:
+-            tools.actions.container_manager.freeze(args)
++        # WhaleOS: host powerd + waydroid_helper drive container idle
++        # cooperatively via Android Doze (see suspend_coordinator.cc).
++        # Freezing the container here races with the host suspend cycle
++        # and wedges powerd in pm_get_wakeup_count() because the LXC
++        # freezer halts AlarmManager mid-epoll_wait, leaving its
++        # EPOLLWAKEUP wakeup sources active forever.
++        pass
+
+     def reboot():
+         helpers.lxc.stop(args)

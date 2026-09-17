@@ -1,0 +1,6 @@
+CONFIG_CONSOLE_SERIAL_115200=y
+CONFIG_UART_FOR_CONSOLE=0
+CONFIG_FSP_ENABLE_SERIAL_DEBUG=y
+CONFIG_DEBUG_RAM_SETUP=y
+CONFIG_FSP_M_FILE="3rdparty/blobs/intel/wcl/fsp/debug/fspm_debug.bin"
+CONFIG_FSP_S_FILE="3rdparty/blobs/intel/wcl/fsp/debug/fsps_debug.bin"

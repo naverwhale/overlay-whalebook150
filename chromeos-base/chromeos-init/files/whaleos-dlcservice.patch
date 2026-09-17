@@ -1,0 +1,154 @@
+diff --git a/dlcservice/BUILD.gn b/dlcservice/BUILD.gn
+index 20bf570139..4910f7db94 100644
+--- a/dlcservice/BUILD.gn
++++ b/dlcservice/BUILD.gn
+@@ -33,7 +33,9 @@ group("all") {
+ }
+ 
+ pkg_config("target_defaults") {
+-  defines = [ "USE_LVM_STATEFUL_PARTITION=${use.lvm_stateful_partition}" ]
++  defines = [
++    "USE_LVM_STATEFUL_PARTITION=${use.lvm_stateful_partition}",
++  ]
+ 
+   # NOSORT
+   pkg_deps = [
+diff --git a/dlcservice/dlc_base.cc b/dlcservice/dlc_base.cc
+index 088dc504b9..4f2f152dff 100644
+--- a/dlcservice/dlc_base.cc
++++ b/dlcservice/dlc_base.cc
+@@ -520,6 +520,50 @@ bool DlcBase::PreloadedCopier(ErrorPtr* err) {
+   return true;
+ }
+ 
++bool DlcBase::WhalePriorityCopier(ErrorPtr* err) {
++  // Whale custom DLC path: /opt/whale/dlc-images/{id}/package/dlc.img
++  base::FilePath whale_dlc_path = base::FilePath("/opt/whale/dlc-images")
++                                      .Append(id_)
++                                      .Append(package_)
++                                      .Append(kDlcImageFileName);
++
++  if (!base::PathExists(whale_dlc_path)) {
++    return false;
++  }
++
++  auto whale_image_size = base::GetFileSize(whale_dlc_path);
++  if (!whale_image_size.has_value()) {
++    auto err_str = base::StringPrintf("Failed to get Whale DLC (%s) size.", id_.c_str());
++    *err = Error::Create(FROM_HERE, kErrorInternal, err_str);
++    return false;
++  }
++
++  if (whale_image_size.value() != manifest_->size()) {
++    auto err_str = base::StringPrintf(
++        "Whale DLC (%s) is (%" PRId64 ") different than the size (%" PRId64
++        ") in the manifest.",
++        id_.c_str(), whale_image_size.value(), manifest_->size());
++    *err = Error::Create(FROM_HERE, kErrorInternal, err_str);
++    return false;
++  }
++
++  // Before touching the image, we need to mark it as unverified.
++  MarkUnverified();
++
++  FilePath image_path = GetImagePath(SystemState::Get()->active_boot_slot());
++
++  vector<uint8_t> image_sha256;
++  if (image_path.empty() ||
++      !CopyAndHashFile(whale_dlc_path, image_path, manifest_->size(),
++                       &image_sha256)) {
++    auto err_str = base::StringPrintf("Failed to copy Whale DLC (%s).", id_.c_str());
++    *err = Error::Create(FROM_HERE, kErrorInternal, err_str);
++    return false;
++  }
++
++  return true;
++}
++
+ bool DlcBase::FactoryInstallCopier() {
+   auto factory_install_image_size =
+       base::GetFileSize(factory_install_image_path_);
+@@ -664,6 +708,12 @@ bool DlcBase::Install(ErrorPtr* err) {
+         break;
+       }
+ 
++      // First priority: Try Whale custom DLC path
++      if (WhalePriorityCopier(err)) {
++        LOG(INFO) << "Whale priority installing DLC=" << sanitized_id_;
++        break;
++      }
++
+       // Load the factory installed DLC if allowed otherwise clear the image.
+       if (IsFactoryInstall() && base::PathExists(factory_install_image_path_)) {
+         if (FactoryInstallCopier()) {
+diff --git a/dlcservice/dlc_base.h b/dlcservice/dlc_base.h
+index 817384e93d..35cf0a97f6 100644
+--- a/dlcservice/dlc_base.h
++++ b/dlcservice/dlc_base.h
+@@ -239,6 +239,9 @@ class DlcBase : public DlcInterface {
+   virtual bool VerifyInternal(const base::FilePath& image_path,
+                               std::vector<uint8_t>* image_sha256);
+ 
++  // Helper used to load in (copy + cleanup) Whale priority DLC files.
++  bool WhalePriorityCopier(brillo::ErrorPtr* err);
++
+   // Helper used to load in (copy + cleanup) preloadable files for the DLC.
+   bool PreloadedCopier(brillo::ErrorPtr* err);
+ 
+diff --git a/dlcservice/dlc_service.cc b/dlcservice/dlc_service.cc
+index aea65364b4..6675c097ab 100644
+--- a/dlcservice/dlc_service.cc
++++ b/dlcservice/dlc_service.cc
+@@ -242,6 +242,26 @@ void DlcService::Install(
+   };
+ 
+   brillo::ErrorPtr err;
++  bool supported = false;
++  static const std::string kWhaleSupportedDlcList[] = {
++    "screen-ai",
++    "termina-dlc",
++    // TODO(rebase150_whaleos): M150's Baguette Crostini installer additionally
++    // requires termina-tools-dlc; without it Linux install fails at the DLC
++    // download ("Unsupported DLC=termina-tools-dlc for WhaleOS"). StartsWith
++    // means "termina-dlc" does NOT cover "termina-tools-dlc".
++    "termina-tools-dlc",
++  };
++  for (size_t i = 0; i < std::size(kWhaleSupportedDlcList); i++) {
++    if (base::StartsWith(install_request.id(), kWhaleSupportedDlcList[i])) {
++      supported = true;
++      break;
++    }
++  }
++  if (!supported) {
++    LOG(WARNING) << "Unsupported DLC=" << install_request.id() << " for WhaleOS";
++    return;
++  }
+   auto* dlc = GetDlc(install_request.id(), &err);
+   if (dlc == nullptr) {
+     LOG(ERROR) << "Requested to install unsupported DLC="
+@@ -360,12 +380,24 @@ void DlcService::InstallViaInstaller(
+           },
+           std::move(response)));
+ 
++  if (dlc->IsForceOTA()) {
++    LOG(INFO) << "Overriding manifest force-ota for DLC="
++              << install_request.id() << "; routing via Omaha.";
++  }
++
+   SystemState::Get()->installer()->Install(
+       Installer::InstallArgs{
+           .id = install_request.id(),
+           .url = install_request.omaha_url(),
+           .scaled = dlc->IsScaled(),
+-          .force_ota = dlc->IsForceOTA(),
++          // Google prebuilt DLC packages (e.g. termina-dlc, termina-tools-dlc)
++          // bake force-ota into their manifests, which routes the install to
++          // Google's CDN where Whale artifacts do not exist (HTTP 404).
++          // Whale serves DLC payloads from the Whale AU server, so suppress
++          // force-ota and take the default Omaha install path. Note: this
++          // override covers the force-OTA routing only — a DLC with
++          // scaled=true in its manifest would still take the CDN path.
++          .force_ota = false,
+       },
+       base::BindOnce(&DlcService::OnInstallSuccess,
+                      weak_ptr_factory_.GetWeakPtr(), std::move(response_bind1)),

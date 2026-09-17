@@ -1,0 +1,23 @@
+CONFIG_VENDOR_GOOGLE=y
+CONFIG_BOARD_GOOGLE_LAPIS=y
+
+# Enable OEM screen logo (center)
+CONFIG_CHROMEOS_LOGO_PATH="bootsplash_assets/oem_main_logo/f9a1262d/logo_200_percent.bmp"
+CONFIG_CHROMEBOOK_PLUS_LOGO_PATH="bootsplash_assets/oem_main_logo/f9a1262d/logo_100_percent.bmp"
+
+# Low-battery indicator
+CONFIG_PLATFORM_LOW_BATTERY_INDICATOR_LOGO_PATH="bootsplash_assets/battery_low_200_percent.bmp"
+
+# SPI Descriptor
+CONFIG_IFD_BIN_PATH="3rdparty/blobs/mainboard/google/fatcat/descriptor-lapis.bin"
+
+# CSE data
+# CONFIG_CSE_DATA_FILE="cse_data/cse_data-lapis.bin"
+CONFIG_ME_BIN_PATH="3rdparty/blobs/mainboard/google/fatcat/csme-lapis.bin"
+CONFIG_SOC_INTEL_CSE_RW_FILE="3rdparty/blobs/mainboard/google/fatcat/me_rw-lapis.bin"
+
+# Video Blob
+CONFIG_INTEL_GMA_VBT_FILE="3rdparty/blobs/mainboard/google/fatcat/vbt/vbt-lapis.bin"
+
+# Microcode
+CONFIG_CPU_INTEL_UCODE_SPLIT_BINARIES="3rdparty/blobs/mainboard/google/fatcat/microcode_inputs/lapis"

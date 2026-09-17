@@ -1,0 +1,49 @@
+From: WhaleOS <whaleos-dev@navercorp.com>
+Subject: [PATCH] cgroups: fall back to noprefix cpuset file names
+
+ChromeOS mounts the cpuset cgroup hierarchy with the "noprefix" option,
+which renames "cpuset.cpus" -> "cpus" and "cpuset.mems" -> "mems".
+Add ENOENT fallbacks so LXC works on both standard and noprefix mounts.
+
+--- a/src/lxc/cgroups/cgfsng.c	2023-07-26 07:00:11.000000000 +0900
++++ b/src/lxc/cgroups/cgfsng.c	2026-04-27 12:40:30.614595006 +0900
+@@ -592,7 +592,10 @@
+ 	int ret;
+ 	__u32 poss_last_set_bit = 0;
+ 
++	/* ChromeOS mounts cpuset with noprefix: "cpuset.cpus" -> "cpus" */
+ 	posscpus = read_file_at(dfd_parent, "cpuset.cpus", PROTECT_OPEN, 0);
++	if (!posscpus && errno == ENOENT)
++		posscpus = read_file_at(dfd_parent, "cpus", PROTECT_OPEN, 0);
+ 	if (!posscpus)
+ 		return log_error_errno(false, errno, "Failed to read file %d/cpuset.cpus", dfd_parent);
+ 
+@@ -646,6 +649,8 @@
+ copy_parent:
+ 	if (!am_initialized) {
+ 		ret = lxc_writeat(dfd_child, "cpuset.cpus", cpulist, strlen(cpulist));
++		if (ret < 0 && errno == ENOENT)
++			ret = lxc_writeat(dfd_child, "cpus", cpulist, strlen(cpulist));
+ 		if (ret < 0)
+ 			return log_error_errno(false, errno, "Failed to write cpu list to \"%d/cpuset.cpus\"", dfd_child);
+ 
+@@ -672,11 +677,18 @@
+ 
+ 	/* Read cpuset.mems from parent... */
+ 	bytes = lxc_readat(dfd_base, "cpuset.mems", mems, sizeof(mems));
++	if (bytes < 0 && errno == ENOENT)
++		bytes = lxc_readat(dfd_base, "mems", mems, sizeof(mems));
+ 	if (bytes < 0)
+ 		return syserror_ret(false, "Failed to read file %d(cpuset.mems)", dfd_base);
+ 
+ 	/* and copy to first cgroup in the tree... */
+-	bytes = lxc_writeat(dfd_next, "cpuset.mems", mems, bytes);
++	{
++		ssize_t mems_bytes = bytes;
++		bytes = lxc_writeat(dfd_next, "cpuset.mems", mems, mems_bytes);
++		if (bytes < 0 && errno == ENOENT)
++			bytes = lxc_writeat(dfd_next, "mems", mems, mems_bytes);
++	}
+ 	if (bytes < 0)
+ 		return syserror_ret(false, "Failed to write %d(cpuset.mems)", dfd_next);
+ 

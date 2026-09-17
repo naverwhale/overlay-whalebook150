@@ -1,0 +1,14 @@
+CONFIG_BOARD_GOOGLE_SAPPHIRE=y
+# CONFIG_CONSOLE_SERIAL is not set
+
+# Enable Splash Screen
+CONFIG_CHROMEOS_FW_SPLASH_SCREEN=y
+CONFIG_CHROMEOS_LOGO_PATH="bootsplash_assets/oem_main_logo/137b7852/logo_300_percent.bmp"
+CONFIG_CHROMEBOOK_PLUS_LOGO_PATH="bootsplash_assets/chromebook_plus_200_percent.bmp"
+
+# Enable Low Battery Indicator
+CONFIG_PLATFORM_HAS_LOW_BATTERY_INDICATOR=y
+CONFIG_PLATFORM_LOW_BATTERY_INDICATOR_LOGO_PATH="bootsplash_assets/battery_low_300_percent.bmp"
+
+# Enable Text based splash screen
+CONFIG_FRAMEBUFFER_SPLASH_TEXT=y

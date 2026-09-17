@@ -1,0 +1,43 @@
+From: WhaleOS <whaleos-dev@navercorp.com>
+Subject: [PATCH 14/14] config_base: drop CAP_WAKE_ALARM from the container
+
+CAP_WAKE_ALARM in the container's bounding set lets any process inside
+Waydroid create CLOCK_BOOTTIME_ALARM / CLOCK_REALTIME_ALARM timerfd
+handles -- Android AlarmManager's wake-capable alarms.  Every armed
+alarm of that kind is a registered kernel wakeup source; when the
+timer fires the kernel calls __pm_stay_awake and the wake source stays
+active until userspace reads the fd.
+
+Combined with powerd's cgroup-freezer-based suspend, this races: if an
+alarm fires while the container is frozen the holding thread is stuck
+in __refrigerator() and cannot call __pm_relax, leaving pm_get_wakeup_count()
+blocked forever (powerd wchan = pm_get).  Removing the cap forces
+AlarmManager onto plain CLOCK_BOOTTIME which doesn't register a wake
+source.
+
+CAP_BLOCK_SUSPEND is left in the bounding set on purpose: Android's
+InputManagerService (libinputreader EventHub) requires EPOLLWAKEUP on
+its wake pipe and aborts with "Input must be able to block suspend to
+properly process events" if it can't get one.  Dropping
+CAP_BLOCK_SUSPEND would put system_server into a respawn loop and make
+the entire Android container unusable.
+
+The wake-source-leak risk that CAP_BLOCK_SUSPEND keeps open is mitigated
+separately by a powerd suspend-delay client inside waydroid_helper that,
+on every SuspendImminent, runs `cmd deviceidle force-idle deep` inside
+the container to make Android release its non-critical wake locks
+before powerd freezes the cgroup.  See platform2/waydroid_helper/.
+
+Note: the original line listed `wake_alarm` twice (an upstream Waydroid
+copy/paste); both occurrences are removed.
+
+--- a/data/configs/config_base
++++ b/data/configs/config_base
+@@ -5,7 +5,7 @@
+ lxc.autodev = 0
+ # lxc.autodev.tmpfs.size = 25000000
+
+-lxc.cap.keep = audit_control sys_nice wake_alarm setpcap setgid setuid sys_ptrace sys_admin wake_alarm block_suspend sys_time net_admin net_raw net_bind_service kill dac_override dac_read_search fsetid mknod syslog chown sys_resource fowner ipc_lock sys_chroot
++lxc.cap.keep = audit_control sys_nice setpcap setgid setuid sys_ptrace sys_admin block_suspend sys_time net_admin net_raw net_bind_service kill dac_override dac_read_search fsetid mknod syslog chown sys_resource fowner ipc_lock sys_chroot
+
+ lxc.mount.auto = cgroup:ro

@@ -1,0 +1,52 @@
+From: WhaleOS <whaleos-dev@navercorp.com>
+Subject: [PATCH 12/12] config_base: bind-mount /proc/sys/kernel read-only into container
+
+The Waydroid Android image's /system/etc/init/hw/init.rc writes to
+/proc/sys/kernel/modprobe (an empty newline) on container boot as a
+"disable kernel-side module auto-load" hardening step inherited from
+AOSP.
+
+But /proc/sys/kernel/* is NOT a namespaced sysctl on Linux: writes
+from inside the LXC container land directly on the host kernel's
+global modprobe_path[].  On WhaleOS this is fatal because:
+
+  - CONFIG_STATIC_USERMODEHELPER=y forces every kernel-triggered
+    modprobe through /sbin/usermode-helper.
+  - /sbin/usermode-helper validates argv[0] against a small whitelist
+    (/sbin/modprobe, /usr/bin/modprobe, ...).  Any other value
+    (including an empty path) triggers LOG(FATAL) -> SIGABRT.
+  - Once Android init has cleared modprobe_path on the host, host-side
+    mount(2) calls that need lazy module load -- vfat / nls_cp437 /
+    nls_iso8859-1 needed by chromeos-install reading the FAT32 EFI
+    partition -- cannot trigger module auto-load any more, so
+    chromeos-install fails on a fresh USB boot with
+    "FAT-fs (sda12): codepage cp437 not found".
+
+We block the leak at the container boundary instead of patching the
+Android image: bind-mount the host's /proc/sys/kernel into the
+container as read-only.  Android init's defensive `write
+/proc/sys/kernel/modprobe` then fails with EROFS, which is non-fatal
+inside init.cpp's do_write() (logs an error and continues).  No
+Waydroid runtime functionality depends on being able to override
+host kernel sysctls.
+
+This is a WhaleOS-specific patch: regular Linux hosts neither enforce
+a strict usermode-helper whitelist nor rely on lazy module auto-load
+during installer boot, so the same sysctl leak goes unnoticed there.
+
+The `optional` flag is defensive -- if for some reason the host
+/proc/sys/kernel is not yet visible at container start, container boot
+proceeds without the isolation plug rather than aborting.  (In
+practice the preceding `lxc.mount.entry = proc proc proc ...` ensures
+procfs is mounted first, so the bind always succeeds.)
+
+--- a/data/configs/config_base
++++ b/data/configs/config_base
+@@ -18,3 +18,7 @@ lxc.include = /var/lib/waydroid/lxc/waydroid/config_session
+
+ lxc.mount.entry = proc proc proc nosuid,nodev,noexec,create=dir 0 0
+ lxc.mount.entry = sysfs sys sysfs nosuid,nodev,noexec,ro,create=dir 0 0
++
++# WhaleOS: block container writes to host /proc/sys/kernel/* (modprobe path,
++# core_pattern, hotplug, ...).  See PATCH 12/12 header for full rationale.
++lxc.mount.entry = /proc/sys/kernel proc/sys/kernel none ro,bind,optional 0 0

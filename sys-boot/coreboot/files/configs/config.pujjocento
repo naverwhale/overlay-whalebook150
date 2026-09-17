@@ -1,0 +1,22 @@
+CONFIG_VENDOR_GOOGLE=y
+CONFIG_BOARD_GOOGLE_PUJJOCENTO=y
+
+# Enable Early Splash Screen
+CONFIG_CHROMEOS_FW_SPLASH_SCREEN=n
+CONFIG_CHROMEOS_LOGO_PATH="bootsplash_assets/chromeos_100_percent.bmp"
+CONFIG_CHROMEBOOK_PLUS_LOGO_PATH="bootsplash_assets/chromebook_plus_100_percent.bmp"
+
+# SPI Descriptor
+CONFIG_IFD_BIN_PATH="3rdparty/blobs/mainboard/google/nissa/descriptor-pujjocento.bin"
+
+# Management Engine
+CONFIG_ME_BIN_PATH="3rdparty/blobs/mainboard/google/nissa/csme-pujjocento.bin"
+
+# Management Engine FW update
+CONFIG_SOC_INTEL_CSE_RW_FILE="3rdparty/blobs/mainboard/google/nissa/me_rw-pujjocento.bin"
+
+# Video Blob
+CONFIG_INTEL_GMA_VBT_FILE="3rdparty/blobs/mainboard/google/nissa/vbt-pujjocento.bin"
+
+# Microcode
+CONFIG_CPU_UCODE_BINARIES="3rdparty/blobs/mainboard/google/nissa/ucode-pujjocento.bin"

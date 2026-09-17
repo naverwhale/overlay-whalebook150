@@ -1,0 +1,26 @@
+diff --git a/dns-proxy/init/dns-proxy.conf b/dns-proxy/init/dns-proxy.conf
+index dcd8b53050..7303149eaf 100644
+--- a/dns-proxy/init/dns-proxy.conf
++++ b/dns-proxy/init/dns-proxy.conf
+@@ -5,7 +5,20 @@
+ description     "DNS proxy daemon"
+ author          "chromium-os-dev@chromium.org"
+ 
+-start on starting system-services
++# WhaleOS: 'starting system-services' fires before shill and patchpanel
++# have registered their D-Bus names on this board (R150 pushed shill's
++# start to 'started network-services and started wpasupplicant', which
++# widens the race window). dnsproxyd's Controller::Setup() then makes an
++# early GetProperties/GetDevices call that fails with
++# org.freedesktop.DBus.Error.ServiceUnknown, and the on-available
++# callback does not recover: the process is left holding no upstream
++# nameservers, so 127.0.0.2 DNS queries from Chrome time out and the
++# OOBE login web view can never load account.whalespace.io.
++#
++# Gate our start on the two D-Bus dependencies actually being up.
++# shill's own start rule 'started network-services and started
++# wpasupplicant' still applies transitively.
++start on started shill and started patchpanel
+ stop on stopping system-services
+ 
+ respawn

@@ -1,0 +1,203 @@
+diff --git a/tpm_manager/BUILD.gn b/tpm_manager/BUILD.gn
+index c6bc2a0dfa..68a6c33b94 100644
+--- a/tpm_manager/BUILD.gn
++++ b/tpm_manager/BUILD.gn
+@@ -49,6 +49,7 @@ config("target_defaults") {
+     "USE_OS_INSTALL_SERVICE=${use.os_install_service}",
+     "USE_CR50_ONBOARD=${use.cr50_onboard}",
+     "USE_TI50_ONBOARD=${use.ti50_onboard}",
++    # TODO(changwan.hong) : Needs to change global build macro of whaleos
+   ]
+ }
+ 
+diff --git a/tpm_manager/server/tpm2_initializer_impl.cc b/tpm_manager/server/tpm2_initializer_impl.cc
+index ed2163330d..81572217a1 100644
+--- a/tpm_manager/server/tpm2_initializer_impl.cc
++++ b/tpm_manager/server/tpm2_initializer_impl.cc
+@@ -6,6 +6,9 @@
+ 
+ #include <string>
+ 
++#include <base/files/file_util.h>
++#include <brillo/whaleos_util.h>
++
+ #include <base/logging.h>
+ #include <base/strings/string_number_conversions.h>
+ #include <tpm_manager-client/tpm_manager/dbus-constants.h>
+@@ -124,7 +127,14 @@ bool Tpm2InitializerImpl::InitializeTpm(bool* already_owned) {
+       owner_password, endorsement_password, lockout_password);
+   if (result != TPM_RC_SUCCESS) {
+     LOG(ERROR) << "Error taking ownership of TPM2.0";
+-    return false;
++    // https://example.com
++    if (brillo::IsWhalebook2Model()) {
++      LOG(ERROR) << "Need to clear tpm in bios setup menu."
++        << " Fallback continues.";
++      base::WriteFile(base::FilePath(brillo::kTpmOwnedFallbackPath), "");
++    } else {
++      return false;
++    }
+   }
+ 
+   return true;
+diff --git a/tpm_manager/server/tpm2_status_impl.cc b/tpm_manager/server/tpm2_status_impl.cc
+index 6c53c8712e..8c19416ae2 100644
+--- a/tpm_manager/server/tpm2_status_impl.cc
++++ b/tpm_manager/server/tpm2_status_impl.cc
+@@ -6,6 +6,9 @@
+ 
+ #include <string>
+ 
++#include <base/files/file_util.h>
++#include <brillo/whaleos_util.h>
++
+ #include <base/check.h>
+ #include <base/logging.h>
+ #include <trunks/cr50_headers/ap_ro_status.h>
+@@ -218,6 +221,11 @@ bool Tpm2StatusImpl::GetTpmOwned(TpmStatus::TpmOwnershipStatus* status) {
+     ownership_status_ = kTpmPreOwned;
+   }
+ 
++   if (brillo::IsWhalebook2Model() &&
++       base::PathExists(base::FilePath(brillo::kTpmOwnedFallbackPath))) {
++    ownership_status_ = kTpmOwned;
++  }
++
+   *status = ownership_status_;
+   return true;
+ }
+diff --git a/tpm_manager/server/tpm_manager_service.cc b/tpm_manager/server/tpm_manager_service.cc
+index 9226332114..8428955f5d 100644
+--- a/tpm_manager/server/tpm_manager_service.cc
++++ b/tpm_manager/server/tpm_manager_service.cc
+@@ -12,6 +12,8 @@
+ #include <utility>
+ #include <vector>
+ 
++#include <brillo/whaleos_util.h>
++
+ #include <base/check.h>
+ #include <base/check_op.h>
+ #include <base/command_line.h>
+@@ -35,6 +37,7 @@
+ #include "tpm_manager/server/openssl_crypto_util_impl.h"
+ #include "tpm_manager/server/tpm_allowlist_impl.h"
+ #include "tpm_manager/server/tpm_manager_metrics.h"
++#include <base/files/file_util.h>
+ 
+ namespace {
+ 
+@@ -182,12 +185,35 @@ bool TpmManagerService::Initialize() {
+   worker_thread_->StartWithOptions(
+       base::Thread::Options(base::MessagePumpType::IO, 0));
+ 
+-  update_tpm_status_pending_ = true;
++  // Check if this is a known model without TPM
++  if (brillo::IsNoTpmModel()) {
++    LOG(INFO) << __func__ << ": Known non-TPM model detected, starting in software-only mode";
+ 
+-  PostTaskToWorkerThreadWithoutRequest<GetTpmStatusReply>(
+-      base::BindOnce(&TpmManagerService::UpdateTpmStatusCallback,
+-                     base::Unretained(this)),
+-      &TpmManagerService::InitializeTask);
++    // Set software-only mode configuration
++    tpm_allowed_ = false;
++    update_tpm_status_pending_ = false;
++
++    // Set TPM disabled status for response
++    auto no_tpm_reply = std::make_unique<GetTpmStatusReply>();
++    no_tpm_reply->set_enabled(false);
++    no_tpm_reply->set_owned(false);
++    no_tpm_reply->set_status(STATUS_SUCCESS);
++
++    // Invoke status update callback
++    origin_task_runner_->PostTask(
++        FROM_HERE,
++        base::BindOnce(&TpmManagerService::UpdateTpmStatusCallback,
++                       base::Unretained(this), *no_tpm_reply));
++  } else {
++    LOG(INFO) << __func__ << ": Proceeding with normal TPM initialization";
++
++    // Normal TPM initialization
++    update_tpm_status_pending_ = true;
++    PostTaskToWorkerThreadWithoutRequest<GetTpmStatusReply>(
++        base::BindOnce(&TpmManagerService::UpdateTpmStatusCallback,
++                       base::Unretained(this)),
++        &TpmManagerService::InitializeTask);
++  }
+ 
+   ReportVersionFingerprint();
+ 
+@@ -255,10 +281,29 @@ std::unique_ptr<GetTpmStatusReply> TpmManagerService::InitializeTask() {
+         // Tolerate some delay in trunksd being up and ready.
+         base::TimeTicks deadline =
+             base::TimeTicks::Now() + kTrunksDaemonTimeout;
+-        while (!trunks_factory->Initialize() &&
+-               base::TimeTicks::Now() < deadline) {
+-          base::PlatformThread::Sleep(kTrunksDaemonInitAttemptDelay);
++
++        bool trunks_initialized = false;
++        while (!trunks_initialized && base::TimeTicks::Now() < deadline) {
++          trunks_initialized = trunks_factory->Initialize();
++          if (!trunks_initialized) {
++            base::PlatformThread::Sleep(kTrunksDaemonInitAttemptDelay);
++          }
+         }
++
++        if (!trunks_initialized) {
++          // If /dev/tpm0 is missing or TPM hardware issue occurs
++          LOG(ERROR) << __func__ << ": Trunks initialization failed, likely no TPM device. "
++                     << "Falling back to software-only mode.";
++
++          // Switch to software-only mode
++          tpm_allowed_ = false;
++          auto reply = std::make_unique<GetTpmStatusReply>();
++          reply->set_enabled(false);
++          reply->set_owned(false);
++          reply->set_status(STATUS_SUCCESS);
++          return reply;
++        }
++
+         trunks_factory_ = std::move(trunks_factory);
+       }
+       default_tpm_status_ = std::make_unique<Tpm2StatusImpl>(*trunks_factory_);
+@@ -397,7 +442,7 @@ std::unique_ptr<GetTpmStatusReply> TpmManagerService::InitializeTask() {
+       dictionary_attack_timer_.Reset();
+       reply->set_status(STATUS_NOT_AVAILABLE);
+ 
+-      if (USE_TPM_INSECURE_FALLBACK) {
++      if (!brillo::IsWhalebook2Model()) {
+         // Don't allow the TPM to be used when we failed to take the ownership
+         // of it, because most of the security features would not work under
+         // this case. And set the take ownership device error to make sure the
+@@ -724,6 +769,30 @@ TpmManagerService::GetDictionaryAttackInfoTask(
+     return reply;
+   }
+ 
++  if (lockout) {
++    LOG(ERROR) << __func__ << " " << __LINE__
++        << " Try resetting DA Lock";
++    auto status = tpm_initializer_->ResetDictionaryAttackLock();
++    tpm_manager_metrics_->ReportDictionaryAttackResetStatus(status);
++    if (status == DictionaryAttackResetStatus::kResetAttemptSucceeded) {
++      if (!tpm_status_->GetDictionaryAttackInfo(&counter, &threshold, &lockout,
++                                                &lockout_time_remaining)) {
++        LOG(ERROR) << __func__ << " " << __LINE__ << ": failed to get DA info ";
++        reply->set_status(STATUS_DEVICE_ERROR);
++        return reply;
++      }
++      if (lockout) {
++        LOG(ERROR) << __func__ << " " << __LINE__
++            << " Resetting DA status and getting info are succeeded, "
++            << " but TPM has locked out still.";
++      }
++    } else {
++      LOG(ERROR) << __func__ << " " << __LINE__ << ": failed to reset DA";
++      reply->set_status(STATUS_DEVICE_ERROR);
++      return reply;
++    }
++  }
++
+   reply->set_dictionary_attack_counter(counter);
+   reply->set_dictionary_attack_threshold(threshold);
+   reply->set_dictionary_attack_lockout_in_effect(lockout);

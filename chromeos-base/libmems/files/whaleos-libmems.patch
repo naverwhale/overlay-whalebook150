@@ -1,0 +1,39 @@
+diff --git a/libmems/BUILD.gn b/libmems/BUILD.gn
+index 1126cfa5d2..173e211964 100644
+--- a/libmems/BUILD.gn
++++ b/libmems/BUILD.gn
+@@ -17,7 +17,7 @@ group("all") {
+ }
+ 
+ pkg_config("target_defaults_pkg_deps") {
+-  pkg_deps = [
++pkg_deps = [
+     "libbrillo",
+     "libchrome",
+     "libcros_config",
+diff --git a/libmems/common_types.h b/libmems/common_types.h
+index 75b70f2504..ba71df8faf 100644
+--- a/libmems/common_types.h
++++ b/libmems/common_types.h
+@@ -32,7 +32,7 @@ constexpr char kHrtimerNameFormatString[] = "iioservice-%i";
+ // IioDevice::ReadStringAttribute.
+ constexpr char kDeviceName[] = "name";
+ 
+-constexpr char kFrequencyAttr[] = "frequency";
++constexpr char kFrequencyAttr[] = "sampling_frequency";
+ constexpr char kSamplingFrequencyAttr[] = "sampling_frequency";
+ constexpr char kHWFifoTimeoutAttr[] = "buffer/hwfifo_timeout";
+ constexpr char kSamplingFrequencyAvailable[] = "sampling_frequency_available";
+diff --git a/libmems/iio_device_impl.cc b/libmems/iio_device_impl.cc
+index f4af530f3c..e39bbcef77 100644
+--- a/libmems/iio_device_impl.cc
++++ b/libmems/iio_device_impl.cc
+@@ -35,7 +35,7 @@ namespace libmems {
+ namespace {
+ 
+ constexpr int kNumSamples = 1;
+-constexpr char kHWFifoWatermarkMaxAttr[] = "hwfifo_watermark_max";
++constexpr char kHWFifoWatermarkMaxAttr[] = "watermark";
+ 
+ };  // namespace
+ 

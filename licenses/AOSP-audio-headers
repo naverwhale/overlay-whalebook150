@@ -1,0 +1,65 @@
+==============================================================================
+Android audio HAL headers, used to build the CRAS audio HAL for the
+Waydroid container
+  audio.primary.cras.so
+
+  // SPDX-License-Identifier: Apache-2.0
+==============================================================================
+   =========================================================================
+   ==  NOTICE file corresponding to the section 4 d of                    ==
+   ==  the Apache License, Version 2.0,                                   ==
+   ==  in this case for the Android-specific code.                        ==
+   =========================================================================
+
+Android Code
+Copyright (C) The Android Open Source Project
+
+This product includes software developed as part of
+The Android Open Source Project (http://source.android.com).
+
+The shipped library is authored by NAVER Corporation, but it is
+compiled against the Android legacy audio HAL interface headers listed
+below, which are part of AOSP and are licensed under the Apache
+License, Version 2.0.  Their enumerations, constants and structure
+layouts are reproduced in the compiled output.
+
+  system/audio.h                 Copyright (C) 2011 The Android Open
+  system/audio-base.h                            Source Project
+  system/audio_effect.h          Copyright (C) 2016
+  system/audio-base-utils.h      Copyright (C) 2018
+  system/audio-hal-enums.h       Copyright (C) 2020
+
+The following headers are hidl-gen output generated from the AOSP HIDL
+interface definitions under hardware/interfaces/audio/ and carry no
+copyright header of their own; they are covered by the same license:
+
+  system/audio-base-v7.0.h       android.hardware.audio@7.0
+  system/audio-base-v7.1.h       android.hardware.audio@7.1
+  system/audio_common-base.h     android.hardware.audio.common@7.0
+  system/audio_effect-base.h     android.hardware.audio.effect@7.0
+
+vendor/tinyalsa/asoundlib.h is not tinyalsa upstream code.  It is a
+minimal stub written by NAVER Corporation that declares only the
+pcm_format enumeration and the pcm_format_to_bits() helper needed at
+compile time; the real linking happens against the container's
+libtinyalsa.so at runtime.
+
+The CRAS client code that this library links statically comes from
+ChromiumOS third_party/adhd and is covered separately by the
+BSD-Google license also listed for this package.
+
+   =========================================================================
+   ==  Apache License, Version 2.0                                        ==
+   =========================================================================
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.

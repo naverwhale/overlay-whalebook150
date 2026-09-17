@@ -1,0 +1,580 @@
+diff --git a/cryptohome/auth_blocks/auth_block_utility_impl.cc b/cryptohome/auth_blocks/auth_block_utility_impl.cc
+index 34f0513065..f58c06db53 100644
+--- a/cryptohome/auth_blocks/auth_block_utility_impl.cc
++++ b/cryptohome/auth_blocks/auth_block_utility_impl.cc
+@@ -9,6 +9,9 @@
+ #include <utility>
+ #include <vector>
+ 
++#include <brillo/whaleos_util.h>
++#include <base/files/file_util.h>
++
+ #include <base/check.h>
+ #include <base/check_op.h>
+ #include <base/logging.h>
+@@ -121,6 +124,12 @@ void AuthBlockUtilityImpl::DeriveKeyBlobsWithAuthBlock(
+   }
+   ReportDeriveAuthBlock(auth_block_type);
+ 
++  // Write last used auth block type to file for Chrome to read at login.
++  // Use /tmp/ which is accessible by all users including chronos (Chrome).
++  const base::FilePath auth_block_file("/tmp/last_auth_block_type");
++  base::WriteFile(auth_block_file,
++                  std::to_string(static_cast<int>(auth_block_type)));
++
+   // This lambda functions to keep the auth_block reference valid until
+   // the results are returned through derive_callback.
+   AuthBlock* auth_block_ptr = auth_block->get();
+@@ -188,9 +197,6 @@ AuthBlockUtilityImpl::SelectAuthBlockTypeForCreation(
+       return candidate_type;
+     }
+   }
+-  // No suitable block was found. As we need to return only one error, take it
+-  // from the last attempted candidate (it's likely the most permissive one), if
+-  // any.
+   return MakeStatus<CryptohomeCryptoError>(
+              CRYPTOHOME_ERR_LOC(
+                  kLocAuthBlockUtilNoSupportedInGetAuthBlockWithType),
+diff --git a/cryptohome/auth_blocks/pin_weaver_auth_block.cc b/cryptohome/auth_blocks/pin_weaver_auth_block.cc
+index 4079583cf6..039db30d59 100644
+--- a/cryptohome/auth_blocks/pin_weaver_auth_block.cc
++++ b/cryptohome/auth_blocks/pin_weaver_auth_block.cc
+@@ -144,36 +144,7 @@ const DelaySchedule& PasswordDelaySchedule() {
+ 
+ CryptoStatus PinWeaverAuthBlock::IsSupported(
+     const hwsec::CryptohomeFrontend& hwsec) {
+-  hwsec::StatusOr<bool> is_ready = hwsec.IsReady();
+-  if (!is_ready.ok()) {
+-    return MakeStatus<CryptohomeCryptoError>(
+-               CRYPTOHOME_ERR_LOC(
+-                   kLocPinWeaverAuthBlockHwsecReadyErrorInIsSupported),
+-               ErrorActionSet({PossibleAction::kDevCheckUnexpectedState}))
+-        .Wrap(TpmAuthBlockUtils::TPMErrorToCryptohomeCryptoError(
+-            std::move(is_ready).err_status()));
+-  }
+-  if (!is_ready.value()) {
+-    return MakeStatus<CryptohomeCryptoError>(
+-        CRYPTOHOME_ERR_LOC(kLocPinWeaverAuthBlockHwsecNotReadyInIsSupported),
+-        ErrorActionSet({PossibleAction::kDevCheckUnexpectedState}),
+-        CryptoError::CE_OTHER_CRYPTO);
+-  }
+-
+-  hwsec::StatusOr<bool> has_pinweaver = hwsec.IsPinWeaverEnabled();
+-  if (!has_pinweaver.ok()) {
+-    return MakeStatus<CryptohomeCryptoError>(
+-               CRYPTOHOME_ERR_LOC(
+-                   kLocPinWeaverAuthBlockPinWeaverCheckFailInIsSupported))
+-        .Wrap(TpmAuthBlockUtils::TPMErrorToCryptohomeCryptoError(
+-            std::move(has_pinweaver).err_status()));
+-  }
+-  if (!has_pinweaver.value()) {
+-    return MakeStatus<CryptohomeCryptoError>(
+-        CRYPTOHOME_ERR_LOC(kLocPinWeaverAuthBlockNoPinWeaverInIsSupported),
+-        ErrorActionSet({PossibleAction::kAuth}), CryptoError::CE_OTHER_CRYPTO);
+-  }
+-
++  LOG(INFO) << __func__ << " Whale PinWeaver always supported";
+   return OkStatus<CryptohomeCryptoError>();
+ }
+ 
+diff --git a/cryptohome/auth_blocks/revocation.cc b/cryptohome/auth_blocks/revocation.cc
+index e0791d9f04..7570fc601a 100644
+--- a/cryptohome/auth_blocks/revocation.cc
++++ b/cryptohome/auth_blocks/revocation.cc
+@@ -91,8 +91,8 @@ bool DeriveSecret(const brillo::SecureBlob& key,
+ }  // namespace
+ 
+ bool IsRevocationSupported(const hwsec::CryptohomeFrontend* hwsec) {
+-  hwsec::StatusOr<bool> enabled = hwsec->IsPinWeaverEnabled();
+-  return enabled.ok() && *enabled;
++  // https://example.com
++  return false;
+ }
+ 
+ CryptoStatus Create(const hwsec::PinWeaverManagerFrontend* hwsec_pw_manager,
+diff --git a/cryptohome/auth_factor/manager.cc b/cryptohome/auth_factor/manager.cc
+index 7a73069acd..fbc2b6f894 100644
+--- a/cryptohome/auth_factor/manager.cc
++++ b/cryptohome/auth_factor/manager.cc
+@@ -15,6 +15,7 @@
+ 
+ #include <absl/container/flat_hash_set.h>
+ #include <base/check.h>
++#include <base/files/file_util.h>
+ #include <base/files/file_enumerator.h>
+ #include <base/files/file_path.h>
+ #include <base/logging.h>
+@@ -54,7 +55,9 @@ constexpr mode_t kAuthFactorFilePermissions = 0600;
+ CryptohomeStatusOr<base::FilePath> GetAuthFactorPathFromStringType(
+     const ObfuscatedUsername& obfuscated_username,
+     const std::string& auth_factor_type_string,
+-    const std::string& auth_factor_label) {
++    const std::string& auth_factor_label
++    , bool is_backup = false
++    ) {
+   if (!IsValidAuthFactorLabel(auth_factor_label)) {
+     LOG(ERROR) << "Invalid auth factor label " << auth_factor_label
+                << " of type " << auth_factor_type_string;
+@@ -65,7 +68,9 @@ CryptohomeStatusOr<base::FilePath> GetAuthFactorPathFromStringType(
+   }
+ 
+   return AuthFactorPath(obfuscated_username, auth_factor_type_string,
+-                        auth_factor_label);
++                        auth_factor_label
++                        , is_backup
++      );
+ }
+ 
+ // Converts `auth_factor_type` to string and on success calls
+@@ -73,7 +78,9 @@ CryptohomeStatusOr<base::FilePath> GetAuthFactorPathFromStringType(
+ CryptohomeStatusOr<base::FilePath> GetAuthFactorPath(
+     const ObfuscatedUsername& obfuscated_username,
+     const AuthFactorType auth_factor_type,
+-    const std::string& auth_factor_label) {
++    const std::string& auth_factor_label
++    , bool is_backup = false
++    ) {
+   const std::string type_string = AuthFactorTypeToString(auth_factor_type);
+   if (type_string.empty()) {
+     LOG(ERROR) << "Failed to convert auth factor type "
+@@ -84,9 +91,10 @@ CryptohomeStatusOr<base::FilePath> GetAuthFactorPath(
+         ErrorActionSet({PossibleAction::kDevCheckUnexpectedState}),
+         user_data_auth::CRYPTOHOME_ERROR_INVALID_ARGUMENT);
+   }
+-
+-  return GetAuthFactorPathFromStringType(obfuscated_username, type_string,
+-                                         auth_factor_label);
++  return GetAuthFactorPathFromStringType(
++      obfuscated_username, type_string, auth_factor_label
++     , is_backup
++     );
+ }
+ }  // namespace
+ 
+@@ -121,11 +129,16 @@ void AuthFactorManager::DiscardAllAuthFactorMaps() {
+   map_of_af_maps_.clear();
+ }
+ 
+-CryptohomeStatus AuthFactorManager::SaveAuthFactorFile(
++CryptohomeStatus AuthFactorManager::SaveAuthFactorInternal(
+     const ObfuscatedUsername& obfuscated_username,
+-    const AuthFactor& auth_factor) {
++    const AuthFactor& auth_factor,
++    bool is_backup) {
++  LOG(INFO) << "AuthFactorManager::SaveAuthFactorInternal "
++      << " is_backup: " << is_backup;
+   CryptohomeStatusOr<base::FilePath> file_path = GetAuthFactorPath(
+-      obfuscated_username, auth_factor.type(), auth_factor.label());
++      obfuscated_username, auth_factor.type(), auth_factor.label()
++      , is_backup
++      );
+   if (!file_path.ok()) {
+     LOG(ERROR) << "Failed to get auth factor path in Save.";
+     return MakeStatus<CryptohomeError>(
+@@ -165,9 +178,23 @@ CryptohomeStatus AuthFactorManager::SaveAuthFactorFile(
+   return OkStatus<CryptohomeError>();
+ }
+ 
++CryptohomeStatus AuthFactorManager::SaveAuthFactorFile(
++    const ObfuscatedUsername& obfuscated_username,
++    const AuthFactor& auth_factor) {
++  for (bool is_backup : {false, true}) {
++    CryptohomeStatus status = OkStatus<error::CryptohomeError>();
++    status = SaveAuthFactorInternal(
++        obfuscated_username, auth_factor, is_backup);
++    if (!status.ok())
++      return status;
++  }
++  return OkStatus<CryptohomeError>();
++}
++
+ CryptohomeStatus AuthFactorManager::DeleteAuthFactorFile(
+     const ObfuscatedUsername& obfuscated_username,
+     const AuthFactor& auth_factor) {
++  for (bool is_backup : {false, true}) {
+   CryptohomeStatusOr<base::FilePath> file_path = GetAuthFactorPath(
+       obfuscated_username, auth_factor.type(), auth_factor.label());
+   if (!file_path.ok()) {
+@@ -178,6 +205,11 @@ CryptohomeStatus AuthFactorManager::DeleteAuthFactorFile(
+         user_data_auth::CRYPTOHOME_ERROR_INVALID_ARGUMENT);
+   }
+ 
++  if (is_backup && !base::PathExists(file_path.value())) {
++    LOG(INFO) << "There is no backup auth factor.";
++    return OkStatus<CryptohomeError>();
++  }
++
+   // Remove the file.
+   if (!platform_->DeleteFileSecurely(*file_path)) {
+     LOG(WARNING) << "Failed to securely delete from disk auth factor "
+@@ -216,15 +248,20 @@ CryptohomeStatus AuthFactorManager::DeleteAuthFactorFile(
+           << obfuscated_username;
+     }
+   }
++  } // for (bool is_backup : {false, true}) {
+   return OkStatus<CryptohomeError>();
+ }
+ 
+ CryptohomeStatusOr<AuthFactor> AuthFactorManager::LoadAuthFactor(
+     const ObfuscatedUsername& obfuscated_username,
+     AuthFactorType auth_factor_type,
+-    const std::string& auth_factor_label) {
++    const std::string& auth_factor_label
++    , bool is_backup
++    ) {
+   CryptohomeStatusOr<base::FilePath> file_path = GetAuthFactorPath(
+-      obfuscated_username, auth_factor_type, auth_factor_label);
++      obfuscated_username, auth_factor_type, auth_factor_label
++      , is_backup
++      );
+   if (!file_path.ok()) {
+     LOG(ERROR) << "Failed to get auth factor path in Load.";
+     return MakeStatus<CryptohomeError>(
+@@ -271,13 +308,30 @@ CryptohomeStatusOr<AuthFactor> AuthFactorManager::LoadAuthFactor(
+       serialized_factor.value().auth_block_state);
+ }
+ 
++AuthFactorMap AuthFactorManager::LoadAllAuthFactors(
++    const ObfuscatedUsername& obfuscated_username) {
++  auto label_to_auth_factor = LoadAllAuthFactorsInternal(
++      obfuscated_username, false /* is_backup */);
++  if (!label_to_auth_factor.empty())
++    return label_to_auth_factor;
++
++  // https://example.com
++  LOG(ERROR) << " Hit original auth factors are empty!! Try backup one.";
++  return LoadAllAuthFactorsInternal(
++      obfuscated_username, true /* is_backup */);
++}
++
+ absl::flat_hash_map<std::string, AuthFactorType>
+ AuthFactorManager::ListAuthFactors(
+-    const ObfuscatedUsername& obfuscated_username) {
++    const ObfuscatedUsername& obfuscated_username
++    , bool is_backup
++    ) {
+   absl::flat_hash_map<std::string, AuthFactorType> label_to_type_map;
+ 
+   std::unique_ptr<libstorage::FileEnumerator> file_enumerator(
+-      platform_->GetFileEnumerator(AuthFactorsDirPath(obfuscated_username),
++      platform_->GetFileEnumerator(AuthFactorsDirPath(obfuscated_username
++                                   , is_backup
++                                   ),
+                                    /*recursive=*/false,
+                                    base::FileEnumerator::FILES));
+   base::FilePath next_path;
+@@ -435,8 +489,10 @@ void AuthFactorManager::RemoveMigratedFingerprintAuthFactors(
+                      auth_factor, std::move(migrate_more)));
+ }
+ 
+-AuthFactorMap AuthFactorManager::LoadAllAuthFactors(
+-    const ObfuscatedUsername& obfuscated_username) {
++AuthFactorMap
++AuthFactorManager::LoadAllAuthFactorsInternal(
++    const ObfuscatedUsername& obfuscated_username,
++    bool is_backup) {
+   AuthFactorMap auth_factor_map;
+ 
+   // Load labels for auth factors in the USS. If the USS cannot be loaded then
+@@ -451,13 +507,17 @@ AuthFactorMap AuthFactorManager::LoadAllAuthFactors(
+ 
+   // Load all of the USS-based auth factors.
+   for (const auto& [label, auth_factor_type] :
+-       ListAuthFactors(obfuscated_username)) {
++       ListAuthFactors(obfuscated_username
++                       , is_backup
++                      )) {
+     if (!uss_labels.contains(label)) {
+       LOG(WARNING) << "Skipping auth factor which has no key in USS " << label;
+       continue;
+     }
+     CryptohomeStatusOr<AuthFactor> auth_factor =
+-        LoadAuthFactor(obfuscated_username, auth_factor_type, label);
++        LoadAuthFactor(obfuscated_username, auth_factor_type, label
++                       , is_backup
++                      );
+     if (!auth_factor.ok()) {
+       LOG(WARNING) << "Skipping malformed auth factor " << label;
+       continue;
+diff --git a/cryptohome/auth_factor/manager.h b/cryptohome/auth_factor/manager.h
+index d4456bdd37..513ac9c0bd 100644
+--- a/cryptohome/auth_factor/manager.h
++++ b/cryptohome/auth_factor/manager.h
+@@ -56,6 +56,10 @@ class AuthFactorManager final {
+   // ========= Stored AuthFactor functions =========
+   // Functions for accessing and modifying the stored AuthFactor files.
+ 
++  CryptohomeStatus SaveAuthFactorInternal(
++      const ObfuscatedUsername& obfuscated_username,
++      const AuthFactor& auth_factor,
++      bool is_backup);
+   // Serializes and persists as a file the given auth factor in the user's data
+   // vault.
+   CryptohomeStatus SaveAuthFactorFile(
+@@ -72,12 +76,25 @@ class AuthFactorManager final {
+   CryptohomeStatusOr<AuthFactor> LoadAuthFactor(
+       const ObfuscatedUsername& obfuscated_username,
+       AuthFactorType auth_factor_type,
+-      const std::string& auth_factor_label);
++      const std::string& auth_factor_label
++      , bool is_backup = false
++      );
++
++  AuthFactorMap LoadAllAuthFactorsInternal(
++      const ObfuscatedUsername& obfuscated_username,
++      bool is_backup);
+ 
+   // Loads the list of configured auth factors from the user's data vault.
+   absl::flat_hash_map<std::string, AuthFactorType> ListAuthFactors(
+-      const ObfuscatedUsername& obfuscated_username);
++      const ObfuscatedUsername& obfuscated_username
++      , bool is_backup = false
++      );
+ 
++  CryptohomeStatus RemoveAuthFactorInternal(
++      const ObfuscatedUsername& obfuscated_username,
++      const AuthFactor& auth_factor,
++      AuthBlockUtility* auth_block_utility,
++      bool is_backup);
+   // Removes the auth factor:
+   // 1. Calls PrepareForRemoval() on the AuthBlock. A failure in
+   // `PrepareForRemoval()` aborts the auth factor removal from disk.
+diff --git a/cryptohome/auth_factor/types/password.h b/cryptohome/auth_factor/types/password.h
+index 47418334d1..ff14a9ef88 100644
+--- a/cryptohome/auth_factor/types/password.h
++++ b/cryptohome/auth_factor/types/password.h
+@@ -54,9 +54,7 @@ class AfDriverWithPasswordBlockTypes : public virtual AuthFactorDriver {
+   static constexpr AuthBlockType kBlockTypes[] = {
+       AuthBlockType::kPinWeaver,     AuthBlockType::kTpmEcc,
+       AuthBlockType::kTpmBoundToPcr, AuthBlockType::kTpmNotBoundToPcr,
+-#if USE_TPM_INSECURE_FALLBACK
+       AuthBlockType::kScrypt,
+-#endif
+   };
+ };
+ 
+diff --git a/cryptohome/auth_session/auth_session.cc b/cryptohome/auth_session/auth_session.cc
+index a0d5bb8fdb..fb00019c56 100644
+--- a/cryptohome/auth_session/auth_session.cc
++++ b/cryptohome/auth_session/auth_session.cc
+@@ -1543,6 +1543,9 @@ void AuthSession::AuthForDecrypt::RemoveAuthFactor(
+   const auto& auth_factor_label = request.auth_factor_label();
+   AuthFactorMap& auth_factor_map = session_->GetAuthFactorMap();
+ 
++  LOG(INFO) << " AuthSession::RemoveAuthFactor "
++      << " auth_factor_label: " << request.auth_factor_label();
++
+   std::optional<AuthFactorMap::ValueView> stored_auth_factor =
+       auth_factor_map.Find(auth_factor_label);
+   if (!stored_auth_factor) {
+diff --git a/cryptohome/crypto.cc b/cryptohome/crypto.cc
+index 47d682278f..1bc42740b4 100644
+--- a/cryptohome/crypto.cc
++++ b/cryptohome/crypto.cc
+@@ -146,13 +146,8 @@ bool Crypto::is_cryptohome_key_loaded() const {
+ }
+ 
+ bool Crypto::CanUnsealWithUserAuth() const {
+-  hwsec::StatusOr<bool> is_ready = hwsec_->IsSealingSupported();
+-  if (!is_ready.ok()) {
+-    LOG(ERROR) << "Failed to get da mitigation status: " << is_ready.status();
+-    return false;
+-  }
+-
+-  return is_ready.value();
++  // FIXME(changwan.hong): Skip PCR checking.
++  return false;
+ }
+ 
+ }  // namespace cryptohome
+diff --git a/cryptohome/cryptorecovery/recovery_crypto_impl.cc b/cryptohome/cryptorecovery/recovery_crypto_impl.cc
+index c8eca5848a..05a8222120 100644
+--- a/cryptohome/cryptorecovery/recovery_crypto_impl.cc
++++ b/cryptohome/cryptorecovery/recovery_crypto_impl.cc
+@@ -712,8 +712,11 @@ bool RecoveryCryptoImpl::GenerateHsmPayload(
+     return false;
+   }
+ 
+-  brillo::Blob hkdf_info = RecoveryCrypto::GenerateMediatorShareHkdfInfo(
+-      response->hsm_payload.associated_data);
++// PasswordRecovery: The whale recovery server only supports the schema=1
++// (legacy) mediator-share encryption, so keep enrolling with the legacy HKDF
++// info until the server supports schema versions 2 and 3.
++  brillo::Blob hkdf_info =
++      RecoveryCrypto::GenerateLegacyMediatorShareHkdfInfo();
+ 
+   if (!EncryptHsmPlainText(
+           HsmPlainText{
+@@ -891,17 +894,7 @@ CryptoStatus RecoveryCryptoImpl::DecryptResponsePayload(
+         CryptoError::CE_RECOVERY_FATAL);
+   }
+ 
+-  // Verify inclusion proof.
+-  if (!VerifyInclusionProof(response_ad.ledger_signed_proof,
+-                            request.ledger_info,
+-                            request.hsm_associated_data.onboarding_meta_data)) {
+-    LOG(ERROR) << "Unable to verify inclusion proof";
+-    return MakeStatus<CryptohomeCryptoError>(
+-        CRYPTOHOME_ERR_LOC(kLocRecoveryCryptoBadLedgerSignedProof),
+-        ErrorActionSet(
+-            {PossibleAction::kDevCheckUnexpectedState, PossibleAction::kFatal}),
+-        CryptoError::CE_RECOVERY_FATAL);
+-  }
++// PasswordRecovery: Skip ledger impl
+ 
+   if (!request.epoch_response.has_epoch_pub_key()) {
+     LOG(ERROR) << "Epoch response doesn't have epoch public key";
+@@ -1068,8 +1061,9 @@ bool RecoveryCryptoImpl::GenerateOnboardingMetadata(
+   }
+   onboarding_metadata->rlz_code = GetRlzCode();
+   onboarding_metadata->recovery_id = recovery_id;
+-  onboarding_metadata->info_format =
+-      OnboardingMetadata::InfoFormat::kIncludesRecoveryId;
++// PasswordRecovery: Advertise the schema=1 format to match the legacy HKDF
++// info used in GenerateHsmPayload().
++  onboarding_metadata->info_format = OnboardingMetadata::InfoFormat::kFixed;
+   return true;
+ }
+ 
+diff --git a/cryptohome/filesystem_layout.cc b/cryptohome/filesystem_layout.cc
+index d7bf1c2c46..093efc8bcd 100644
+--- a/cryptohome/filesystem_layout.cc
++++ b/cryptohome/filesystem_layout.cc
+@@ -185,15 +185,29 @@ base::FilePath UserSecretStashPath(
+ }
+ 
+ base::FilePath AuthFactorsDirPath(
+-    const ObfuscatedUsername& obfuscated_username) {
++    const ObfuscatedUsername& obfuscated_username
++    , bool is_backup
++    ) {
++  if (is_backup) {
++    return UserPath(obfuscated_username).Append(kAuthFactorsBackupDir);
++  }
+   return UserPath(obfuscated_username).Append(kAuthFactorsDir);
+ }
+ 
+-base::FilePath AuthFactorPath(const ObfuscatedUsername& obfuscated_username,
+-                              const std::string& auth_factor_type_string,
+-                              const std::string& auth_factor_label) {
++base::FilePath AuthFactorPath(
++    const ObfuscatedUsername& obfuscated_username,
++    const std::string& auth_factor_type_string,
++    const std::string& auth_factor_label
++    , bool is_backup
++    ) {
+   // The caller must make sure the label was sanitized.
+   CHECK(IsValidAuthFactorLabel(auth_factor_label));
++  if (is_backup) {
++    return UserPath(obfuscated_username)
++        .Append(kAuthFactorsBackupDir)
++        .Append(auth_factor_type_string)
++        .AddExtension(auth_factor_label);
++  }
+   return UserPath(obfuscated_username)
+       .Append(kAuthFactorsDir)
+       .Append(auth_factor_type_string)
+diff --git a/cryptohome/filesystem_layout.h b/cryptohome/filesystem_layout.h
+index 0c713aa940..1fc005e3b1 100644
+--- a/cryptohome/filesystem_layout.h
++++ b/cryptohome/filesystem_layout.h
+@@ -47,6 +47,8 @@ inline constexpr char kUserSecretStashDir[] = "user_secret_stash";
+ inline constexpr char kUserSecretStashFileBase[] = "uss";
+ inline constexpr int kUserSecretStashDefaultSlot = 0;
+ inline constexpr char kAuthFactorsDir[] = "auth_factors";
++inline constexpr char kAuthFactorsBackupDir[] = "auth_factors_backup";
++
+ inline constexpr char kUserPolicyDir[] = "policy";
+ inline constexpr char kPolicyFile[] = "user_policy";
+ 
+@@ -64,11 +66,14 @@ base::FilePath UserActivityPerIndexTimestampPath(
+ base::FilePath UserActivityTimestampPath(const ObfuscatedUsername& obfuscated);
+ base::FilePath UserSecretStashPath(
+     const ObfuscatedUsername& obfuscated_username, int slot);
+-base::FilePath AuthFactorsDirPath(
+-    const ObfuscatedUsername& obfuscated_username);
++base::FilePath AuthFactorsDirPath(const ObfuscatedUsername& obfuscated_username
++    , bool is_backup = false
++    );
+ base::FilePath AuthFactorPath(const ObfuscatedUsername& obfuscated_username,
+                               const std::string& auth_factor_type_string,
+-                              const std::string& auth_factor_label);
++                              const std::string& auth_factor_label
++                              , bool is_backup = false
++    );
+ 
+ std::string LogicalVolumePrefix(const ObfuscatedUsername& obfuscated_username);
+ std::string DmcryptVolumePrefix(const ObfuscatedUsername& obfuscated_username);
+diff --git a/cryptohome/keyset_management.cc b/cryptohome/keyset_management.cc
+index f203483f6a..37b94858b4 100644
+--- a/cryptohome/keyset_management.cc
++++ b/cryptohome/keyset_management.cc
+@@ -392,6 +392,9 @@ CryptohomeStatus KeysetManagement::AddKeyset(
+               CRYPTOHOME_ERROR_KEY_LABEL_EXISTS);
+     }
+     vk_path = match->GetSourceFile();
++    // When you update pin in settings, stored label is not removed
++    // automatically.
++    RemoveLECredentials(obfuscated_username_new);
+   }
+ 
+   // If we need to create a new file, walk the namespace looking for the first
+diff --git a/cryptohome/libs/BUILD.gn b/cryptohome/libs/BUILD.gn
+index e62fa41494..75499f456b 100644
+--- a/cryptohome/libs/BUILD.gn
++++ b/cryptohome/libs/BUILD.gn
+@@ -32,6 +32,7 @@ pkg_config("target_default_deps") {
+ config("target_defaults") {
+   configs = [ ":target_default_deps" ]
+   defines = [
++    # TODO(changwan.hong) : Needs to change global build macro of whaleos
+     "PLATFORM_FWMP_INDEX=${use.generic_tpm2}",
+     "USE_FUZZER=${use.fuzzer}",
+     "USE_PINWEAVER=${use.pinweaver}",
+@@ -424,6 +425,7 @@ proto_library("cryptohome-proto") {
+     "${proto_in_dir}/timestamp.proto",
+     "${proto_in_dir}/vault_keyset.proto",
+   ]
++
+   all_dependent_configs = [ ":cryptohome-proto_config" ]
+ }
+ 
+@@ -512,6 +514,7 @@ static_library("libcrostpm") {
+     "../user_secret_stash/migrator.cc",
+     "../vault_keyset.cc",
+   ]
++
+   all_dependent_configs = [ ":target_defaults" ]
+   libs = [
+     "chaps",
+diff --git a/cryptohome/lockbox_cache_manager/lockbox_cache_manager.cc b/cryptohome/lockbox_cache_manager/lockbox_cache_manager.cc
+index f48d73267f..65e31cfb3d 100644
+--- a/cryptohome/lockbox_cache_manager/lockbox_cache_manager.cc
++++ b/cryptohome/lockbox_cache_manager/lockbox_cache_manager.cc
+@@ -159,6 +159,13 @@ bool LockboxCacheManager::CreateLockboxCache() {
+     LOG(INFO) << "Missing " << lockbox_nvram_file_path_.value()
+               << ", may be intended if "
+                  "lockbox nvram contents are empty.";
++    // For TPM-less devices and legacy CR1 devices, pretend like lockbox is
++    // supported. Yeah whalebook does.
++    // https://example.com
++    if (base::PathExists(install_attrs_new_path_)) {
++      LOG(WARNING) << " Whalebook tries copying install_attributes.pb";
++      return base::CopyFile(install_attrs_new_path_, lockbox_cache_path_);
++    }
+     return true;
+   }
+   if (platform_->IsOwnedByRoot(lockbox_nvram_file_path_.value())) {
+diff --git a/cryptohome/vault_keyset.cc b/cryptohome/vault_keyset.cc
+index 4d2d86eaeb..a5e36ff861 100644
+--- a/cryptohome/vault_keyset.cc
++++ b/cryptohome/vault_keyset.cc
+@@ -10,6 +10,8 @@
+ #include <utility>
+ #include <variant>
+ 
++#include <brillo/whaleos_util.h>
++
+ #include <base/check.h>
+ #include <base/check_op.h>
+ #include <base/files/file_path.h>

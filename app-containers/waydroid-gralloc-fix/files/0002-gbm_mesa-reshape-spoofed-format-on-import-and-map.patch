@@ -1,0 +1,181 @@
+From: WhaleOS <whaleos-dev@navercorp.com>
+Subject: [PATCH] gbm_mesa: import/map spoofed-format buffer in its R8 2D shape
+
+Copyright (c) 2026 NAVER Corp.  All rights reserved.
+SPDX-License-Identifier: BSD-3-Clause
+See files/LICENSE.wrapper in this ebuild directory for the full text.
+
+
+The gbm_mesa backend cannot allocate multi-planar YUV formats (NV12,
+NV21, FLEX_YCbCr_420_888 etc.) through mesa's libgbm directly, so
+gbm_mesa_bo_create() spoofs them onto a 4096-wide R8 2D texture:
+
+    alloc_args.drm_format = DRM_FORMAT_R8;
+    alloc_args.width  = bo->meta.total_size;
+    alloc_args.height = 1;
+    /* then: */
+    alloc_args.height = DIV_ROUND_UP(width, 4096);
+    alloc_args.width  = 4096;
+
+The allocator-side process therefore ends up with libgbm holding the
+buffer as a 4096 x ceil(total_size/4096) R8 2D texture, and
+priv->map_stride is saved as 4096.
+
+When the same buffer is later imported into a different process (e.g.
+the 32-bit external camera HAL) the original gbm_mesa_bo_import() code
+reverts the spoofing to "total_size x 1" and uses the client-view
+stride (e.g. NV12 width).  mesa-libgbm then sees a 1D buffer view,
+gbm_bo_map() returns NULL, and the camera HAL receives y=cb=cr=0x0
+from lockYCbCr.  The matching gbm_mesa_bo_map() spoofed path has the
+same defect: even when libgbm did manage to import a 2D R8 texture,
+the map call asks for a region wider than its row stride and fails.
+Finally, when the camera HAL allocates a JPEG output BLOB without
+BO_USE_SW_MASK, gbm_mesa_bo_import() skips the libgbm import entirely;
+later gbm_mesa_bo_map() then hits an unconditional
+`assert(priv->gbm_bo != nullptr)` and aborts the camera service.
+
+This patch makes three matching changes so the spoofed-format
+invariants stay consistent across alloc / import / map / lazy-map:
+
+  * gbm_mesa_bo_import(): for the spoofed format case, recompute
+    s_width = 4096 / s_height = ceil(total_size/4096), save the R8
+    stride into priv->map_stride, and hand libgbm the R8 stride (not
+    the client-view stride) so it correctly interprets the buffer as
+    a 2D R8 texture.
+
+  * gbm_mesa_bo_map(): if priv->gbm_bo is still nullptr (the import
+    skipped libgbm because BO_USE_SW_MASK was clear), do the libgbm
+    import now using the same R8 2D reshape, and return MAP_FAILED if
+    that import itself fails instead of asserting.  Then, when
+    priv->map_stride > 0, ask libgbm to map the texture using that
+    stride and the height derived from total_size so the region stays
+    inside the texture.
+
+With these three changes, lockYCbCr() in callers like
+mapper@4.0-impl.minigbm_gbm_mesa returns valid y/cb/cr pointers and
+the external camera HAL is able to convert V4L2 frames into Surface
+buffers for the camera preview path.  The JPEG/BLOB path no longer
+crashes the camera service either, although libgbm's PRIME-fd import
+of a 4096-wide R8 texture still fails for some BLOB sizes, so JPEG
+capture remains broken at the createJpegLocked level (downgraded from
+SIGABRT to a clean "createJpegLocked failed" error that the HAL
+reports back to cameraserver).  The non-spoofed (mesa-libgbm native
+format) path is unchanged.
+
+--- a/gbm_mesa_driver/gbm_mesa_internals.cpp
++++ b/gbm_mesa_driver/gbm_mesa_internals.cpp
+@@ -416,15 +416,37 @@ int gbm_mesa_bo_import(struct bo *bo, struct drv_import_fd_data *data)
+ 		uint32_t s_format = data->format;
+ 		int s_height = data->height;
+ 		int s_width = data->width;
+-		if (wr->get_gbm_format(s_format) == 0) {
+-			s_width = bo->meta.total_size;
+-			s_height = 1;
++		bool spoofed_fmt = (wr->get_gbm_format(s_format) == 0);
++		if (spoofed_fmt) {
++			/*
++			 * WhaleOS: align with the alloc-time spoofed-format
++			 * reshape in gbm_mesa_bo_create() that turns the buffer
++			 * into a 4096-wide R8 2D texture.  Importing as
++			 * total_size x 1 (the upstream behaviour) leaves libgbm
++			 * with a 1D view that gbm_bo_map() then refuses to
++			 * expose, so callers like the external camera HAL see
++			 * y=cb=cr=0x0 on lockYCbCr.  Use the same 4096 x
++			 * ceil(size/4096) shape that the allocator side used,
++			 * and save the R8 stride into priv->map_stride so the
++			 * bo_map fallback can pick it up.
++			 */
++			const uint32_t R8_TEX_WIDTH = 4096;
++			s_width = R8_TEX_WIDTH;
++			s_height = (bo->meta.total_size + R8_TEX_WIDTH - 1) / R8_TEX_WIDTH;
+ 			s_format = DRM_FORMAT_R8;
++			priv->map_stride = R8_TEX_WIDTH;
+ 		}
+
+ 		priv->drv = drv;
++		/*
++		 * For the spoofed path we must hand libgbm the R8 stride
++		 * (== s_width) too; data->strides[0] carries the original
++		 * client-view stride (e.g. NV12 width) and would make
++		 * mesa-libgbm misinterpret the underlying R8 texture.
++		 */
++		uint32_t import_stride = spoofed_fmt ? s_width : data->strides[0];
+ 		priv->gbm_bo = wr->import(drv->gbm_dev, data->fds[0], s_width, s_height,
+-					  data->strides[0], data->format_modifier, s_format);
++					  import_stride, data->format_modifier, s_format);
+ 	}
+
+ 	bo->priv = priv;
+@@ -456,7 +478,40 @@ void *gbm_mesa_bo_map(struct bo *bo, struct vma *vma, size_t plane, uint32_t map
+ 	vma->length = bo->meta.total_size;
+
+ 	auto priv = (GbmMesaBoPriv *)bo->priv;
+-	assert(priv->gbm_bo != nullptr);
++
++	/*
++	 * WhaleOS lazy SW import: if the buffer was imported without
++	 * BO_USE_SW_MASK (e.g. JPEG output BLOB created by the camera HAL),
++	 * priv->gbm_bo is nullptr and the upstream code would assert.
++	 * Import it into libgbm now, applying the same 4096-wide R8 2D
++	 * reshape that gbm_mesa_bo_create / gbm_mesa_bo_import use for any
++	 * format libgbm does not understand natively.  This keeps the
++	 * spoofed-format invariants consistent across alloc / import / map.
++	 */
++	if (priv->gbm_bo == nullptr) {
++		int fd = priv->fds[0].Get();
++		if (fd < 0)
++			return MAP_FAILED;
++
++		uint32_t i_width  = bo->meta.width;
++		uint32_t i_height = bo->meta.height;
++		uint32_t i_stride = bo->meta.strides[0];
++		uint32_t i_format = bo->meta.format;
++		if (wr->get_gbm_format(i_format) == 0) {
++			const uint32_t R8_TEX_WIDTH = 4096;
++			i_width  = R8_TEX_WIDTH;
++			i_height = (bo->meta.total_size + R8_TEX_WIDTH - 1) / R8_TEX_WIDTH;
++			i_stride = R8_TEX_WIDTH;
++			i_format = DRM_FORMAT_R8;
++			priv->map_stride = R8_TEX_WIDTH;
++		}
++
++		priv->drv = drv;
++		priv->gbm_bo = wr->import(drv->gbm_dev, fd, i_width, i_height,
++					  i_stride, bo->meta.format_modifier, i_format);
++		if (priv->gbm_bo == nullptr)
++			return MAP_FAILED;
++	}
+
+ 	void *buf = MAP_FAILED;
+
+@@ -464,8 +519,28 @@ void *gbm_mesa_bo_map(struct bo *bo, struct vma *vma, size_t plane, uint32_t map
+ 	int s_width = bo->meta.width;
+ 	int s_height = bo->meta.height;
+ 	if (wr->get_gbm_format(s_format) == 0) {
+-		s_width = bo->meta.total_size;
+-		s_height = 1;
++		/*
++		 * WhaleOS fix for the gbm_mesa spoofed-format path: the
++		 * underlying gbm_bo was allocated as an R8 2D texture with
++		 * actual dimensions priv->map_stride x ceil(total_size /
++		 * map_stride) (see the "Allocate 1D buffer as %dx%d R8 2D
++		 * texture" log path in gbm_mesa_bo_create()).  The original
++		 * code asks libgbm to map total_size x 1, which exceeds the
++		 * texture's row stride and gbm_bo_map() returns NULL --
++		 * camera HAL then sees y=cb=cr=0x0 on lockYCbCr.
++		 *
++		 * Use the saved map_stride and derive an integer height that
++		 * is large enough to cover total_size, so libgbm can map the
++		 * texture in its native shape.
++		 */
++		if (priv->map_stride > 0) {
++			s_width = priv->map_stride;
++			s_height = (bo->meta.total_size + priv->map_stride - 1) /
++				   priv->map_stride;
++		} else {
++			s_width = bo->meta.total_size;
++			s_height = 1;
++		}
+ 	}
+
+ 	wr->map(priv->gbm_bo, s_width, s_height, &buf, &vma->priv);

@@ -1,0 +1,16 @@
+CONFIG_VENDOR_GOOGLE=y
+CONFIG_BOARD_GOOGLE_MATSU=y
+
+# SPI Descriptor
+CONFIG_IFD_BIN_PATH="3rdparty/blobs/mainboard/google/ocelot/descriptor-matsu.bin"
+
+# CSE data
+# CONFIG_CSE_DATA_FILE="cse_data/cse_data-matsu.bin"
+CONFIG_ME_BIN_PATH="3rdparty/blobs/mainboard/google/ocelot/csme-matsu.bin"
+CONFIG_SOC_INTEL_CSE_RW_FILE="3rdparty/blobs/mainboard/google/ocelot/me_rw-matsu.bin"
+
+# Video Blob
+CONFIG_INTEL_GMA_VBT_FILE="3rdparty/blobs/mainboard/google/ocelot/vbt/vbt.bin"
+
+# Microcode
+CONFIG_CPU_INTEL_UCODE_SPLIT_BINARIES="3rdparty/blobs/mainboard/google/ocelot/microcode_inputs/matsu"

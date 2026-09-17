@@ -1,0 +1,25 @@
+CONFIG_VENDOR_GOOGLE=y
+CONFIG_BOARD_GOOGLE_ATRIA=y
+CONFIG_VBOOT_FWID_MODEL="Google_Atria"
+
+# Enable Early Splash Screen
+# CONFIG_CHROMEOS_FW_SPLASH_SCREEN is not set
+# CONFIG_CHROMEOS_LOGO_PATH is not set
+# CONFIG_CHROMEBOOK_PLUS_LOGO_PATH is not set
+
+# Low-battery indicator
+# CONFIG_PLATFORM_LOW_BATTERY_INDICATOR_LOGO_PATH is not set
+
+# SPI Descriptor
+CONFIG_IFD_BIN_PATH="3rdparty/blobs/mainboard/google/atria/descriptor-atria.bin"
+
+# CSE data
+# CONFIG_CSE_DATA_FILE is not file
+CONFIG_ME_BIN_PATH="3rdparty/blobs/mainboard/google/atria/csme-atria.bin"
+# CONFIG_SOC_INTEL_CSE_RW_FILE is not set
+
+# Video Blob
+CONFIG_INTEL_GMA_VBT_FILE="3rdparty/blobs/mainboard/google/atria/vbt/vbt-atria.bin"
+
+# Microcode
+CONFIG_CPU_INTEL_UCODE_SPLIT_BINARIES="3rdparty/blobs/mainboard/google/atria/microcode_inputs/atria"

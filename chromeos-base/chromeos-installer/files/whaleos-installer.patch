@@ -1,0 +1,349 @@
+diff --git a/installer/chromeos-install.sh b/installer/chromeos-install.sh
+index 18bf85de78..fe825a000a 100755
+--- a/installer/chromeos-install.sh
++++ b/installer/chromeos-install.sh
+@@ -524,6 +524,13 @@ install_stateful() {
+     parent=$(dirname "${file}")
+     cp -au "${ROOT}/mnt/stateful_partition/${file}" "${TMPMNT}/${parent}"
+   done
++  local manifest="${ROOT}/home/chronos/user/startup_manifest.json"
++  if [ -e "${manifest}" ]; then
++    local dst_dir="${TMPMNT}/unencrypted/preserve"
++    mkdir -p "${dst_dir}"
++    cp "${manifest}" "${dst_dir}"
++  fi
++  #endif
+ 
+   tracked_umount "${TMPMNT}"
+   sync
+diff --git a/installer/chromeos-setgoodkernel b/installer/chromeos-setgoodkernel
+index 73a8057b8a..ecbdde225b 100755
+--- a/installer/chromeos-setgoodkernel
++++ b/installer/chromeos-setgoodkernel
+@@ -102,6 +102,9 @@ if [ -f "${OLD_INSTALL_ATTRIBUTES}" ]; then
+   fi
+ fi
+ 
++# It is too costly to read flashrom in Whalebook.
++exit
++
+ # Run the verified boot debugging tool now, because we won't be able to run it
+ # manually if there's a problem (no root shell). It leaves a log file that we
+ # can look at.
+diff --git a/installer/chromeos_legacy.cc b/installer/chromeos_legacy.cc
+index 7bfab99590..e65f51fbf1 100644
+--- a/installer/chromeos_legacy.cc
++++ b/installer/chromeos_legacy.cc
+@@ -25,6 +25,8 @@
+ #include "installer/inst_util.h"
+ #include "installer/platform.h"
+ 
++#include <brillo/whaleos_util.h>
++
+ using std::string;
+ using std::vector;
+ 
+@@ -164,6 +166,120 @@ bool UpdateLegacyKernel(const InstallConfig& install_config) {
+   return base::CopyFile(kernel_from, kernel_to);
+ }
+ 
++bool UpdateMiniosKernel(const InstallConfig& install_config) {
++  const base::FilePath root_mount(install_config.root.mount());
++  const base::FilePath boot_mount(install_config.boot.mount());
++
++  const base::FilePath kernel_from = root_mount.Append("boot").Append("syslinux").Append("vmlinuz.minios");
++  const base::FilePath kernel_to =
++      boot_mount.Append("syslinux").Append("vmlinuz.minios");
++
++  if (base::PathExists(kernel_from))
++    return base::CopyFile(kernel_from, kernel_to);
++
++  PLOG(WARNING) << "There are no vmlinuz.minios in efi partition";
++
++  return true;
++}
++
++bool UpdateFW(const InstallConfig& install_config) {
++  const base::FilePath root_mount(install_config.root.mount());
++  const base::FilePath fw_dir = root_mount.Append("usr")
++      .Append("share").Append("whaleos_fw");
++
++  if (!base::PathExists(fw_dir)) {
++    PLOG(WARNING) << __func__ << ": There are no fw updater.";
++    return true;
++  }
++
++  std::string file_content, target_model, target_server;
++  base::ReadFileToString(fw_dir.Append("target"), &file_content);
++  base::TrimWhitespaceASCII(file_content, base::TRIM_ALL, &target_model);
++  base::ReadFileToString(fw_dir.Append("server"), &file_content);
++  base::TrimWhitespaceASCII(file_content, base::TRIM_ALL, &target_server);
++
++  string result_string;
++  if (LsbReleaseValue(root_mount.Append("etc/lsb-release"),
++        "CHROMEOS_RELEASE_TRACK", &result_string) && result_string != target_server) {
++    LOG(INFO) << __func__ << ": " << result_string << " is not a target server, skip fw update.";
++    return true;
++  }
++
++  bool need_update = false;
++  for (const std::string& model : base::SplitString(
++        target_model, ",", base::TRIM_WHITESPACE, base::SPLIT_WANT_ALL)) {
++    if (base::StartsWith(brillo::GetProductName(), model,
++                         base::CompareCase::SENSITIVE)) {
++      need_update = true;
++      break;
++    }
++  }
++
++  if (need_update) {
++    LOG(INFO) << __func__ << ": Try to FW update.";
++
++    if (RunCommand({fw_dir.Append("update_firmware.sh").value(), fw_dir.value()}) != 0) {
++      PLOG(ERROR) << __func__ << ": Failed to run update script.";
++      return false;
++    }
++  } else {
++    LOG(INFO) << __func__ << ": It's not target model.";
++  }
++
++  return true;
++}
++
++bool UpdateBIOS(const InstallConfig& install_config) {
++  const base::FilePath root_mount(install_config.root.mount());
++  const base::FilePath bios_dir = root_mount.Append("usr")
++      .Append("share").Append("whaleos_bios");
++
++  if (!base::PathExists(bios_dir)) {
++    PLOG(WARNING) << __func__ << ": There are no bios updater.";
++    return true;
++  }
++
++  std::string file_content, target_server, target_model, next_version;
++  base::ReadFileToString(bios_dir.Append("target"), &file_content);
++  base::TrimWhitespaceASCII(file_content, base::TRIM_ALL, &target_model);
++  base::ReadFileToString(bios_dir.Append("version"), &file_content);
++  base::TrimWhitespaceASCII(file_content, base::TRIM_ALL, &next_version);
++  base::ReadFileToString(bios_dir.Append("server"), &file_content);
++  base::TrimWhitespaceASCII(file_content, base::TRIM_ALL, &target_server);
++
++  string result_string;
++  if (LsbReleaseValue(root_mount.Append("etc/lsb-release"),
++        "CHROMEOS_RELEASE_TRACK", &result_string) && result_string != target_server) {
++    LOG(INFO) << __func__ << ": " << result_string << " is not a target server, skip bios update.";
++    return true;
++  }
++
++  bool need_update = false;
++  for (const std::string& model : base::SplitString(
++        target_model, ",", base::TRIM_WHITESPACE, base::SPLIT_WANT_ALL)) {
++    if (brillo::GetProductName() == model &&
++        brillo::GetBiosVersion().compare(next_version) < 0) {
++      need_update = true;
++      break;
++    }
++  }
++
++  if (need_update) {
++    LOG(INFO) << __func__ << ": Try to BIOS update.";
++
++    if (RunCommand({bios_dir.Append("fw_upd_prepare.sh").value(), bios_dir.value()}) != 0) {
++      PLOG(ERROR) << __func__ << ": Failed to run update script.";
++    } else {
++      LOG(INFO) << __func__ << ": BIOS will be updated after rebooting";
++    }
++  } else {
++    LOG(INFO) << __func__ << ": It's not target model or it has Already latest version";
++  }
++
++  return true;
++}
++
++
+ string ExpandVerityArguments(const string& kernel_config,
+                              const string& root_uuid) {
+   string kernel_config_dm = ExtractKernelArg(kernel_config, "dm");
+@@ -448,15 +564,53 @@ bool CheckRequiresGrubQuirk(const Platform& platform) {
+   return false;
+ }
+ 
++void CleanupEfi(const InstallConfig& install_config) {
++  const base::FilePath boot_mount(install_config.boot.mount());
++  const base::FilePath fw_dir = boot_mount.Append("efi").Append("boot").Append("fw");
++  const base::FilePath fws_dir = boot_mount.Append("syslinux").Append("fws");
++  const base::FilePath bios_dir = boot_mount.Append("syslinux").Append("bios_upd");
++
++  if (base::PathExists(fw_dir)) {
++    if(!brillo::DeletePathRecursively(fw_dir)) {
++      LOG(INFO) << "Failed to cleanup " << fw_dir;
++    } else {
++      LOG(INFO) << "Cleanup " << fw_dir;
++    }
++  }
++
++  if (base::PathExists(fws_dir)) {
++    if(!brillo::DeletePathRecursively(fws_dir)) {
++      LOG(INFO) << "Failed to cleanup " << fws_dir;
++    } else {
++      LOG(INFO) << "Cleanup " << fws_dir;
++    }
++  }
++
++  if (base::PathExists(bios_dir)) {
++    if(!brillo::DeletePathRecursively(bios_dir)) {
++      LOG(INFO) << "Failed to cleanup " << bios_dir;
++    } else {
++      LOG(INFO) << "Cleanup " << bios_dir;
++    }
++  }
++}
++
+ bool RunEfiPostInstall(const Platform& platform,
+                        const InstallConfig& install_config) {
+   LOG(INFO) << "Running EfiPostInstall.";
+ 
++  CleanupEfi(install_config);
++
+   // Update the kernel we are about to use.
+   if (!UpdateLegacyKernel(install_config)) {
+     return false;
+   }
+ 
++  // Update the vmlinuz.minios for Whalebook
++  if (!UpdateMiniosKernel(install_config)) {
++    return false;
++  }
++
+   if (!UpdateEfiBootloaders(platform, install_config)) {
+     return false;
+   }
+@@ -470,6 +624,28 @@ bool RunEfiPostInstall(const Platform& platform,
+     return false;
+   }
+ 
++  string kernel_cmd_line;
++  if (!base::ReadFileToString(base::FilePath("/proc/cmdline"),
++                              &kernel_cmd_line)) {
++    LOG(WARNING) << "Can't read kernel commandline options"
++                 << "Skip update FWs and BIOS";
++    return true;
++  }
++
++  bool is_minios = kernel_cmd_line.find("cros_minios") != string::npos;
++
++  // Skip update FW or BIOS when install from usb or minios
++  if (install_config.is_install || is_minios) {
++    LOG(INFO) << "It's not update, skip update FWs and BIOS";
++    return true;
++  }
++
++  if (!UpdateFW(install_config))
++    return false;
++
++  if (!UpdateBIOS(install_config))
++    return false;
++
+   // We finished.
+   return true;
+ }
+diff --git a/installer/chromeos_postinst.cc b/installer/chromeos_postinst.cc
+index ab6e86e6f4..45192708f2 100644
+--- a/installer/chromeos_postinst.cc
++++ b/installer/chromeos_postinst.cc
+@@ -39,6 +39,13 @@ using std::string;
+ namespace {
+ const char kStatefulMount[] = "/mnt/stateful_partition";
+ 
++void ReportInstallerFailure(const string& error_type) {
++  LOG(INFO) << "Reporting installer failure to crash_reporter: " << error_type;
++  RunCommand({"/sbin/crash_reporter",
++              "--update_failure=installer",
++              "--update_error_type=" + error_type});
++}
++
+ const char kUMABiosType[] = "Installer.Postinstall.BiosType";
+ const char kUMANonChromebookBiosSuccessEFI[] =
+     "Installer.Postinstall.NonChromebookBiosSuccess.EFI";
+@@ -605,6 +612,18 @@ void CheckForDefaultKeyStatefulMigration(const InstallConfig& install_config) {
+ bool ChromeosChrootPostinst(const InstallConfig& install_config,
+                             int* exit_code) {
+   PlatformImpl platform;
++  if (!install_config.is_update) {
++    base::FilePath startup_manifest("/home/chronos/user/startup_manifest.json");
++    if (base::PathExists(startup_manifest)) {
++      base::FilePath dest_startup_manifest(install_config.root.mount().value() +
++          string(kStatefulMount) +
++          "/unencrypted/preserve/startup_manifest.json");
++      if (!base::CopyFile(startup_manifest, dest_startup_manifest)) {
++        LOG(ERROR) << "startup manifest copy failed.";
++      }
++    }
++  }
++  // #endif
+ 
+   switch (install_config.defer_update_action) {
+     case DeferUpdateAction::kAuto:
+@@ -621,6 +640,7 @@ bool ChromeosChrootPostinst(const InstallConfig& install_config,
+ 
+       if (!SetImage(install_config)) {
+         LOG(ERROR) << "SetImage failed.";
++        ReportInstallerFailure("SetImageFailed");
+         return false;
+       }
+ 
+@@ -659,6 +679,7 @@ bool ChromeosChrootPostinst(const InstallConfig& install_config,
+ 
+       if (!UpdatePartitionTable(cgpt_manager, install_config)) {
+         LOG(ERROR) << "UpdatePartitionTable failed.";
++        ReportInstallerFailure("UpdatePartitionTableFailed");
+         return false;
+       }
+ 
+@@ -666,6 +687,7 @@ bool ChromeosChrootPostinst(const InstallConfig& install_config,
+       // until we update files on the EFI System Partition.
+       if (!ESPPostInstall(platform, install_config)) {
+         LOG(ERROR) << "ESPPostInstall failed.";
++        ReportInstallerFailure("ESPPostInstallFailed");
+         // ESPPostInstall has failed. We don't know which changes have been made
+         // or which slot they'll allow booting into. My best guess is that a
+         // rollback will generally be better than leaving things as-is.
+@@ -687,12 +709,14 @@ bool ChromeosChrootPostinst(const InstallConfig& install_config,
+           // Format the metadata partition if needed.
+           if (!FormatMetaDataPartition(install_config)) {
+             LOG(ERROR) << "FormatMetaDataPartition failed.";
++            ReportInstallerFailure("FormatMetaDataPartitionFailed");
+             return false;
+           }
+         } else if (USE_LVM_STATEFUL_PARTITION && !USE_DISABLE_LVM_INSTALL) {
+           // Install migrate encrypted stateful to LVM.
+           if (!ThinpoolMigration(install_config)) {
+             LOG(ERROR) << "Unable to setup LVM";
++            ReportInstallerFailure("ThinpoolMigrationFailed");
+             return false;
+           }
+         }
+@@ -724,6 +748,7 @@ bool ChromeosChrootPostinst(const InstallConfig& install_config,
+       if (!install_config.is_factory_install &&
+           !RunBoardPostInstall(install_config.root.mount())) {
+         LOG(ERROR) << "Failed to perform board specific post install script.";
++        ReportInstallerFailure("BoardPostInstallFailed");
+         return false;
+       }
+ 
+@@ -780,6 +805,7 @@ bool ChromeosChrootPostinst(const InstallConfig& install_config,
+ 
+       LOG(INFO)
+           << "Rolling back update due to failure calling firmware updater";
++      ReportInstallerFailure("FirmwareUpdateFailed");
+       // Note: This will only rollback the ChromeOS verified boot target.
+       // The assumption is that systems running firmware autoupdate
+       // are not running legacy (non-ChromeOS) firmware. If the firmware
+@@ -838,6 +864,7 @@ bool RunPostInstall(const base::FilePath& install_dev,
+                         defer_update_action, force_update_firmware,
+                         &install_config)) {
+     LOG(ERROR) << "Configure failed.";
++    ReportInstallerFailure("ConfigureInstallFailed");
+     // In the failure case don't try to use `install_config.bios_type`, we don't
+     // want to rely on the implementation of `ConfigureInstall`.
+     SendBiosTypeUMA(bios_type);

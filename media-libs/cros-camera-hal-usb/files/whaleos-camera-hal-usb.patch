@@ -1,0 +1,58 @@
+diff --git a/camera/hal/usb/camera_hal.cc b/camera/hal/usb/camera_hal.cc
+index 682b1ea891..cc8210e5e2 100644
+--- a/camera/hal/usb/camera_hal.cc
++++ b/camera/hal/usb/camera_hal.cc
+@@ -515,7 +515,7 @@ int CameraHal::Init() {
+       LOGF(WARNING) << "Force starting cros-camera: Ignore missing built-in "
+                     << "camera error to allow external camera usage";
+     } else {
+-      return -ENODEV;
++      LOGF(WARNING) << "Force starting cros-camera for whaleos flex";
+     }
+   }
+ 
+diff --git a/camera/hal/usb/quirks.cc b/camera/hal/usb/quirks.cc
+index 81c4aab64a..f052229bb5 100644
+--- a/camera/hal/usb/quirks.cc
++++ b/camera/hal/usb/quirks.cc
+@@ -68,6 +68,9 @@ const QuirksMap& GetQuirksMap() {
+       {{"5986", "2189"}, kQuirkUserSpaceTimestamp},
+       // LCE-Optics LSN131BF (b/450396233)
+       {{"5959", "0131"}, kQuirkUserSpaceTimestamp},
++      // UVC Camera (vid:pid 2207:0016) produces corrupted MJPEG at resolutions
++      // above 1024x768.
++      {{"2207", "0016"}, kQuirkLimitResolution1024x768},
+   });
+   return *kQuirksMap;
+ }
+diff --git a/camera/hal/usb/quirks.h b/camera/hal/usb/quirks.h
+index 0f5ee4bbe0..ded368cee3 100644
+--- a/camera/hal/usb/quirks.h
++++ b/camera/hal/usb/quirks.h
+@@ -27,6 +27,9 @@ enum : uint32_t {
+   kQuirkAndroidLegacy = 1 << 8,
+   kQuirkExpectTimeout = 1 << 9,
+   kQuirkExpectHotplugWhileOpen = 1 << 10,
++  // Limit max resolution to 1024x768. Some cameras produce corrupted MJPEG
++  // output at higher resolutions due to firmware issues.
++  kQuirkLimitResolution1024x768 = 1 << 11,
+ };
+ 
+ uint32_t GetQuirks(const std::string& vid, const std::string& pid);
+diff --git a/camera/hal/usb/stream_format.cc b/camera/hal/usb/stream_format.cc
+index 45cb5f9790..ad72109d7d 100644
+--- a/camera/hal/usb/stream_format.cc
++++ b/camera/hal/usb/stream_format.cc
+@@ -166,6 +166,12 @@ SupportedFormats GetQualifiedFormats(const SupportedFormats& supported_formats,
+     }
+   }
+ 
++  if (quirks & kQuirkLimitResolution1024x768) {
++    std::erase_if(qualified_formats, [](const SupportedFormat& f) {
++      return f.width > 1024 || f.height > 768;
++    });
++  }
++
+   // Sort the resolution from high to low for easier reading and consistent of
+   // different camera modules.
+   // CTS uses the first 2 resolutions to create streams. It also let CTS choose

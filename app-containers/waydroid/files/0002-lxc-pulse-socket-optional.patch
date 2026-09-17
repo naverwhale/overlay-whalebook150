@@ -1,0 +1,20 @@
+From: WhaleOS <whaleos-dev@navercorp.com>
+Subject: [PATCH 2/2] lxc.py: make pulse socket mount optional
+
+On ChromeOS/WhaleOS, the PulseAudio socket at pulse_runtime_path/native
+may not exist (CRAS is used instead of PulseAudio). Without this check,
+LXC fails with ENOENT trying to bind-mount the missing socket and the
+container fails to start.
+
+--- a/tools/helpers/lxc.py
++++ b/tools/helpers/lxc.py
+@@ -204,7 +204,8 @@
+     # Make sure PULSE_RUNTIME_DIR exists
+     pulse_host_socket = os.path.join(session["pulse_runtime_path"], "native")
+     pulse_container_socket = os.path.join(tools.config.defaults["container_pulse_runtime_path"], "native")
+-    make_entry(pulse_host_socket, pulse_container_socket[1:])
++    if os.path.exists(pulse_host_socket):
++        make_entry(pulse_host_socket, pulse_container_socket[1:])
+
+     if not make_entry(session["waydroid_data"], "data", options="rbind 0 0"):
+         raise OSError("Failed to bind userdata")
